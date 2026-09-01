@@ -349,7 +349,9 @@ async fn run_inner(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 		.expect("RPC headless session owns its lossless event stream");
 	let negotiated = Arc::new(AtomicU8::new(PROTOCOL_V1));
 	let (output_tx, output_rx) = flume::unbounded();
-	let writer = tokio::spawn(write_frames(stdout(), output_rx, negotiated.clone()));
+	let output_shutdown = CancellationToken::new();
+	let writer =
+		tokio::spawn(write_frames(stdout(), output_rx, negotiated.clone(), output_shutdown.clone()));
 	let ready = serde_json::to_value(ReadyFrame::v2_capable(MAX_FRAME_BYTES, MAX_REASSEMBLED_BYTES))
 		.into_diagnostic()?;
 	emit(&output_tx, ready)?;
@@ -418,9 +420,18 @@ async fn run_inner(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 	runtime.host_resources.shutdown("RPC client disconnected")?;
 	host::unbind(&host_resources_authority);
 	runtime.shutdown.shutdown().await;
+	{
+		let mut headless = runtime.headless.lock().await;
+		headless.session.dispose().await;
+	}
 	let read_result = reader.await.into_diagnostic()?;
 	drop(runtime);
 	drop(output_tx);
+	// Output producers can be retained by environment-owned tool resolvers after
+	// the client disconnects. The lifecycle signal lets the protocol writer drain
+	// frames already queued and finish without relying on every producer clone
+	// being dropped first.
+	output_shutdown.cancel();
 	let write_result = writer.await.into_diagnostic()?;
 	dispatch_result?;
 	read_result?;
@@ -496,13 +507,21 @@ async fn write_frames<W>(
 	mut output: W,
 	receiver: Receiver<Value>,
 	negotiated: Arc<AtomicU8>,
+	shutdown: CancellationToken,
 ) -> miette::Result<()>
 where
 	W: AsyncWrite + Unpin,
 {
 	let mut sequence = 0_u64;
 	let streamed = HashSet::new();
-	while let Ok(value) = receiver.recv_async().await {
+	loop {
+		let value = tokio::select! {
+			value = receiver.recv_async() => match value {
+				Ok(value) => value,
+				Err(_) => break,
+			},
+			() = shutdown.cancelled() => break,
+		};
 		let frames = if negotiated.load(Ordering::Acquire) >= PROTOCOL_V2 {
 			sequence = sequence.wrapping_add(1);
 			encode_json_v2(&value, &format!("server-{sequence}"))
@@ -515,6 +534,25 @@ where
 		}
 		output.flush().await.into_diagnostic()?;
 	}
+	// Preserve the frames queued at shutdown without letting a racing producer
+	// extend teardown indefinitely.
+	let queued = receiver.len();
+	for _ in 0..queued {
+		let Ok(value) = receiver.try_recv() else {
+			break;
+		};
+		let frames = if negotiated.load(Ordering::Acquire) >= PROTOCOL_V2 {
+			sequence = sequence.wrapping_add(1);
+			encode_json_v2(&value, &format!("server-{sequence}"))
+				.map_err(|error| miette!(error.to_string()))?
+		} else {
+			vec![encode_json_v1(&value, &streamed)]
+		};
+		for frame in frames {
+			output.write_all(&frame).await.into_diagnostic()?;
+		}
+	}
+	output.flush().await.into_diagnostic()?;
 	Ok(())
 }
 
@@ -4794,6 +4832,29 @@ mod tests {
 			observed.push(value);
 		}
 		assert_eq!(observed, (0..64).collect::<Vec<_>>());
+	}
+
+	#[tokio::test]
+	async fn rpc_output_writer_shutdown_does_not_wait_for_producer_drop() {
+		let (sender, receiver) = flume::unbounded();
+		let shutdown = CancellationToken::new();
+		sender
+			.send(json!({ "type": "event" }))
+			.expect("frame queued");
+		let writer = tokio::spawn(write_frames(
+			tokio::io::sink(),
+			receiver,
+			Arc::new(AtomicU8::new(PROTOCOL_V1)),
+			shutdown.clone(),
+		));
+
+		shutdown.cancel();
+		time::timeout(Duration::from_millis(100), writer)
+			.await
+			.expect("writer exits while a producer clone remains")
+			.expect("writer task joins")
+			.expect("writer drains queued frames");
+		assert!(sender.send(json!({ "type": "late" })).is_err());
 	}
 
 	#[test]

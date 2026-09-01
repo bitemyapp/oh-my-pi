@@ -1709,11 +1709,11 @@ impl HeadlessSession {
 	}
 
 	/// Disposes the live session without running mode-specific finalizers.
-	pub(crate) async fn dispose(&mut self) {
-		let _ = self.session.dispose().await;
+	pub async fn dispose(&mut self) {
 		if let Some(worker) = self._memory_extraction.as_mut() {
 			worker.shutdown().await;
 		}
+		let _ = self.session.dispose().await;
 	}
 
 	/// Runs ordered bounded finalization. Dropping this session afterward
@@ -1725,10 +1725,10 @@ impl HeadlessSession {
 		let report = mem::take(&mut self.finalizer)
 			.finalize(stdout, budget)
 			.await;
-		let _ = self.session.dispose().await;
 		if let Some(worker) = self._memory_extraction.as_mut() {
 			worker.shutdown().await;
 		}
+		let _ = self.session.dispose().await;
 		report
 	}
 
