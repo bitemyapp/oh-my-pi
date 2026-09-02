@@ -3,7 +3,12 @@
 # LLVM-22 LTO bitcode in vendor/python. Xcode's ld64 (LLVM 17) cannot read
 # that bitcode, and rustc's rust-lld (LLVM 23) mis-resolves a handful of
 # symbols in it; the producer-matched major is the one that links clean.
-LLD=/opt/homebrew/opt/lld/bin/ld64.lld
+VERSIONED_LLD=/opt/homebrew/opt/lld@22/bin/ld64.lld
+if [[ -x "$VERSIONED_LLD" ]]; then
+	LLD=$VERSIONED_LLD
+else
+	LLD=/opt/homebrew/opt/lld/bin/ld64.lld
+fi
 case "$("$LLD" --version 2>/dev/null)" in
 	*"LLD 22."*) ;;
 	*)
