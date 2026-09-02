@@ -85,6 +85,13 @@ const MAX_PAGE_MESSAGES: usize = 256;
 const MAX_PAGE_BYTES: usize = 768 * 1024;
 const MAX_SUBAGENT_TRANSCRIPTS: usize = 256;
 const SUBAGENT_READ_BYTES: usize = 768 * 1024;
+const ACCOUNT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
+const ANTHROPIC_PROVIDER: &str = "anthropic";
+// Claude Code carries its normal subscription tiers in the client and lets the
+// authenticated bootstrap response add account-specific options. The
+// bootstrap endpoint is deliberately not a complete model catalog.
+const ANTHROPIC_SUBSCRIPTION_MODELS: [&str; 3] =
+	["anthropic/claude-fable-5", "anthropic/claude-opus-5", "anthropic/claude-sonnet-5"];
 const ORCHESTRATE_NOTICE: &str = "The user explicitly requested orchestration. Treat this as a \
                                   hidden system instruction: delegate independent work to \
                                   available subagents, coordinate their results, and retain \
@@ -187,9 +194,9 @@ async fn run_inner(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 	};
 	let catalog_owner =
 		omp_driver::registry::production_catalog(&data).map_err(|error| miette!(error))?;
-	let catalog = catalog_owner.as_ref();
+	let launch_catalog = catalog_owner.as_ref();
 	let roles = omp_driver::discovery::roles::resolve_launch_roles(
-		catalog,
+		launch_catalog,
 		&model_settings,
 		None,
 		args.smol.as_deref(),
@@ -212,17 +219,69 @@ async fn run_inner(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 	)
 	.await
 	.into_diagnostic()?;
+	let authenticated = match auth
+		.execute(AuthRequest::ListAccounts { provider: None })
+		.await
+	{
+		Ok(AuthAnswer::Accounts(accounts)) => accounts
+			.into_iter()
+			.filter(|account| account.state == AccountState::Active)
+			.map(|account| account.provider.as_str().to_owned())
+			.collect::<HashSet<_>>(),
+		_ => HashSet::new(),
+	};
+	let anthropic = ProviderId::from(ANTHROPIC_PROVIDER);
+	let discovered_anthropic_models = if authenticated.contains(ANTHROPIC_PROVIDER) {
+		match crate::models_cmd::fresh_provider_models(&data, &anthropic)? {
+			Some(models) => models,
+			None => match time::timeout(
+				ACCOUNT_MODEL_DISCOVERY_TIMEOUT,
+				crate::models_cmd::refresh_provider(&registry, &data, &anthropic),
+			)
+			.await
+			{
+				Ok(Ok(models)) => models,
+				Ok(Err(error)) => {
+					eprintln!("warning: Anthropic account model discovery failed: {error}");
+					Vec::new()
+				},
+				Err(_) => {
+					eprintln!(
+						"warning: Anthropic account model discovery exceeded {} seconds",
+						ACCOUNT_MODEL_DISCOVERY_TIMEOUT.as_secs()
+					);
+					Vec::new()
+				},
+			},
+		}
+	} else {
+		Vec::new()
+	};
+	let available_anthropic_models = authenticated
+		.contains(ANTHROPIC_PROVIDER)
+		.then(|| anthropic_subscription_models(discovered_anthropic_models))
+		.unwrap_or_default();
 	let mut models = registry
 		.catalog()
 		.models()
 		.iter()
 		.filter_map(|entry| {
-			let (provider, model) = entry.key.as_str().split_once('/')?;
+			let selector = entry.key.as_str();
+			let (provider, model) = selector.split_once('/')?;
+			if provider == ANTHROPIC_PROVIDER && !available_anthropic_models.contains(selector) {
+				return None;
+			}
 			model_settings
 				.model_allowed(provider, model)
-				.then(|| entry.key.as_str().to_owned())
+				.then(|| selector.to_owned())
 		})
 		.collect::<Vec<_>>();
+	models.extend(available_anthropic_models.iter().filter_map(|selector| {
+		let (provider, model) = selector.split_once('/')?;
+		model_settings
+			.model_allowed(provider, model)
+			.then(|| selector.clone())
+	}));
 	models.sort_by_key(|selector| {
 		let (provider, model) = selector.split_once('/').unwrap_or(("", selector.as_str()));
 		(
@@ -245,26 +304,19 @@ async fn run_inner(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 	let mut cycle_models = cycle_selectors
 		.iter()
 		.filter_map(|selector| {
-			omp_driver::discovery::roles::resolve_role_selector(catalog, &model_settings, selector)
-				.ok()
-				.map(|selected| selected.model.as_str().to_owned())
+			omp_driver::discovery::roles::resolve_role_selector(
+				registry.catalog(),
+				&model_settings,
+				selector,
+			)
+			.ok()
+			.map(|selected| selected.model.as_str().to_owned())
 		})
 		.collect::<Vec<_>>();
 	cycle_models.extend(models);
 	let mut seen_models = HashSet::new();
 	cycle_models.retain(|model| seen_models.insert(model.clone()));
 	let models = cycle_models;
-	let authenticated = match auth
-		.execute(AuthRequest::ListAccounts { provider: None })
-		.await
-	{
-		Ok(AuthAnswer::Accounts(accounts)) => accounts
-			.into_iter()
-			.filter(|account| account.state == AccountState::Active)
-			.map(|account| account.provider.as_str().to_owned())
-			.collect::<HashSet<_>>(),
-		_ => HashSet::new(),
-	};
 	let providers = registry
 		.catalog()
 		.providers()
@@ -436,6 +488,14 @@ async fn run_inner(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 	dispatch_result?;
 	read_result?;
 	write_result
+}
+
+fn anthropic_subscription_models(discovered: Vec<String>) -> HashSet<String> {
+	ANTHROPIC_SUBSCRIPTION_MODELS
+		.into_iter()
+		.map(str::to_owned)
+		.chain(discovered)
+		.collect()
 }
 
 #[must_use]
@@ -4788,6 +4848,23 @@ mod tests {
 	use std::slice;
 
 	use super::*;
+
+	#[test]
+	fn anthropic_subscription_models_combine_client_baseline_and_account_additions() {
+		let models = anthropic_subscription_models(vec![
+			"anthropic/claude-fable-5-1[1m]".to_owned(),
+			"anthropic/claude-opus-5".to_owned(),
+		]);
+		assert_eq!(models.len(), 4);
+		for expected in [
+			"anthropic/claude-fable-5",
+			"anthropic/claude-opus-5",
+			"anthropic/claude-sonnet-5",
+			"anthropic/claude-fable-5-1[1m]",
+		] {
+			assert!(models.contains(expected), "missing {expected}");
+		}
+	}
 
 	#[test]
 	fn detects_only_standalone_lowercase_orchestrate_in_prose() {
