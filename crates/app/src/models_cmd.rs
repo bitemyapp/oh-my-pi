@@ -47,11 +47,9 @@ pub(crate) fn fresh_provider_models(
 	// endpoint's implicit Chat capability. Treat those rows as stale so the
 	// current decoder can replace them before a caller exposes the selector.
 	if provider.as_str() == "anthropic"
-		&& cached
-			.rows
-			.iter()
-			.any(|row| !discovered_model_supports_chat(row))
-	{
+		&& cached.rows.iter().any(|row| {
+			!discovered_model_supports_chat(row) || row.wire_model.as_str().ends_with("[1m]")
+		}) {
 		return Ok(None);
 	}
 	Ok(Some(discovered_selectors(&cached.rows)))
@@ -548,6 +546,7 @@ mod tests {
 			.expect("stale generation");
 		assert_eq!(fresh_provider_models(directory.path(), &provider).expect("stale lookup"), None,);
 
+		row.wire_model = omp_catalog::WireModelId::from("claude-fable-5-1");
 		row.declared_operations
 			.insert_kind(omp_catalog::OperationKind::Chat);
 		store
@@ -560,8 +559,28 @@ mod tests {
 			.expect("current generation");
 		assert_eq!(
 			fresh_provider_models(directory.path(), &provider).expect("fresh lookup"),
-			Some(vec!["anthropic/claude-fable-5-1[1m]".to_owned()]),
+			Some(vec!["anthropic/claude-fable-5-1".to_owned()]),
 		);
+	}
+
+	#[test]
+	fn anthropic_cache_rows_with_decorated_wire_ids_are_refreshed() {
+		let directory = tempfile::tempdir().expect("temporary profile");
+		let provider = ProviderId::from("anthropic");
+		let store = DiscoveryStore::open(&directory.path().join("models.db")).expect("cache");
+		let now_ms = discovery_now_ms().expect("clock");
+		let mut row = cached_model(&provider);
+		row.declared_operations
+			.insert_kind(omp_catalog::OperationKind::Chat);
+		store
+			.publish(
+				&DiscoveryCacheKey::provider(provider.clone()),
+				&[row],
+				now_ms,
+				DISCOVERY_CACHE_TTL,
+			)
+			.expect("decorated generation");
+		assert_eq!(fresh_provider_models(directory.path(), &provider).expect("stale lookup"), None,);
 	}
 
 	#[test]

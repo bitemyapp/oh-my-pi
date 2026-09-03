@@ -399,14 +399,15 @@ impl DiscoveryDecoder {
 		let cursor = envelope.cursor();
 		let mut rows = Vec::with_capacity(envelope.models.len());
 		for model in envelope.models {
-			let wire_model = model
+			let advertised_model = model
 				.model
 				.or(model.slug)
 				.or(model.id)
 				.ok_or_else(protocol_error)?;
-			if wire_model.starts_with(CLAUDE_CODE_UPDATE_SENTINEL_PREFIX) {
+			if advertised_model.starts_with(CLAUDE_CODE_UPDATE_SENTINEL_PREFIX) {
 				continue;
 			}
+			let (wire_model, advertised_alias) = account_wire_model(&self.provider, advertised_model);
 			let availability = match model.visibility.as_ref().map(Str::as_str) {
 				Some("visible" | "available") => Some(ModelAvailability::Available),
 				Some("hide" | "hidden" | "disabled") => Some(ModelAvailability::Disabled),
@@ -414,6 +415,9 @@ impl DiscoveryDecoder {
 			};
 			let mut row =
 				self.row(wire_model, model.display_name, model.family.map(ClassId::from), availability);
+			if let Some(alias) = advertised_alias {
+				row.aliases = vec![alias].into_boxed_slice();
+			}
 			// Anthropic's compact bootstrap rows describe models selectable by
 			// Claude's chat client but omit capability metadata. Absence there is
 			// not evidence that the model cannot chat.
@@ -647,6 +651,19 @@ struct AccountModel {
 	family:       Option<Str>,
 	#[serde(default)]
 	visibility:   Option<Str>,
+}
+
+fn account_wire_model(
+	provider: &ProviderId<str>,
+	advertised_model: Str,
+) -> (Str, Option<WireModelId>) {
+	if provider.as_str() == ANTHROPIC_PROVIDER
+		&& let Some(base_model) = advertised_model.as_str().strip_suffix("[1m]")
+		&& !base_model.is_empty()
+	{
+		return (Str::new(base_model), Some(WireModelId::from(advertised_model)));
+	}
+	(advertised_model, None)
 }
 
 fn invalid_request() -> Error {
@@ -1026,7 +1043,8 @@ mod tests {
 
 	#[test]
 	fn anthropic_bootstrap_omits_client_update_control_rows() {
-		let (rows, next) = discovered(
+		let (rows, next) = discovered_for_provider(
+			"anthropic",
 			DiscoveryFlavor::Account,
 			DiscoveryPagination::SinglePage,
 			br#"{
@@ -1038,7 +1056,8 @@ mod tests {
 		);
 		assert_eq!(next, None);
 		assert_eq!(rows.len(), 1);
-		assert_eq!(rows[0].wire_model.as_str(), "claude-fable-5-1[1m]");
+		assert_eq!(rows[0].wire_model.as_str(), "claude-fable-5-1");
+		assert_eq!(rows[0].aliases.as_ref(), &[WireModelId::from("claude-fable-5-1[1m]")]);
 	}
 
 	#[test]
