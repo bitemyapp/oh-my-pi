@@ -34,7 +34,7 @@ const PROMPT: &str = "Complete login in your browser. If the browser cannot reac
 const ANTHROPIC_BETA: HeaderName = HeaderName::from_static("anthropic-beta");
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 const REFRESH_USER_AGENT: &str = "anthropic-sdk-typescript/0.112.1 userOAuthProvider";
-const BOOTSTRAP_USER_AGENT: &str = "claude-code/2.1.246";
+const BOOTSTRAP_USER_AGENT: &str = "claude-code/2.1.258";
 
 struct AnthropicPkceHandler {
 	http: Arc<dyn OAuthHttpClient>,

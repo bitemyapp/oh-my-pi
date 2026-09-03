@@ -48,7 +48,7 @@ pub const DIRECT_PATH: &str = "/v1/messages";
 /// Claude Code inference endpoint.
 const CLAUDE_CODE_OAUTH_BETA: &str = "oauth-2025-04-20";
 /// User-Agent emitted by Cowork's Claude desktop inference entrypoint.
-const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.246 (external, claude-desktop)";
+const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.258 (external, claude-desktop)";
 /// `@anthropic-ai/sdk` version bundled by the matching Cowork release.
 const CLAUDE_CODE_SDK_VERSION: &str = "0.112.1";
 /// Ordered Cowork agent betas sent on every subscription-OAuth request.
