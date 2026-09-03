@@ -1571,7 +1571,7 @@ impl HeadlessSession {
 			.and_then(|route| catalog.route(route))
 			.ok_or_else(|| HeadlessError::MissingRoute(Str::new(selector)))?;
 		self
-			.control
+			.session
 			.model_override(now_ms(), JournalModelChange {
 				role:     sf!("temporary"),
 				model:    JournalModelRef {
