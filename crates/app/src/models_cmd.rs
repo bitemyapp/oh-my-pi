@@ -9,7 +9,7 @@ use std::{
 };
 
 use miette::{IntoDiagnostic as _, miette};
-use omp_catalog::{DiscoveredModel, ModelSpec, OperationBits, ProviderId, snapshot::Catalog};
+use omp_catalog::{DiscoveredModel, ModelSpec, ProviderId, snapshot::Catalog};
 use omp_core::Str;
 use omp_driver::bridges::{AgentGoalControl, InferenceBridge};
 use omp_inference::{
@@ -410,6 +410,14 @@ fn discovered(
 		.wire_ids
 		.iter()
 		.find_map(|(candidate, wire)| (candidate == route).then(|| wire.clone()))?;
+	let mut declared_operations = model.capabilities.operations;
+	// The Claude subscription bootstrap endpoint is itself an authoritative
+	// list of chat-selectable models. The mixed discovery projector may replace
+	// a compact response row with conservative catalog metadata, so retain this
+	// endpoint-level fact when materializing the durable cache row.
+	if provider.as_str() == "anthropic" {
+		declared_operations.insert_kind(omp_catalog::OperationKind::Chat);
+	}
 	Some(DiscoveredModel {
 		provider: provider.to_owned(),
 		route: route.to_owned(),
@@ -417,7 +425,7 @@ fn discovered(
 		aliases: Box::new([]),
 		display_name: Some(model.display_name.clone()),
 		declared_class: Some(model.class.clone()),
-		declared_operations: OperationBits::empty(),
+		declared_operations,
 		declared_capabilities: Some(model.capabilities.clone()),
 		declared_limits: Some(model.limits.clone()),
 		extended_context_mode: None,
@@ -511,7 +519,7 @@ mod tests {
 			aliases:               Box::new([]),
 			display_name:          Some(Str::new_static("Claude Fable 5.1")),
 			declared_class:        None,
-			declared_operations:   OperationBits::empty(),
+			declared_operations:   omp_catalog::OperationBits::empty(),
 			declared_capabilities: None,
 			declared_limits:       None,
 			extended_context_mode: None,
@@ -554,6 +562,20 @@ mod tests {
 			fresh_provider_models(directory.path(), &provider).expect("fresh lookup"),
 			Some(vec!["anthropic/claude-fable-5-1[1m]".to_owned()]),
 		);
+	}
+
+	#[test]
+	fn anthropic_cache_projection_retains_endpoint_chat_capability() {
+		let catalog = Catalog::embedded();
+		let provider = ProviderId::from("anthropic");
+		let route = omp_catalog::RouteId::from("anthropic/primary");
+		let mut model = catalog
+			.model(omp_catalog::ModelKey::from_ref("anthropic/claude-fable-5"))
+			.expect("bundled Anthropic model")
+			.clone();
+		model.capabilities = omp_catalog::unknown_capabilities();
+		let row = discovered(&model, &provider, &route, 1).expect("primary route wire id");
+		assert!(discovered_model_supports_chat(&row));
 	}
 
 	#[test]
