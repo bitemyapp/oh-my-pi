@@ -42,6 +42,18 @@ pub(crate) fn fresh_provider_models(
 	else {
 		return Ok(None);
 	};
+	// Cached rows outlive the binary that decoded them. Older Anthropic
+	// bootstrap decoders preserved the model identity but did not record the
+	// endpoint's implicit Chat capability. Treat those rows as stale so the
+	// current decoder can replace them before a caller exposes the selector.
+	if provider.as_str() == "anthropic"
+		&& cached
+			.rows
+			.iter()
+			.any(|row| !discovered_model_supports_chat(row))
+	{
+		return Ok(None);
+	}
 	Ok(Some(discovered_selectors(&cached.rows)))
 }
 
@@ -132,11 +144,25 @@ fn provider_discovery_routes(
 fn discovered_selectors(rows: &[DiscoveredModel]) -> Vec<String> {
 	let mut selectors = rows
 		.iter()
+		.filter(|row| discovered_model_supports_chat(row))
 		.map(|row| format!("{}/{}", row.provider, row.wire_model))
 		.collect::<Vec<_>>();
 	selectors.sort();
 	selectors.dedup();
 	selectors
+}
+
+fn discovered_model_supports_chat(row: &DiscoveredModel) -> bool {
+	row.declared_operations
+		.contains_kind(omp_catalog::OperationKind::Chat)
+		|| row
+			.declared_capabilities
+			.as_ref()
+			.is_some_and(|capabilities| {
+				capabilities
+					.operations
+					.contains_kind(omp_catalog::OperationKind::Chat)
+			})
 }
 
 fn discovery_now_ms() -> miette::Result<u64> {
@@ -476,6 +502,59 @@ fn print_rows(rows: &[&ModelSpec], json: bool) -> miette::Result<()> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn cached_model(provider: &ProviderId<str>) -> DiscoveredModel {
+		DiscoveredModel {
+			provider:              provider.to_owned(),
+			route:                 omp_catalog::RouteId::from("anthropic/primary"),
+			wire_model:            omp_catalog::WireModelId::from("claude-fable-5-1[1m]"),
+			aliases:               Box::new([]),
+			display_name:          Some(Str::new_static("Claude Fable 5.1")),
+			declared_class:        None,
+			declared_operations:   OperationBits::empty(),
+			declared_capabilities: None,
+			declared_limits:       None,
+			extended_context_mode: None,
+			availability:          None,
+			source:                Str::new_static("test"),
+			observed_at_ms:        None,
+			updated_at_ms:         None,
+			deprecated:            None,
+		}
+	}
+
+	#[test]
+	fn anthropic_cache_rows_without_chat_evidence_are_refreshed() {
+		let directory = tempfile::tempdir().expect("temporary profile");
+		let provider = ProviderId::from("anthropic");
+		let store = DiscoveryStore::open(&directory.path().join("models.db")).expect("cache");
+		let now_ms = discovery_now_ms().expect("clock");
+		let mut row = cached_model(&provider);
+		store
+			.publish(
+				&DiscoveryCacheKey::provider(provider.clone()),
+				&[row.clone()],
+				now_ms,
+				DISCOVERY_CACHE_TTL,
+			)
+			.expect("stale generation");
+		assert_eq!(fresh_provider_models(directory.path(), &provider).expect("stale lookup"), None,);
+
+		row.declared_operations
+			.insert_kind(omp_catalog::OperationKind::Chat);
+		store
+			.publish(
+				&DiscoveryCacheKey::provider(provider.clone()),
+				&[row],
+				now_ms,
+				DISCOVERY_CACHE_TTL,
+			)
+			.expect("current generation");
+		assert_eq!(
+			fresh_provider_models(directory.path(), &provider).expect("fresh lookup"),
+			Some(vec!["anthropic/claude-fable-5-1[1m]".to_owned()]),
+		);
+	}
 
 	#[test]
 	fn provider_discovery_routes_deduplicate_shared_specs() {

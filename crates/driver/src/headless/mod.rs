@@ -1583,9 +1583,24 @@ impl HeadlessSession {
 			})
 			.await
 			.map_err(composition)?;
-		self
-			.state
-			.update(|snapshot| snapshot.turn.params.model = model.to_string());
+		self.state.update(|snapshot| {
+			snapshot.turn.params.model = model.to_string();
+			let mut fields = match snapshot.props.get(omp_agent::prompt_keys::MODEL) {
+				Some(omp_scribe::Value::Map(fields)) => fields.clone(),
+				_ => Default::default(),
+			};
+			fields.insert(
+				Str::new_static(omp_agent::prompt_keys::IDENTIFIER),
+				omp_scribe::Value::from(Str::new(selector)),
+			);
+			fields.insert(
+				Str::new_static("codex_task_policy"),
+				omp_scribe::Value::from(crate::task::prompt_policy::uses_codex_task_prompt(selector)),
+			);
+			snapshot
+				.props
+				.set(omp_agent::prompt_keys::MODEL, omp_scribe::Value::Map(fields));
+		});
 		Ok(())
 	}
 

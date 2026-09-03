@@ -1467,23 +1467,10 @@ impl Runtime {
 				let state = self.state.lock();
 				Ok(json!({ "models": state.models, "active": state.config.model }))
 			},
-			"cycle_model" => self.cycle_model(),
+			"cycle_model" => self.cycle_model().await,
 			"set_model" => {
 				let params = parse_params::<SetModelParams>(params)?;
-				let result = self.set_model(&params.provider, &params.model_id)?;
-				let selector = result
-					.get("model")
-					.and_then(Value::as_str)
-					.expect("set_model returns its validated selector");
-				self
-					.headless
-					.lock()
-					.await
-					.session
-					.set_model(selector)
-					.await
-					.map_err(|error| CommandError::new("model_not_found", error.to_string()))?;
-				Ok(result)
+				self.change_model(&params.provider, &params.model_id).await
 			},
 			"set_fast_mode" => {
 				let enabled = boolean(params, "enabled")?;
@@ -2209,15 +2196,6 @@ impl Runtime {
 	fn set_string_config(&self, key: &str, value: &str) -> Result<Value, CommandError> {
 		let mut state = self.state.lock();
 		match key {
-			"model" => {
-				if !state.models.iter().any(|candidate| candidate == value) {
-					return Err(CommandError::new(
-						"model_not_found",
-						format!("unknown model `{value}`"),
-					));
-				}
-				state.config.model = value.to_owned();
-			},
 			"thinkingLevel" => state.config.thinking_level = value.to_owned(),
 			"steeringMode" => state.config.steering_mode = value.to_owned(),
 			"followUpMode" => state.config.follow_up_mode = value.to_owned(),
@@ -2232,7 +2210,11 @@ impl Runtime {
 		Ok(json!({ "key": key, "value": value }))
 	}
 
-	fn set_model(&self, provider: &str, model_id: &str) -> Result<Value, CommandError> {
+	fn validated_model_selector(
+		&self,
+		provider: &str,
+		model_id: &str,
+	) -> Result<String, CommandError> {
 		if provider.is_empty() || model_id.is_empty() {
 			return Err(CommandError::new("invalid_params", "provider and modelId must not be empty"));
 		}
@@ -2241,7 +2223,7 @@ impl Runtime {
 		} else {
 			format!("{provider}/{model_id}")
 		};
-		let mut state = self.state.lock();
+		let state = self.state.lock();
 		if !state
 			.providers
 			.iter()
@@ -2255,6 +2237,22 @@ impl Runtime {
 		if !state.models.iter().any(|candidate| candidate == &key) {
 			return Err(CommandError::new("model_not_found", format!("unknown model `{key}`")));
 		}
+		Ok(key)
+	}
+
+	async fn change_model(&self, provider: &str, model_id: &str) -> Result<Value, CommandError> {
+		let key = self.validated_model_selector(provider, model_id)?;
+		// The live session owns inference truth. Do not publish a configuration
+		// change until that owner has accepted and durably recorded the model.
+		self
+			.headless
+			.lock()
+			.await
+			.session
+			.set_model(&key)
+			.await
+			.map_err(|error| CommandError::new("model_not_found", error.to_string()))?;
+		let mut state = self.state.lock();
 		state.config.model = key.clone();
 		state.config.provider = Some(provider.to_owned());
 		let config = serde_json::to_value(&state.config).map_err(CommandError::json)?;
@@ -2281,7 +2279,7 @@ impl Runtime {
 		Ok(json!({ "enabled": value, "active": value }))
 	}
 
-	fn cycle_model(&self) -> Result<Value, CommandError> {
+	async fn cycle_model(&self) -> Result<Value, CommandError> {
 		let next = {
 			let state = self.state.lock();
 			let index = state
@@ -2295,7 +2293,11 @@ impl Runtime {
 				.cloned()
 		}
 		.ok_or_else(|| CommandError::new("model_not_found", "no models are available"))?;
-		self.set_string_config("model", &next)
+		let (provider, model_id) = next.split_once('/').ok_or_else(|| {
+			CommandError::new("model_not_found", format!("model selector `{next}` has no provider"))
+		})?;
+		let changed = self.change_model(provider, model_id).await?;
+		Ok(json!({ "key": "model", "value": changed["model"] }))
 	}
 
 	fn cycle_thinking(&self) -> Result<Value, CommandError> {
@@ -3434,8 +3436,12 @@ impl ModelCommandHost for RpcCommandHost {
 		};
 		let runtime = self.runtime.clone();
 		Box::pin(async move {
+			let (provider, model_id) = selector
+				.split_once('/')
+				.ok_or_else(|| miette!("model selector `{selector}` must include its provider"))?;
 			runtime
-				.set_string_config("model", selector.as_str())
+				.change_model(provider, model_id)
+				.await
 				.map_err(|error| miette!(error.message))?;
 			command_status("Model updated.").await
 		})
