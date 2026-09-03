@@ -221,6 +221,14 @@ fn discovered(
 		.wire_ids
 		.iter()
 		.find_map(|(candidate, wire)| (candidate == route).then(|| wire.clone()))?;
+	let mut declared_operations = model.capabilities.operations;
+	// The Claude subscription bootstrap endpoint is itself an authoritative
+	// list of chat-selectable models. The mixed discovery projector may replace
+	// a compact response row with conservative catalog metadata, so retain this
+	// endpoint-level fact when materializing the durable cache row.
+	if provider.as_str() == "anthropic" {
+		declared_operations.insert_kind(omp_catalog::OperationKind::Chat);
+	}
 	Some(DiscoveredModel {
 		provider: provider.to_owned(),
 		route: route.to_owned(),
@@ -228,7 +236,7 @@ fn discovered(
 		aliases: Box::new([]),
 		display_name: Some(model.display_name.clone()),
 		declared_class: Some(model.class.clone()),
-		declared_operations: OperationBits::empty(),
+		declared_operations,
 		declared_capabilities: Some(model.capabilities.clone()),
 		declared_limits: Some(model.limits.clone()),
 		declared_pricing: Box::new([]),
