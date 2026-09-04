@@ -410,6 +410,18 @@ pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, Reg
 						.contains_key(record.model.key.as_str())
 			});
 			if !explicitly_configured {
+				// The normalizer keys discovered rows by their bare logical
+				// model; every bundled key is `provider/model`, and selectors
+				// resolve by key, so prefix the provider here.
+				let mut record = record;
+				if !record.model.key.as_str().contains('/') {
+					let prefixed =
+						omp_catalog::ModelKey::from(format!("{}/{}", key.provider, record.model.key));
+					record.model.key = prefixed.clone();
+					for alias in record.aliases.iter_mut() {
+						alias.target = prefixed.clone();
+					}
+				}
 				normalized.push(record.into_catalog_overlay());
 			}
 		}
@@ -916,6 +928,13 @@ async fn production_assembly_with_catalog(
 	let stored = Arc::new(auth_backend::combined_authority(credential_store.clone()));
 	let database = data_dir.join("credentials.db");
 	let accounts = AccountPool::with_store(Arc::new(AccountStateStore::open(&database)?))?;
+	// Stored route sets predate this catalog whenever per-model route hashes
+	// moved; rebinding keeps every account selectable for the live routes.
+	match accounts.rebind_routes(&catalog) {
+		Ok(0) => {},
+		Ok(rebound) => tracing::debug!(rebound, "account routes rebound to the current catalog"),
+		Err(error) => tracing::warn!(%error, "account route rebinding failed"),
+	}
 	let oauth_http = Arc::new(SystemOAuthHttpClient::new());
 	// Resolve the Antigravity client version concurrently with the remaining
 	// assembly: route codecs freeze their headers at construction, so the

@@ -372,6 +372,36 @@ impl AccountPool {
 		Ok(Self { state: Arc::new(RwLock::new(state)), store: Some(store), changes })
 	}
 
+	/// Re-derives every stored account's eligible routes from the current
+	/// catalog, persisting any change.
+	///
+	/// Login records the provider's route ids at authentication time, but
+	/// per-model route ids are content hashes that change whenever the catalog
+	/// is regenerated, so a persisted set silently goes stale and every account
+	/// becomes route-ineligible for the new ids. Returns how many records were
+	/// rebound.
+	pub fn rebind_routes(
+		&self,
+		catalog: &omp_catalog::snapshot::Catalog,
+	) -> Result<usize, AccountRegistrationError> {
+		let mut rebound = 0;
+		for mut record in self.accounts() {
+			let routes = catalog
+				.routes()
+				.iter()
+				.filter(|route| route.provider == record.provider)
+				.map(|route| route.id.clone())
+				.collect::<BTreeSet<_>>();
+			if routes.is_empty() || routes == record.routes {
+				continue;
+			}
+			record.routes = routes;
+			self.upsert(record)?;
+			rebound += 1;
+		}
+		Ok(rebound)
+	}
+
 	/// Returns the durable account-state dependency, when configured.
 	pub const fn state_store(&self) -> Option<&Arc<AccountStateStore>> {
 		self.store.as_ref()
@@ -1052,4 +1082,48 @@ fn route_cooldown<'a>(
 		.route_cooldowns
 		.get(&record.account)?
 		.get(&request.route)
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::BTreeSet;
+
+	use super::*;
+	use crate::{
+		call::AccountRoutingContext,
+		id::{AccountId, PrincipalId},
+	};
+
+	#[test]
+	fn rebind_routes_replaces_stale_route_ids_with_the_catalog_provider_routes() {
+		use omp_catalog::snapshot::Catalog;
+		let catalog = Catalog::embedded();
+		let expected = catalog
+			.routes()
+			.iter()
+			.filter(|route| route.provider.as_str() == "anthropic")
+			.map(|route| route.id.clone())
+			.collect::<BTreeSet<_>>();
+		assert!(!expected.is_empty(), "embedded catalog has Anthropic routes");
+		let pool = AccountPool::new();
+		pool
+			.upsert(AccountRecord {
+				account:               AccountId::from("anthropic:person@example.test"),
+				principal:             PrincipalId::from("person@example.test"),
+				provider:              ProviderId::from("anthropic"),
+				routes:                BTreeSet::from([RouteId::from("route-stale")]),
+				enabled:               true,
+				credential_generation: 1,
+				routing:               AccountRoutingContext::default(),
+			})
+			.expect("register account");
+		assert_eq!(pool.rebind_routes(catalog).expect("rebind"), 1);
+		let record = pool
+			.accounts()
+			.into_iter()
+			.find(|record| record.provider.as_str() == "anthropic")
+			.expect("account retained");
+		assert_eq!(record.routes, expected);
+		assert_eq!(pool.rebind_routes(catalog).expect("rebind again"), 0);
+	}
 }
