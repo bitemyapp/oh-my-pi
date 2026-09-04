@@ -2165,8 +2165,16 @@ impl AccountSelector<Call> for RouteAccountSelector {
 			AttemptAction::RefreshCredential { previous_account } => (previous_account, false, false),
 			AttemptAction::RotateAccount { previous_account } => (previous_account, true, false),
 		};
+		// A host pin outranks provider-state affinity: when the pinned principal
+		// differs from an existing binding, the account layer rejects the
+		// binding as expired and session planning reseeds under the pin.
 		let affinity = context.session_affinity();
-		let preserve_principal = affinity.is_some();
+		let principal = call
+			.account_pins
+			.get(&self.provider)
+			.cloned()
+			.or_else(|| affinity.as_ref().map(|binding| binding.principal.clone()));
+		let preserve_principal = principal.is_some();
 		let quota_scope = omp_catalog::has_quota_tier_policy(self.provider.as_str()).then(|| {
 			let model = match &call.target {
 				Target::Model(model) | Target::Provider { model, .. } | Target::Route { model, .. } => {
@@ -2183,9 +2191,9 @@ impl AccountSelector<Call> for RouteAccountSelector {
 		let request = AccountSelectionRequest {
 			provider: self.provider.clone(),
 			route: self.route.clone(),
-			affinity: affinity.as_ref().map(|binding| binding.principal.clone()),
+			affinity: principal.clone(),
 			previous_account,
-			previous_principal: affinity.as_ref().map(|binding| binding.principal.clone()),
+			previous_principal: principal,
 			rotate,
 			rotation: RotationPolicy { allow_account_change: true, preserve_principal },
 			now: SystemTime::now(),
@@ -3530,6 +3538,7 @@ mod tests {
 			deadline: None,
 			budget,
 			session: None,
+			account_pins: Default::default(),
 			debug_session: None,
 			affinity: Default::default(),
 			response_hooks: Default::default(),

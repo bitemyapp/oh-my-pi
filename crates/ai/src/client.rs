@@ -125,11 +125,12 @@ impl<O: Operation> PlannedOperation<O> {
 /// Typed facade over one Tower inference service and one side-effect-free
 /// planner.
 pub struct Client<S, P> {
-	service:  S,
-	planner:  P,
-	meta:     CallMeta,
-	affinity: crate::call::CallAffinity,
-	staging:  Option<crate::call::StagingRequest>,
+	service:      S,
+	planner:      P,
+	meta:         CallMeta,
+	affinity:     crate::call::CallAffinity,
+	staging:      Option<crate::call::StagingRequest>,
+	account_pins: Option<crate::call::AccountPins>,
 }
 
 impl<S, P> Client<S, P>
@@ -139,7 +140,21 @@ where
 	/// Creates a client with a clone-cheap planner and caller-supplied metadata
 	/// defaults.
 	pub const fn new(service: S, planner: P, meta: CallMeta) -> Self {
-		Self { service, planner, meta, affinity: crate::call::CallAffinity::none(), staging: None }
+		Self {
+			service,
+			planner,
+			meta,
+			affinity: crate::call::CallAffinity::none(),
+			staging: None,
+			account_pins: None,
+		}
+	}
+
+	/// Returns this client with host-owned account pins whose current snapshot
+	/// is attached to every subsequently planned call.
+	pub fn with_account_pins(mut self, pins: crate::call::AccountPins) -> Self {
+		self.account_pins = Some(pins);
+		self
 	}
 
 	/// Attaches session-independent prompt-cache and provider-session
@@ -201,6 +216,9 @@ where
 		let mut call = operation.to_call(self.meta.clone());
 		call.affinity = self.affinity.clone();
 		call.staging = self.staging.clone();
+		if let Some(pins) = &self.account_pins {
+			call.account_pins = pins.snapshot();
+		}
 		let plan = Arc::new(self.planner.plan(&mut call, Instant::now())?);
 		if plan.operation != O::KIND {
 			return Err(Error::planning(

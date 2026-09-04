@@ -1,6 +1,7 @@
 //! Clone-cheap request envelopes and the closed operation vocabulary.
 
 use std::{
+	collections::BTreeMap,
 	fmt,
 	sync::Arc,
 	time::{Duration, Instant, SystemTime},
@@ -9,6 +10,7 @@ use std::{
 use bytes::Bytes;
 use omp_core::{SecretString, Str, encoding::hex, sf};
 use omp_proto::thread::v1::{self as thread_pb, item, part};
+use parking_lot::Mutex;
 use serde_json::{Value, value::RawValue};
 use strum::IntoStaticStr;
 
@@ -134,6 +136,38 @@ pub struct SessionRequest {
 	pub forked:         bool,
 }
 
+/// Host-owned principal pins keyed by provider.
+///
+/// A pin restricts account selection for its provider to the pinned principal
+/// on every call that carries a snapshot of it; providers without a pin keep
+/// ordinary pool selection. Pins are invocation-scoped and are never journaled
+/// or persisted by inference.
+#[derive(Clone, Debug, Default)]
+pub struct AccountPins(Arc<Mutex<BTreeMap<ProviderId, PrincipalId>>>);
+
+impl AccountPins {
+	/// Pins one provider to the principal that owns the selected account.
+	pub fn set(&self, provider: ProviderId, principal: PrincipalId) {
+		self.0.lock().insert(provider, principal);
+	}
+
+	/// Removes the pin for one provider, returning the previously pinned
+	/// principal.
+	pub fn clear(&self, provider: &ProviderId<str>) -> Option<PrincipalId> {
+		self.0.lock().remove(provider)
+	}
+
+	/// Returns the pinned principal for one provider.
+	pub fn get(&self, provider: &ProviderId<str>) -> Option<PrincipalId> {
+		self.0.lock().get(provider).cloned()
+	}
+
+	/// Copies the current pins for attachment to one call.
+	pub fn snapshot(&self) -> BTreeMap<ProviderId, PrincipalId> {
+		self.0.lock().clone()
+	}
+}
+
 /// Determines how canonical conversation context reaches a provider.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContextStrategy {
@@ -254,6 +288,8 @@ pub struct Call {
 	pub budget:         ExecutionBudget,
 	/// Optional append-only conversation context.
 	pub session:        Option<SessionRequest>,
+	/// Host-pinned principal per provider; account selection preserves it.
+	pub account_pins:   BTreeMap<ProviderId, PrincipalId>,
 	/// Observer-only session identity for bounded private wire capture.
 	pub debug_session:  Option<Str>,
 	/// Session-independent prompt-cache and provider-session identities.
@@ -290,6 +326,7 @@ impl Call {
 			deadline: meta.deadline,
 			budget: meta.budget,
 			session: meta.session,
+			account_pins: BTreeMap::new(),
 			debug_session: meta.debug_session,
 			affinity: CallAffinity::none(),
 			response_hooks: meta.response_hooks,
@@ -310,6 +347,12 @@ impl Call {
 	/// identities.
 	pub fn with_affinity(mut self, affinity: CallAffinity) -> Self {
 		self.affinity = affinity;
+		self
+	}
+
+	/// Attaches host-pinned principals that account selection must preserve.
+	pub fn with_account_pins(mut self, pins: BTreeMap<ProviderId, PrincipalId>) -> Self {
+		self.account_pins = pins;
 		self
 	}
 

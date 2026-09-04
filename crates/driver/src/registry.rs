@@ -20,7 +20,7 @@ use omp_ai::provider::builtin::LocalRouteBackend;
 #[cfg(feature = "local-applefm")]
 use omp_ai::receipt::ReasonId;
 use omp_ai::{
-	Registry,
+	AccountPins, Registry,
 	account::{
 		AccountPool, AccountStateStore, AccountStateStoreError, RefreshCoordinator, RefreshPolicy,
 	},
@@ -654,6 +654,8 @@ pub struct InferenceSessionOverrides {
 	pub api_key:                 Option<SecretString>,
 	/// Opaque prompt-cache identity lowered by compatible codecs.
 	pub prompt_cache_affinity:   Option<Str>,
+	/// Host-owned per-provider account pins shared with the inference facade.
+	pub account_pins:            Option<AccountPins>,
 	/// Shared extension-host usage registry allocated before inference assembly.
 	pub usage_fetchers:          Option<UsageFetcherRegistry>,
 	/// Session-owned provider response hook sink.
@@ -776,6 +778,7 @@ pub async fn production_inference_for_session(
 	let search_settings = omp_ai::search_settings::WebSearchSettings::from_con(ctx.as_ref());
 	let rpc = InferenceRpc::new(registry.clone(), sessions, tool_registry)
 		.with_session_overrides(provider, overrides.prompt_cache_affinity)
+		.with_account_pins(overrides.account_pins.unwrap_or_default())
 		.with_provider_response_hooks(provider_response_hooks.clone())
 		.with_search_settings(search_settings);
 	auth_manager.bind_provider_hooks(provider_response_hooks);

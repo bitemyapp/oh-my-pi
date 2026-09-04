@@ -882,6 +882,7 @@ mod tests {
 			deadline: None,
 			budget: ExecutionBudget::default(),
 			session: None,
+			account_pins: Default::default(),
 			debug_session: None,
 			affinity: Default::default(),
 			response_hooks: Default::default(),
