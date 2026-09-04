@@ -4065,7 +4065,10 @@ fn environment_declarations(
 		}
 	}
 	if tool_settings.enabled("write") {
-		push(omp_tools::write::spec(), long_tail_presentation(policy), long_tail_claims(policy));
+		// `write` is the only way to create a file: the hashline edit prompt
+		// sends new files to it, so it must be a slot the model can call
+		// rather than a `dyn` device it has to discover through the shell.
+		push(omp_tools::write::spec(), essential_presentation(policy), core_claims());
 	}
 	if tool_settings.enabled("lsp") {
 		push(omp_tools::lsp::spec(), long_tail_presentation(policy), long_tail_claims(policy));
@@ -4673,12 +4676,7 @@ pub(crate) fn production_registry<
 		tool_settings.edit_guard_generated,
 	);
 	if tool_settings.enabled("write") {
-		environment_registry(
-			&mut registry,
-			write,
-			long_tail_presentation(policy),
-			long_tail_claims(policy),
-		)?;
+		environment_registry(&mut registry, write, essential_presentation(policy), core_claims())?;
 	}
 	if tool_settings.enabled("lsp") {
 		let maximum = tool_settings
@@ -6160,7 +6158,7 @@ mod tests {
 	}
 
 	#[test]
-	fn default_roster_has_exactly_five_slots_and_keeps_long_tail_devices_live() {
+	fn default_roster_has_exactly_six_slots_and_keeps_long_tail_devices_live() {
 		let inputs = EnvironmentDeclarationInputs {
 			read_policy:      omp_tools::read::ReadPolicy::default(),
 			selected_edit:    omp_tools::edit::hashline_spec().rev,
@@ -6215,7 +6213,7 @@ mod tests {
 			.collect::<BTreeSet<_>>();
 		assert_eq!(
 			slots,
-			[sf!("bash"), sf!("edit"), sf!("glob"), sf!("grep"), sf!("read")]
+			[sf!("bash"), sf!("edit"), sf!("glob"), sf!("grep"), sf!("read"), sf!("write")]
 				.into_iter()
 				.collect()
 		);
@@ -6247,9 +6245,11 @@ mod tests {
 			.devices()
 			.map(|device| device.name.clone())
 			.collect::<BTreeSet<_>>();
-		for expected in ["ast_edit", "ast_grep", "debug", "eval", "lsp", "write"] {
+		for expected in ["ast_edit", "ast_grep", "debug", "eval", "lsp"] {
 			assert!(devices.contains(expected), "{expected} must remain reachable through dyn");
 		}
+		// `write` is a slot now, so it is no longer mounted as a device.
+		assert!(!devices.contains("write"), "write is advertised as a slot, not a dyn device");
 	}
 
 	#[test]
