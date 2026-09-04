@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "source_digest": "f6c24b11d18bf036557645be6908f8838b64d54f14420aef36bcd20172ac2321",
+  "source_digest": "d4e84b5fa49e2094da41789d507ae638834754977a8e3fe69213c3c553fbc2bb",
   "inputs": [
     {
       "id": "catalog.models.compressed.v1",
@@ -11,7 +11,7 @@
     {
       "id": "catalog.oauth.source.v1",
       "path": "fixtures/llm-oracle/catalog/oauth.toml",
-      "sha256": "3608e8a48097cfd54dfd3203938691fe12705dee8aff0d0604359ff7c2aea56f",
+      "sha256": "27b8b0c88dbf7138c310409681cb6e20375e50842568d41544b077136d31bad7",
       "source": "oracle:catalog.oauth.source.v1"
     },
     {
@@ -71,7 +71,7 @@
     {
       "id": "catalog.providers.source.v1",
       "path": "fixtures/llm-oracle/catalog/providers.toml",
-      "sha256": "fdaf688fe55ca76297c550d43504b597bb7f944f82bb641f64cd8a819f012c31",
+      "sha256": "d84482af65d24d52bc71024f636b44d4389aeb7f19a9b70ac083891691c8dbdd",
       "source": "oracle:catalog.providers.source.v1"
     },
     {
@@ -149,13 +149,13 @@
     {
       "id": "compat.cascade.classes.mimo.v1",
       "path": "crates/catalog/compat/classes/mimo.kdl",
-      "sha256": "4f223113dd65c18f46d75a15001c7379763e067c7d57f59282740bd6b2128d60",
+      "sha256": "f1acb6296e74ab4a03cbdc877aa6eb8fb3bb9130d781cfaadf2f93315a25f8ea",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
       "id": "compat.cascade.classes.minimax.v1",
       "path": "crates/catalog/compat/classes/minimax.kdl",
-      "sha256": "f4c06ab99c3976e23d2ad87d56146348cf651ec03106ca0d6cd522e82329a2bb",
+      "sha256": "a7fd93075aee3d90440312cc8ea2771d7ef71dbe750dd0c751b23afb469e4153",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {

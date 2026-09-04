@@ -1668,6 +1668,18 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 			route.codec.as_str() == "bedrock-converse" && operation.kind() == OperationKind::Chat;
 		if bedrock_converse {
 			merge_bedrock_headers(&mut encoded.headers, &self.headers);
+		} else if encoded.operation == OperationKind::DiscoverModels
+			&& route.provider.as_str() == "anthropic"
+		{
+			// The Claude subscription bootstrap endpoint rejects the Messages
+			// API version header; every other static header still applies.
+			let discovery_headers = self
+				.headers
+				.iter()
+				.filter(|header| !header.name.eq_ignore_ascii_case("anthropic-version"))
+				.cloned()
+				.collect::<Vec<_>>();
+			merge_static_headers(&mut encoded.headers, &discovery_headers, execution)?;
 		} else {
 			merge_static_headers(&mut encoded.headers, &self.headers, execution)?;
 		}
