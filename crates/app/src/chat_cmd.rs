@@ -494,6 +494,7 @@ impl Launch {
 			schema_mode: None,
 			prompt_cache_key,
 			provider_session,
+			account_pins: None,
 		};
 		Ok(Self {
 			data_dir,

@@ -63,8 +63,20 @@ pub async fn run(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 async fn run_inner(args: ChatArgs, ui_enabled: bool) -> miette::Result<()> {
 	let project = fs::canonicalize(&args.project).into_diagnostic()?;
 	let ctx = Arc::new(crate::process_ctx(&project)?);
+	// Account-model discovery publishes into the discovery cache that the
+	// launch catalog hydrates, so it must precede `LaunchEnv::production`.
+	let accounts = if args.gateway.is_none() {
+		let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
+		let home = std::env::var_os("HOME").map_or_else(|| project.clone(), PathBuf::from);
+		Some(crate::rpc_accounts::AccountAuthority::compose(&data_dir, &ctx, &project, &home).await?)
+	} else {
+		None
+	};
 	let env = LaunchEnv::production(&project, args.gateway.is_some())?;
-	let launch = Launch::prepare(args, ctx, env).await?;
+	let mut launch = Launch::prepare(args, ctx, env).await?;
+	if let Some(accounts) = &accounts {
+		launch.options.account_pins = Some(accounts.pins.clone());
+	}
 	let (kernel, session) = launch.compose().await?;
 	let home = SessionHome::new(
 		&launch.data_dir,
@@ -82,19 +94,20 @@ async fn run_inner(args: ChatArgs, ui_enabled: bool) -> miette::Result<()> {
 			.bind_ask_presenter(Arc::new(ui.clone()));
 	}
 	let runtime = RpcRuntime {
-		con:                  Some(Arc::clone(&launch.ctx)),
-		catalog:              Some(Arc::clone(&launch.catalog)),
-		model:                launch.model.clone(),
-		model_cycle:          launch.cycle(),
-		model_cycle_index:    0,
-		project:              launch.project.clone(),
-		session_name:         None,
+		con: Some(Arc::clone(&launch.ctx)),
+		catalog: Some(Arc::clone(&launch.catalog)),
+		model: launch.model.clone(),
+		model_cycle: launch.cycle(),
+		model_cycle_index: 0,
+		project: launch.project.clone(),
+		session_name: None,
 		automatic_compaction: true,
-		auto_retry:           true,
-		steering_mode:        Str::new_static("one-at-a-time"),
-		follow_up_mode:       Str::new_static("one-at-a-time"),
-		interrupt_mode:       Str::new_static("immediate"),
-		skills:               launch.options.discovered_skills.clone(),
+		auto_retry: true,
+		steering_mode: Str::new_static("one-at-a-time"),
+		follow_up_mode: Str::new_static("one-at-a-time"),
+		interrupt_mode: Str::new_static("immediate"),
+		skills: launch.options.discovered_skills.clone(),
+		accounts,
 	};
 	serve_rpc_with_runtime(kernel, session, home, ui, runtime, stdin(), stdout()).await
 }
@@ -317,6 +330,9 @@ struct RpcRuntime {
 	follow_up_mode:       Str,
 	interrupt_mode:       Str,
 	skills:               Option<Arc<omp_driver::discovery::skills::ActiveSkills>>,
+	/// Host account, login, and discovery authority; absent for detached
+	/// compositions.
+	accounts:             Option<Arc<crate::rpc_accounts::AccountAuthority>>,
 }
 
 impl RpcRuntime {
@@ -339,6 +355,7 @@ impl RpcRuntime {
 			follow_up_mode:       Str::new_static("one-at-a-time"),
 			interrupt_mode:       Str::new_static("immediate"),
 			skills:               None,
+			accounts:             None,
 		}
 	}
 }
@@ -977,6 +994,12 @@ fn rpc_models(runtime: &RpcRuntime) -> Vec<Value> {
 			catalog
 				.models()
 				.iter()
+				.filter(|model| {
+					runtime
+						.accounts
+						.as_ref()
+						.is_none_or(|accounts| accounts.model_visible(model.key.as_str()))
+				})
 				.map(|model| {
 					let key = model.key.as_str();
 					let (provider, id) = key.split_once('/').unwrap_or(("", key));
@@ -1076,6 +1099,7 @@ fn rpc_state(
 		"autoRetryEnabled": runtime.auto_retry,
 		"fastModeEnabled": fast,
 		"fastModeActive": fast,
+		"accountPins": runtime.accounts.as_ref().map(|accounts| accounts.pinned_accounts()).unwrap_or_else(|| json!({})),
 		"tokensPerSecond": Value::Null,
 		"messageCount": messages.len(),
 		"queuedMessageCount": queued_prompt_count(dom),
@@ -1966,21 +1990,51 @@ where
 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
 							},
 							"get_login_providers" => {
-								let response = RpcResponse::success(
-									id,
-									command.as_str(),
-									json!({ "providers": [] }),
-								).into_diagnostic()?;
+								let providers = runtime.accounts.as_ref()
+									.map(|accounts| accounts.login_providers())
+									.unwrap_or_else(|| json!({ "providers": [] }));
+								let response = RpcResponse::success(id, command.as_str(), providers).into_diagnostic()?;
 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
 							},
-							"login" => {
-								let response = RpcResponse::error(
-									id,
-									command.as_str(),
-									"OAuth login is unavailable on this RPC composition",
-									Some(RpcErrorCode::new("unsupported")),
-								);
-								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
+							"login" | "list_accounts" | "set_account" | "logout_account" | "refresh_models" | "auth_answer" => {
+								let response = match runtime.accounts.as_ref() {
+									None => Err(crate::rpc_accounts::CommandError {
+										code:    RpcErrorCode::new("unsupported"),
+										message: "accounts are unavailable on this RPC composition".into(),
+									}),
+									Some(accounts) => {
+										let notify_tx = outgoing_tx.clone();
+										let notify: crate::rpc_accounts::Notify = Arc::new(move |frame| {
+											let _ = notify_tx.send(Outgoing::Frame(frame));
+										});
+										match command.as_str() {
+											"login" => accounts.login(&request.params, notify).await,
+											"list_accounts" => accounts.list_accounts().await,
+											"set_account" => accounts.set_account(&request.params).await,
+											"logout_account" => accounts.logout_account(&request.params).await,
+											"refresh_models" => accounts.refresh_models().await,
+											_ => {
+												let mut frame = request.params.clone();
+												frame.insert("type".into(), Value::String("auth_answer".into()));
+												match serde_json::from_value::<omp_rpc::protocol::RpcAuthAnswerFrame>(Value::Object(frame)) {
+													Ok(answer) => accounts.answer_auth(answer).await.map(|()| Value::Null),
+													Err(error) => Err(crate::rpc_accounts::CommandError {
+														code:    RpcErrorCode::new("invalid_params"),
+														message: error.to_string(),
+													}),
+												}
+											},
+										}
+									},
+								};
+								let response = match response {
+									Ok(Value::Null) if command == "auth_answer" => None,
+									Ok(data) => Some(RpcResponse::success(id, command.as_str(), data).into_diagnostic()?),
+									Err(error) => Some(RpcResponse::error(id, command.as_str(), error.message, Some(error.code))),
+								};
+								if let Some(response) = response {
+									outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
+								}
 							},
 							"set_host_uri_schemes" => {
 								let response = RpcResponse::error(

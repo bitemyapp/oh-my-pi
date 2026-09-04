@@ -185,6 +185,8 @@ pub struct KernelOptions {
 	pub prompt_cache_key:   Option<Str>,
 	/// Invocation-scoped provider session identity (`--provider-session-id`).
 	pub provider_session:   Option<Str>,
+	/// Host-owned per-provider account pins attached to every inference call.
+	pub account_pins:       Option<omp_ai::AccountPins>,
 }
 
 /// Removes a no-session journal and its private blob/local/temp namespace
@@ -1869,12 +1871,12 @@ pub async fn compose_kernel(
 			debug_session: None,
 			response_hooks: Default::default(),
 		};
-		let client = Client::new(stack.registry.service(), planner, meta.clone()).with_affinity(
-			omp_ai::CallAffinity {
+		let client = Client::new(stack.registry.service(), planner, meta.clone())
+			.with_affinity(omp_ai::CallAffinity {
 				prompt_cache:     options.prompt_cache_key.clone(),
 				provider_session: options.provider_session.clone(),
-			},
-		);
+			})
+			.with_account_pins(options.account_pins.clone().unwrap_or_default());
 		ComposedInference::Production(ProductionInference {
 			client,
 			meta,

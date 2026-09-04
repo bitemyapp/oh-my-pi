@@ -53,6 +53,7 @@ pub mod profile_alias;
 pub mod progress_reporter;
 pub mod ps_cmd;
 pub mod render_cmd;
+pub mod rpc_accounts;
 pub mod rpc_mode;
 #[cfg(feature = "local-tts")]
 pub mod say_cmd;
