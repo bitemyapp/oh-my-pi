@@ -78,6 +78,7 @@ pub use manager::{
 	CredentialAcquisitionLoginEngineError, CredentialAffinityError, CredentialAffinityResolver,
 	CredentialControlWrite, OAuthControlImport, OAuthLoginEngine, OAuthLoginEngineError,
 	RefreshingCredentialSource, SecretLoginEngine, SecretLoginEngineError, StoredOAuthRefreshEngine,
+	prune_credentialless_accounts,
 };
 pub use oauth::{
 	DevicePending, OAuthClock, OAuthCredentialManagerError, OAuthCustomDispatchError,

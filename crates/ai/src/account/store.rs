@@ -686,6 +686,25 @@ impl AccountStateStore {
 			.transpose()
 	}
 
+	/// Forgets the account record, its routes, and affinities that named it,
+	/// so [`load_accounts`](Self::load_accounts) no longer hydrates it.
+	/// Cooldown, rejection, rate, and quota observations stay, so an account
+	/// that signs in again inherits what the provider last said about it.
+	pub fn forget_account(&self, account: &AccountId<str>) -> Result<(), AccountStateStoreError> {
+		let _guard = self.writes.lock();
+		let mut connection = self.connection()?;
+		let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		transaction
+			.execute("DELETE FROM account_state_affinity WHERE account_id = ?1", [account.as_str()])?;
+		transaction.execute("DELETE FROM account_state_account_routes WHERE account_id = ?1", [
+			account.as_str(),
+		])?;
+		transaction
+			.execute("DELETE FROM account_state_accounts WHERE account_id = ?1", [account.as_str()])?;
+		transaction.commit()?;
+		Ok(())
+	}
+
 	/// Explicitly purges secret-free account state; credential removal never
 	/// calls this.
 	pub fn purge_account(&self, account: &AccountId<str>) -> Result<(), AccountStateStoreError> {

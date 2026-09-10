@@ -490,6 +490,28 @@ impl AccountPool {
 		removed
 	}
 
+	/// Removes account metadata like [`remove`](Self::remove) and also forgets
+	/// the durable record, so the next process does not hydrate the account
+	/// again. This is what a logout needs: without it the account comes back
+	/// as an active account with no credential behind it, and every attempt
+	/// to use it fails. Cooldown, rate, and quota observations are kept for a
+	/// later sign-in of the same account.
+	pub fn forget(&self, account: &AccountId<str>) -> Option<AccountRecord> {
+		let removed = self.remove(account);
+		if removed.is_some()
+			&& let Some(store) = &self.store
+			&& let Err(error) = store.forget_account(account)
+		{
+			tracing::warn!(
+				account = account.as_str(),
+				%error,
+				"logged-out account could not be forgotten durably; it will reappear as an \
+				 account without a credential on the next start"
+			);
+		}
+		removed
+	}
+
 	pub(crate) fn subscribe(&self) -> broadcast::Receiver<AccountPoolEvent> {
 		self.changes.subscribe()
 	}
@@ -1125,5 +1147,41 @@ mod tests {
 			.expect("account retained");
 		assert_eq!(record.routes, expected);
 		assert_eq!(pool.rebind_routes(catalog).expect("rebind again"), 0);
+	}
+	#[test]
+	fn forget_removes_the_account_durably_so_it_does_not_resurrect() {
+		let directory = tempfile::tempdir().expect("temporary directory");
+		let store = Arc::new(
+			AccountStateStore::open(directory.path().join("account-state.sqlite"))
+				.expect("open account state store"),
+		);
+		let pool = AccountPool::with_store(Arc::clone(&store)).expect("hydrate empty pool");
+		let account = AccountId::from("openai-codex:person");
+		pool
+			.upsert(AccountRecord {
+				account:               account.clone(),
+				principal:             PrincipalId::from("person"),
+				provider:              ProviderId::from("openai-codex"),
+				routes:                BTreeSet::from([RouteId::from("openai-codex/primary")]),
+				enabled:               true,
+				credential_generation: 1,
+				routing:               AccountRoutingContext::default(),
+			})
+			.expect("register account");
+		assert_eq!(
+			AccountPool::with_store(Arc::clone(&store))
+				.expect("rehydrate")
+				.accounts()
+				.len(),
+			1
+		);
+		assert!(pool.forget(&account).is_some());
+		assert!(pool.accounts().is_empty());
+		assert!(pool.forget(&account).is_none());
+		let rehydrated = AccountPool::with_store(store).expect("rehydrate after removal");
+		assert!(
+			rehydrated.accounts().is_empty(),
+			"a logged-out account must not come back as an active account without a credential"
+		);
 	}
 }

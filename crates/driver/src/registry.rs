@@ -33,7 +33,7 @@ use omp_ai::{
 		OAuthLoginEngine, OAuthLoginEngineError, OsCredentialKeySource, ProviderShaper,
 		RefreshingCredentialSource, SecretLoginEngine, SecretLoginEngineError, StoreError,
 		StoredOAuthRefreshEngine, SystemOAuthClock, SystemOAuthHttpClient, UnavailableKeySource,
-		oauth::OAuthCustomDispatchError,
+		oauth::OAuthCustomDispatchError, prune_credentialless_accounts,
 	},
 	call::AuthMethod,
 	codec::google_cca::{
@@ -934,6 +934,18 @@ async fn production_assembly_with_catalog(
 		Ok(0) => {},
 		Ok(rebound) => tracing::debug!(rebound, "account routes rebound to the current catalog"),
 		Err(error) => tracing::warn!(%error, "account route rebinding failed"),
+	}
+	// A logout that left the durable record behind would otherwise hydrate
+	// an account with no credential; it ranks first for selection and fails
+	// every call and every discovery, so it stays out of this process's pool
+	// until the user signs in again.
+	let credentialless = prune_credentialless_accounts(&catalog, &credential_store, &accounts);
+	if !credentialless.is_empty() {
+		tracing::warn!(
+			accounts = ?credentialless,
+			"accounts without a stored credential were left out of the pool; sign in again to \
+			 use them"
+		);
 	}
 	let oauth_http = Arc::new(SystemOAuthHttpClient::new());
 	// Resolve the Antigravity client version concurrently with the remaining

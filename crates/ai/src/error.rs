@@ -404,6 +404,14 @@ pub enum ErrorDetail {
 		/// Typed local-availability reason.
 		reason: ReasonId,
 	},
+	/// Why no account could serve the call: the accounts the pool considered
+	/// and what blocked each, or the account whose credential was missing.
+	/// Account and principal identifiers only; never credential material.
+	#[error("{summary}")]
+	Account {
+		/// Secret-free account selection or credential summary.
+		summary: Str,
+	},
 }
 
 impl ErrorDetail {
@@ -475,6 +483,11 @@ impl ErrorDetail {
 	pub const fn local_unavailable(reason: ReasonId) -> Self {
 		Self::LocalUnavailable { reason }
 	}
+
+	/// Records why no account could serve the call.
+	pub const fn account(summary: Str) -> Self {
+		Self::Account { summary }
+	}
 }
 
 /// Bulky diagnostics share the receipt's mandatory allocation so [`Error`]
@@ -530,6 +543,7 @@ impl fmt::Debug for Error {
 			ErrorDetail::SearchFailures { .. } => "SearchFailures",
 			ErrorDetail::LocalUnavailable { .. } => "LocalUnavailable",
 			ErrorDetail::StalePlan { .. } => "StalePlan",
+			ErrorDetail::Account { .. } => "Account",
 		});
 		formatter
 			.debug_struct("Error")

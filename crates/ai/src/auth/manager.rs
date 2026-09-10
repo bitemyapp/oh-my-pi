@@ -1523,16 +1523,21 @@ impl AuthManager {
 							.as_ref()
 							.is_none_or(|provider| provider == &record.provider)
 					})
-					.map(|record| AccountSummary {
-						account:   record.account,
-						provider:  record.provider,
-						principal: Some(record.principal),
-						label:     None,
-						state:     if record.enabled {
-							AccountState::Active
-						} else {
+					.map(|record| {
+						let state = if !record.enabled {
 							AccountState::Disabled
-						},
+						} else if credential_missing(&self.catalog, &self.store, &record) {
+							AccountState::LoggedOut
+						} else {
+							AccountState::Active
+						};
+						AccountSummary {
+							account: record.account,
+							provider: record.provider,
+							principal: Some(record.principal),
+							label: None,
+							state,
+						}
 					})
 					.collect();
 				Ok(AuthAnswer::Accounts(accounts))
@@ -1547,7 +1552,7 @@ impl AuthManager {
 					.store
 					.delete(&account)
 					.map_err(|_| auth_store_failure())?;
-				let pooled = self.accounts.remove(&account).is_some();
+				let pooled = self.accounts.forget(&account).is_some();
 				if !stored && !pooled {
 					return Err(auth_not_found());
 				}
@@ -1834,6 +1839,47 @@ fn select_login_engine<'a>(
 	engines.iter().find(|engine| engine.supports(provider))
 }
 
+/// Whether a store-backed account has no credential behind it any more, for
+/// example after a logout in another process that removed the credential but
+/// left the account state. Such an account is reported as logged out rather
+/// than active, so hosts do not offer it for selection. Providers whose
+/// credentials come from the environment (application default credentials,
+/// the AWS chain) keep no store row and are never reported this way.
+/// Drops from `pool` every store-backed account that has no stored credential
+/// and returns their ids. Such records survive a logout that left durable
+/// account state behind; hydrated again, they would rank first for selection
+/// and fail every call. The durable record is kept, so signing in again
+/// restores the account with its history.
+pub fn prune_credentialless_accounts(
+	catalog: &Catalog,
+	store: &CredentialStore,
+	pool: &AccountPool,
+) -> Vec<AccountId> {
+	pool
+		.accounts()
+		.into_iter()
+		.filter(|record| credential_missing(catalog, store, record))
+		.map(|record| {
+			pool.remove(&record.account);
+			record.account
+		})
+		.collect()
+}
+
+fn credential_missing(catalog: &Catalog, store: &CredentialStore, record: &AccountRecord) -> bool {
+	let Some(provider) = catalog.provider(&record.provider) else {
+		return false;
+	};
+	let store_backed = provider
+		.auth
+		.iter()
+		.filter_map(|id| catalog.auth_spec(id))
+		.all(|auth| {
+			!matches!(auth.kind, AuthSpecKind::None | AuthSpecKind::GcpAdc | AuthSpecKind::AwsSigv4)
+		});
+	store_backed && matches!(store.metadata(&record.account), Ok(None))
+}
+
 fn auth_method(
 	catalog: &Catalog,
 	spec: &omp_catalog::provider::AuthSpec,
@@ -2043,24 +2089,25 @@ mod tests {
 	use futures::future::{BoxFuture, FutureExt as _};
 	use http::HeaderMap;
 	use omp_catalog::{ProviderId, provider::AuthSpecKind, snapshot::Catalog};
-	use omp_core::{ExposeSecret as _, SecretString};
+	use omp_core::{ExposeSecret as _, SecretBox, SecretString};
 	use parking_lot::Mutex;
 	use tokio::time;
 
 	use super::{
 		AuthLoginEngine, AuthRefreshEngine, CredentialAffinityError, CredentialAffinityResolver,
 		OAuthLoginEngine, RefreshingCredentialSource, StoredOAuthRefreshEngine, auth_method,
-		auth_store_error, select_auth_spec, select_login_engine,
+		auth_store_error, credential_missing, prune_credentialless_accounts, select_auth_spec,
+		select_login_engine,
 	};
 	use crate::{
 		account::{AccountPool, AccountRecord, RefreshCoordinator, RefreshPolicy},
 		answer::{AccountState, AccountSummary, AuthEvent, AuthResponse as AnswerAuthResponse},
 		auth::{
 			AlibabaTokenPlanLoginEngine, AuthRejection, CredentialError, CredentialFuture,
-			CredentialLease, CredentialNeed, CredentialSource, CredentialStore, HeadlessKeySource,
-			KeyError, KeyId, LeaseMeta, OAuthClock, OAuthCustomDispatcher, OAuthHttpClient,
-			OAuthHttpRequest, OAuthHttpResponse, OAuthTransportError, SecretLoginEngine, StoreError,
-			credential_ready,
+			CredentialLease, CredentialNeed, CredentialOrigin, CredentialSource, CredentialStore,
+			CredentialWrite, HeadlessKeySource, KeyError, KeyId, LeaseMeta, OAuthClock,
+			OAuthCustomDispatcher, OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse,
+			OAuthTransportError, SecretLoginEngine, StoreError, credential_ready,
 		},
 		call::{AccountRoutingContext, AuthInput, AuthMethod, LoginRequest},
 		error::{Error, ErrorKind},
@@ -2090,6 +2137,75 @@ mod tests {
 			CredentialAffinityResolver::new([8; 32]).resolve(&pool, &provider, &digest),
 			Err(CredentialAffinityError::NotFound)
 		);
+	}
+
+	#[test]
+	fn store_backed_account_without_a_credential_row_is_reported_logged_out() {
+		let catalog = Catalog::embedded();
+		let suffix = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.expect("current timestamp")
+			.as_nanos();
+		let path = env::temp_dir()
+			.join(format!("omp-credential-missing-{}-{suffix}.sqlite", std::process::id()));
+		let store = CredentialStore::open(
+			&path,
+			Arc::new(HeadlessKeySource::new(KeyId::new("credential-missing"), [9; 32])),
+		)
+		.expect("credential store");
+		let record = |provider: &str| AccountRecord {
+			account:               AccountId::from(format!("{provider}:person")),
+			principal:             PrincipalId::from("person"),
+			provider:              ProviderId::from(provider),
+			routes:                BTreeSet::new(),
+			enabled:               true,
+			credential_generation: 1,
+			routing:               AccountRoutingContext::default(),
+		};
+		// An OAuth account whose credential row is gone (a logout elsewhere)
+		// is logged out, not active.
+		let ghost = record("openai-codex");
+		assert!(credential_missing(catalog, &store, &ghost));
+		// Once a credential is stored again the account is active.
+		let stored = record("anthropic");
+		let secret = SecretBox::new(Box::new(b"sk-test".to_vec()));
+		store
+			.put(CredentialWrite {
+				account_id:          &stored.account,
+				principal_id:        &stored.principal,
+				kind:                "api-key",
+				secret:              &secret,
+				expires_at_ms:       None,
+				origin:              CredentialOrigin::Persistent,
+				now_ms:              1,
+				expected_generation: None,
+			})
+			.expect("store credential");
+		assert!(!credential_missing(catalog, &store, &stored));
+		// Providers authenticated from the environment keep no store row.
+		let environmental = record("bedrock-mantle");
+		assert!(!credential_missing(catalog, &store, &environmental));
+		// Unknown providers are left alone.
+		let unknown = record("no-such-provider");
+		assert!(!credential_missing(catalog, &store, &unknown));
+		// Startup pruning drops only the ghost from the live pool.
+		let pool = AccountPool::new();
+		for account in [&ghost, &stored, &environmental] {
+			pool.upsert(account.clone()).expect("register account");
+		}
+		assert_eq!(prune_credentialless_accounts(catalog, &store, &pool), vec![
+			ghost.account.clone()
+		]);
+		assert_eq!(
+			pool
+				.accounts()
+				.into_iter()
+				.map(|record| record.account)
+				.collect::<Vec<_>>(),
+			vec![stored.account.clone(), environmental.account.clone()]
+		);
+		drop(store);
+		let _ = fs::remove_file(path);
 	}
 
 	#[test]

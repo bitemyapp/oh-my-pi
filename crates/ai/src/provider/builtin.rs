@@ -27,7 +27,8 @@ use url::Url;
 use crate::{
 	ProviderId,
 	account::{
-		AccountPool, AccountSelection, AccountSelectionRequest, RateAvailability, RotationPolicy,
+		AccountPool, AccountSelection, AccountSelectionRequest, Eligibility, RateAvailability,
+		RotationPolicy, SelectionReceipt,
 	},
 	auth::{
 		AuthManager, AuthScheme, AwsCredentialError, AwsRegistryAvailability, CredentialApplyError,
@@ -35,7 +36,7 @@ use crate::{
 		CredentialShaperRegistry, CredentialSource, OAuthHttpClient, OAuthHttpRequest,
 		ProviderShaper, sigv4::endpoint_scope, spec::AuthSpec,
 	},
-	body::BodySource,
+	body::{AttemptBodyEvidence, BodySource, Replayability, RetryDecision, RetryDecisionReason},
 	call::{
 		AccountRoutingContext, Call, NativeResponseFraming, OperationCall, Setting, StructuredOutput,
 		Target, ToolChoice,
@@ -97,6 +98,7 @@ use crate::{
 	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	gate::GateCondition,
+	id::{AccountId, PrincipalId},
 	layer::{
 		AttemptAction, ExecutionContext,
 		account::{AccountPoolLayer, AccountSelector},
@@ -120,7 +122,10 @@ use crate::{
 		usage::{ConsoleUsageManager, UsageServiceConfig},
 	},
 	plan::{ForcedCallCaps, apply_forced_call_decision, forced_call_ladder},
-	receipt::{Adjustment, ExecutionReceipt, FeatureId, Penalty, ReasonId},
+	receipt::{
+		Adjustment, AttemptOutcome, AttemptReceipt, Cost, ExecutionReceipt, FeatureId, Penalty,
+		ProviderEvidence, ReasonId, Usage,
+	},
 	registry::RouteUnavailable,
 	session::ConversationSessionPlanner,
 	settings::InferenceSettings,
@@ -2221,12 +2226,9 @@ impl AccountSelector<Call> for RouteAccountSelector {
 					},
 				})
 			},
-			Err(_) => Err(Error::new(
-				ErrorKind::Authentication,
-				ErrorPhase::Authentication,
-				RetryAction::ReselectRoute,
-				context.receipt(),
-			)),
+			Err(failure) => {
+				Err(account_selection_error(context, &self.provider, &self.route, &failure.receipt))
+			},
 		}
 	}
 
@@ -2298,12 +2300,12 @@ impl LeaseProvider<Call, RouteAccount> for RouteLeaseProvider {
 						break;
 					},
 					Err(CredentialError::Unavailable | CredentialError::InvalidSource) => {},
-					Err(_) => {
-						return Err(Error::new(
-							ErrorKind::Authentication,
-							ErrorPhase::Authentication,
-							RetryAction::ReselectRoute,
-							context.receipt(),
+					Err(error) => {
+						return Err(credential_lease_error(
+							context,
+							&self.provider,
+							account.as_ref(),
+							&error,
 						));
 					},
 				}
@@ -2312,11 +2314,12 @@ impl LeaseProvider<Call, RouteAccount> for RouteLeaseProvider {
 				if !self.required && !refreshing {
 					return Ok(None);
 				}
-				return Err(Error::new(
-					ErrorKind::Authentication,
-					ErrorPhase::Authentication,
-					RetryAction::ReselectRoute,
-					context.receipt(),
+				return Err(missing_credential_error(
+					context,
+					&self.provider,
+					account.as_ref(),
+					principal.as_ref(),
+					refreshing,
 				));
 			};
 			let Some(shaper) = self.shapers.get(&self.provider) else {
@@ -2584,6 +2587,174 @@ fn authentication_error(context: &ExecutionContext, reason: &'static str) -> Err
 		context.receipt(),
 	)
 	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
+}
+
+/// The pool refused every account. The error names each candidate and what
+/// blocked it, and is classified by the blockers: only quota or only rate
+/// state is an admission failure, anything else an authentication failure,
+/// so a caller never sees a bare "authentication error" for an exhausted or
+/// pinned account.
+fn account_selection_error(
+	context: &ExecutionContext,
+	provider: &ProviderId,
+	route: &RouteId,
+	receipt: &SelectionReceipt,
+) -> Error {
+	let (kind, phase) = selection_failure_class(receipt);
+	Error::new(kind, phase, RetryAction::ReselectRoute, context.receipt())
+		.provider(provider.clone())
+		.route(route.clone())
+		.detail(ErrorDetail::account(selection_summary(provider, route, receipt)))
+}
+
+fn selection_failure_class(receipt: &SelectionReceipt) -> (ErrorKind, ErrorPhase) {
+	let blockers = receipt
+		.candidates
+		.iter()
+		.map(|candidate| &candidate.eligibility)
+		.filter(|eligibility| {
+			!matches!(eligibility, Eligibility::Disabled | Eligibility::RouteIneligible)
+		})
+		.collect::<Vec<_>>();
+	if blockers.is_empty() {
+		return (ErrorKind::Authentication, ErrorPhase::Authentication);
+	}
+	if blockers.iter().all(|eligibility| {
+		matches!(eligibility, Eligibility::QuotaExhausted { .. } | Eligibility::QuotaReserved { .. })
+	}) {
+		return (ErrorKind::QuotaExhausted, ErrorPhase::Admission);
+	}
+	if blockers
+		.iter()
+		.all(|eligibility| matches!(eligibility, Eligibility::RateLimited { .. }))
+	{
+		return (ErrorKind::RateLimited, ErrorPhase::Admission);
+	}
+	(ErrorKind::Authentication, ErrorPhase::Authentication)
+}
+
+fn selection_summary(provider: &ProviderId, route: &RouteId, receipt: &SelectionReceipt) -> Str {
+	use std::fmt::Write as _;
+	if receipt.candidates.is_empty() {
+		return Str::new(format!("no {provider} account is signed in"));
+	}
+	let mut summary = format!("no eligible {provider} account for route {route}:");
+	for (index, candidate) in receipt.candidates.iter().enumerate() {
+		let separator = if index == 0 { "" } else { ";" };
+		let _ = write!(
+			summary,
+			"{separator} {} ({})",
+			candidate.account,
+			eligibility_summary(&candidate.eligibility)
+		);
+	}
+	Str::new(summary)
+}
+
+fn eligibility_summary(eligibility: &Eligibility) -> String {
+	match eligibility {
+		Eligibility::Eligible => "eligible".to_owned(),
+		Eligibility::Disabled => "disabled".to_owned(),
+		Eligibility::RouteIneligible => "not enabled for this route".to_owned(),
+		Eligibility::CredentialRejected { .. } => "credential rejected; sign in again".to_owned(),
+		Eligibility::Cooldown { reason, .. } => format!("cooling down after {reason}"),
+		Eligibility::RateLimited { .. } => "rate limited".to_owned(),
+		Eligibility::QuotaExhausted { .. } => "usage quota exhausted".to_owned(),
+		Eligibility::QuotaReserved { percent, .. } => {
+			format!("remaining quota reserved below {percent}%")
+		},
+		Eligibility::RotationForbidden => "rotation away from it is not allowed".to_owned(),
+		Eligibility::PrincipalMismatch => "pinned to a different account".to_owned(),
+		Eligibility::PreviousAccount => "already failed this request".to_owned(),
+	}
+}
+
+/// A credential lease failed for a reason other than absence. The error names
+/// the account so the caller can act on it; the planner may still reselect.
+fn credential_lease_error(
+	context: &ExecutionContext,
+	provider: &ProviderId,
+	account: Option<&AccountId>,
+	error: &CredentialError,
+) -> Error {
+	let summary = match account {
+		Some(account) => {
+			format!("credential for {provider} account {account} could not be used: {error}")
+		},
+		None => format!("{provider} credential could not be used: {error}"),
+	};
+	Error::new(
+		ErrorKind::Authentication,
+		ErrorPhase::Authentication,
+		RetryAction::ReselectRoute,
+		context.receipt(),
+	)
+	.provider(provider.clone())
+	.detail(ErrorDetail::account(Str::new(summary)))
+}
+
+/// No source holds a credential for the selected account (typically a logout
+/// in another process). The account is recorded as a failed pre-commit
+/// attempt and the error asks for rotation, so a sibling account can serve the
+/// call; when policy forbids leaving the account, the attempt loop reports
+/// this error rather than the pool's refusal.
+fn missing_credential_error(
+	context: &ExecutionContext,
+	provider: &ProviderId,
+	account: Option<&AccountId>,
+	principal: Option<&PrincipalId>,
+	refreshing: bool,
+) -> Error {
+	let Some(account) = account else {
+		return Error::new(
+			ErrorKind::Authentication,
+			ErrorPhase::Authentication,
+			RetryAction::ReselectRoute,
+			context.receipt(),
+		)
+		.provider(provider.clone())
+		.detail(ErrorDetail::account(Str::new(format!(
+			"no credential source is configured for {provider}"
+		))));
+	};
+	let mut receipt = context.receipt();
+	let index = u32::try_from(receipt.attempts.len()).unwrap_or(u32::MAX);
+	receipt.record_attempt(AttemptReceipt {
+		index,
+		hidden: false,
+		provider: Some(provider.clone()),
+		route: None,
+		account: Some(account.clone()),
+		principal: principal.cloned(),
+		body: AttemptBodyEvidence {
+			opened:         false,
+			consumed:       false,
+			replayability:  Replayability::Replayable,
+			retry_decision: RetryDecision::Allow,
+			reason:         RetryDecisionReason::ReplayableSource,
+		},
+		outcome: AttemptOutcome::FailedPreCommit,
+		usage: Usage::default(),
+		cost: Cost::default(),
+		provider_evidence: ProviderEvidence::default(),
+		elapsed: Duration::ZERO,
+	});
+	let (action, summary) = if refreshing {
+		(
+			RetryAction::Never,
+			format!(
+				"credential for {provider} account {account} could not be refreshed; sign in again"
+			),
+		)
+	} else {
+		(
+			RetryAction::RotateAccount,
+			format!("no credential is stored for {provider} account {account}; sign in again"),
+		)
+	};
+	Error::new(ErrorKind::Authentication, ErrorPhase::Authentication, action, receipt)
+		.provider(provider.clone())
+		.detail(ErrorDetail::account(Str::new(summary)))
 }
 
 fn azure_configuration_error(context: &ExecutionContext, reason: &'static str) -> Error {
@@ -4127,5 +4298,140 @@ mod tests {
 		assert_eq!(encoded.method, crate::codec::RequestMethod::Get);
 		assert_eq!(encoded.framing, crate::transport::FramingProtocol::WebSocket);
 		assert!(encoded.uri.as_str().contains("/v1/realtime?model="));
+	}
+	fn candidate(account: &str, eligibility: Eligibility) -> crate::account::CandidateEvidence {
+		crate::account::CandidateEvidence {
+			account: AccountId::from(account),
+			principal: PrincipalId::from(account),
+			eligibility,
+			quota_remaining: None,
+			rate: RateAvailability::Available,
+			quota: crate::account::QuotaAvailability::Available,
+			eligible_at: None,
+			affinity_match: false,
+			previous_match: false,
+		}
+	}
+
+	fn selection_receipt(candidates: Vec<crate::account::CandidateEvidence>) -> SelectionReceipt {
+		SelectionReceipt {
+			provider: ProviderId::from("openai-codex"),
+			route: RouteId::from("openai-codex/primary"),
+			selected_at: SystemTime::UNIX_EPOCH,
+			candidates,
+			retry_at: None,
+		}
+	}
+
+	#[test]
+	fn refused_selection_names_every_candidate_and_its_blocker() {
+		let context = ExecutionContext::new(ExecutionBudget::default());
+		let receipt = selection_receipt(vec![
+			candidate("openai-codex:dos", Eligibility::PreviousAccount),
+			candidate("openai-codex:uno", Eligibility::PrincipalMismatch),
+		]);
+		let error = account_selection_error(
+			&context,
+			&ProviderId::from("openai-codex"),
+			&RouteId::from("openai-codex/primary"),
+			&receipt,
+		);
+		assert_eq!(error.kind, ErrorKind::Authentication);
+		assert_eq!(error.phase, ErrorPhase::Authentication);
+		assert_eq!(error.action, RetryAction::ReselectRoute);
+		assert_eq!(
+			error.detail_ref().map(ToString::to_string).as_deref(),
+			Some(
+				"no eligible openai-codex account for route openai-codex/primary: openai-codex:dos \
+				 (already failed this request); openai-codex:uno (pinned to a different account)"
+			)
+		);
+		assert_eq!(
+			error.to_string(),
+			"inference Authentication error during Authentication: no eligible openai-codex account \
+			 for route openai-codex/primary: openai-codex:dos (already failed this request); \
+			 openai-codex:uno (pinned to a different account)"
+		);
+	}
+
+	#[test]
+	fn refused_selection_is_classified_by_what_blocked_the_candidates() {
+		let quota = selection_receipt(vec![
+			candidate("a", Eligibility::QuotaExhausted { reset_at: None }),
+			candidate("b", Eligibility::RouteIneligible),
+		]);
+		assert_eq!(
+			selection_failure_class(&quota),
+			(ErrorKind::QuotaExhausted, ErrorPhase::Admission)
+		);
+		let rate = selection_receipt(vec![candidate("a", Eligibility::RateLimited { until: None })]);
+		assert_eq!(selection_failure_class(&rate), (ErrorKind::RateLimited, ErrorPhase::Admission));
+		let mixed = selection_receipt(vec![
+			candidate("a", Eligibility::RateLimited { until: None }),
+			candidate("b", Eligibility::PrincipalMismatch),
+		]);
+		assert_eq!(
+			selection_failure_class(&mixed),
+			(ErrorKind::Authentication, ErrorPhase::Authentication)
+		);
+		let none = selection_receipt(Vec::new());
+		assert_eq!(
+			selection_failure_class(&none),
+			(ErrorKind::Authentication, ErrorPhase::Authentication)
+		);
+		assert_eq!(
+			selection_summary(
+				&ProviderId::from("openai-codex"),
+				&RouteId::from("openai-codex/primary"),
+				&none
+			)
+			.as_str(),
+			"no openai-codex account is signed in"
+		);
+	}
+
+	#[test]
+	fn missing_credential_asks_for_rotation_and_names_the_account() {
+		let context = ExecutionContext::new(ExecutionBudget::default());
+		let account = AccountId::from("openai-codex:dos");
+		let principal = PrincipalId::from("dos");
+		let error = missing_credential_error(
+			&context,
+			&ProviderId::from("openai-codex"),
+			Some(&account),
+			Some(&principal),
+			false,
+		);
+		assert_eq!(error.kind, ErrorKind::Authentication);
+		assert_eq!(error.action, RetryAction::RotateAccount);
+		assert_eq!(
+			error.detail_ref().map(ToString::to_string).as_deref(),
+			Some("no credential is stored for openai-codex account openai-codex:dos; sign in again")
+		);
+		let attempt = error
+			.receipt()
+			.attempts
+			.last()
+			.expect("failed attempt is accounted");
+		assert_eq!(attempt.account.as_ref(), Some(&account));
+		assert_eq!(attempt.principal.as_ref(), Some(&principal));
+		assert_eq!(attempt.outcome, AttemptOutcome::FailedPreCommit);
+		assert_eq!(attempt.body.retry_decision, RetryDecision::Allow);
+		assert!(!attempt.hidden);
+
+		let refreshed = missing_credential_error(
+			&context,
+			&ProviderId::from("openai-codex"),
+			Some(&account),
+			Some(&principal),
+			true,
+		);
+		assert_eq!(refreshed.action, RetryAction::Never);
+		assert!(refreshed.to_string().contains("could not be refreshed"));
+
+		let brokered =
+			missing_credential_error(&context, &ProviderId::from("openai-codex"), None, None, false);
+		assert_eq!(brokered.action, RetryAction::ReselectRoute);
+		assert!(brokered.receipt().attempts.is_empty());
 	}
 }

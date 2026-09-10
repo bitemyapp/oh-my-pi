@@ -2499,15 +2499,23 @@ where
 						"tokensIn": outcome.tokens_in,
 						"tokensOut": outcome.tokens_out,
 					}),
-					Err(source) => json!({
-						"type": "agent_end",
-						"messages": replica.children(replica.body()).last().copied()
-							.map(|turn| rpc_turn_messages(&replica, turn))
-							.unwrap_or_default(),
-						"isTerminal": true,
-						"cancelled": false,
-						"error": source.to_string(),
-					}),
+					Err(source) => {
+						let mut frame = json!({
+							"type": "agent_end",
+							"messages": replica.children(replica.body()).last().copied()
+								.map(|turn| rpc_turn_messages(&replica, turn))
+								.unwrap_or_default(),
+							"isTerminal": true,
+							"cancelled": false,
+							"error": source.to_string(),
+						});
+						if let KernelError::Inference(error) = &source
+							&& let Some(object) = frame.as_object_mut()
+						{
+							object.extend(inference_error_fields(error));
+						}
+						frame
+					},
 				};
 				outgoing_tx.send(Outgoing::Frame(terminal)).into_diagnostic()?;
 				if shutting_down || !input_open {
@@ -2826,6 +2834,30 @@ fn up_response(
 	}
 }
 
+/// Structured companions to `agent_end.error` for an inference failure, so a
+/// host can phrase the outcome itself instead of parsing the display string:
+/// the stable kind and phase, the provider and HTTP status when known, the
+/// provider's error code, and the typed detail (a provider message, or which
+/// accounts were considered and why none could serve).
+fn inference_error_fields(error: &omp_ai::Error) -> Map<String, Value> {
+	let mut fields = Map::new();
+	fields.insert("errorKind".into(), json!(format!("{:?}", error.kind)));
+	fields.insert("errorPhase".into(), json!(format!("{:?}", error.phase)));
+	if let Some(provider) = &error.provider {
+		fields.insert("errorProvider".into(), json!(provider.as_str()));
+	}
+	if let Some(status) = error.status {
+		fields.insert("errorStatus".into(), json!(status));
+	}
+	if let Some(code) = &error.code {
+		fields.insert("errorCode".into(), json!(code.as_str()));
+	}
+	if let Some(detail) = error.detail_ref() {
+		fields.insert("errorDetail".into(), json!(detail.to_string()));
+	}
+	fields
+}
+
 fn kernel_event_value(event: KernelEvent) -> Option<Value> {
 	match event {
 		KernelEvent::InferenceStarted => None,
@@ -2934,4 +2966,48 @@ fn approve_response(
 fn error_frame(id: Option<RequestId>, command: &str, code: &str, message: &str) -> Value {
 	serde_json::to_value(RpcResponse::error(id, command, message, Some(RpcErrorCode::new(code))))
 		.expect("RPC error envelope serializes")
+}
+
+#[cfg(test)]
+mod tests {
+	use omp_ai::{ErrorDetail, ErrorKind, ErrorPhase, RetryAction, receipt::ExecutionReceipt};
+	use omp_core::Str;
+	use serde_json::json;
+
+	use super::inference_error_fields;
+
+	#[test]
+	fn agent_end_error_fields_carry_kind_phase_provider_status_code_and_detail() {
+		let error = omp_ai::Error::new(
+			ErrorKind::RateLimited,
+			ErrorPhase::Handshake,
+			RetryAction::Never,
+			ExecutionReceipt::default(),
+		)
+		.provider(omp_ai::ProviderId::from("openai-codex"))
+		.status(Some(429))
+		.code(Str::new("usage_limit_reached"))
+		.detail(ErrorDetail::provider(Str::new("The usage limit has been reached")));
+		let fields = inference_error_fields(&error);
+		assert_eq!(fields["errorKind"], json!("RateLimited"));
+		assert_eq!(fields["errorPhase"], json!("Handshake"));
+		assert_eq!(fields["errorProvider"], json!("openai-codex"));
+		assert_eq!(fields["errorStatus"], json!(429));
+		assert_eq!(fields["errorCode"], json!("usage_limit_reached"));
+		assert_eq!(fields["errorDetail"], json!("The usage limit has been reached"));
+	}
+
+	#[test]
+	fn agent_end_error_fields_omit_what_the_failure_does_not_know() {
+		let error = omp_ai::Error::new(
+			ErrorKind::Authentication,
+			ErrorPhase::Authentication,
+			RetryAction::Never,
+			ExecutionReceipt::default(),
+		);
+		let fields = inference_error_fields(&error);
+		assert_eq!(fields.len(), 2);
+		assert_eq!(fields["errorKind"], json!("Authentication"));
+		assert_eq!(fields["errorPhase"], json!("Authentication"));
+	}
 }

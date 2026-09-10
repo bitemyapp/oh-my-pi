@@ -10,9 +10,31 @@ use tower::{Layer, Service};
 
 use crate::{
 	body::RetryDecision,
-	error::{Error, ErrorPhase, RetryAction},
+	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	layer::{AttemptAction, LayerCall},
 };
+
+/// A failure raised before any new attempt because no other account could be
+/// selected or credentialed after a refresh or rotation: an admission or
+/// authentication failure that recorded no attempt beyond those already
+/// accounted (`known`), carrying either the typed account summary from
+/// selection and lease acquisition or nothing at all. A provider answer for the
+/// newly selected account always records an attempt, and a cancellation is
+/// never one.
+fn is_reselection_refusal(error: &Error, known: &[u32]) -> bool {
+	if matches!(error.kind, ErrorKind::Cancelled | ErrorKind::DeadlineExceeded) {
+		return false;
+	}
+	let new_attempt = error
+		.receipt()
+		.attempts
+		.iter()
+		.any(|attempt| !known.contains(&attempt.index));
+	!new_attempt
+		&& matches!(error.phase, ErrorPhase::Admission | ErrorPhase::Authentication)
+		&& (matches!(error.detail_ref(), Some(ErrorDetail::Account { .. }))
+			|| (error.code.is_none() && error.status.is_none() && error.detail_ref().is_none()))
+}
 
 /// Marks the complete attempt sub-stack without rebuilding it per call.
 #[derive(Clone, Copy, Debug, Default)]
@@ -50,6 +72,13 @@ where
 		async move {
 			let mut reentries = 0_u32;
 			let mut refresh_once_replay_used = false;
+			// The failure that sent the loop back through account selection,
+			// with the attempt indices accounted at that point. When the
+			// re-entry is refused before reaching a provider, this is what
+			// the caller needs to hear: the usage limit or missing credential
+			// on the account that was tried, not that no other account could
+			// stand in for it.
+			let mut trigger: Option<(Error, Vec<u32>)> = None;
 			request.context.set_attempt_action(AttemptAction::Initial);
 			loop {
 				request.context.clear_body_evidence();
@@ -59,6 +88,20 @@ where
 					Ok(response) => return Ok(response),
 					Err(error) => error,
 				};
+				if attempted_action != AttemptAction::Initial
+					&& let Some((mut cause, known)) = trigger.take()
+					&& is_reselection_refusal(&error, &known)
+				{
+					tracing::debug!(
+						refusal = %error,
+						"re-entry could not select another account; reporting the failure that \
+						 triggered it"
+					);
+					cause.action = RetryAction::Never;
+					let _ = cause.take_receipt();
+					request.context.finalize_error(&mut cause);
+					return Err(cause);
+				}
 				if let Some(attempt) = error.receipt().attempts.last() {
 					request.context.set_body_evidence(attempt.body);
 				}
@@ -140,6 +183,14 @@ where
 					AttemptAction::Initial => {},
 				}
 				reentries += 1;
+				let known = request
+					.context
+					.receipt()
+					.attempts
+					.iter()
+					.map(|attempt| attempt.index)
+					.collect();
+				trigger = Some((error, known));
 				request.context.set_attempt_action(action);
 				future::poll_fn(|cx| service.poll_ready(cx)).await?;
 			}
@@ -159,13 +210,14 @@ mod tests {
 	};
 
 	use futures::future::{Ready, ready};
+	use omp_core::Str;
 	use parking_lot::Mutex;
 	use tower::{Service, service_fn};
 
 	use super::AttemptService;
 	use crate::{
 		body::{AttemptBodyEvidence, Replayability, RetryDecision, RetryDecisionReason},
-		error::{Error, ErrorKind, ErrorPhase, RetryAction},
+		error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 		id::AccountId,
 		layer::{AttemptAction, ExecutionContext, LayerCall},
 		receipt::{
@@ -439,5 +491,114 @@ mod tests {
 			.unwrap_err();
 		assert_eq!(error.action, RetryAction::ReselectRoute);
 		assert!(error.receipt().attempts.is_empty());
+	}
+	/// Fails with each prepared error in turn, then succeeds.
+	#[derive(Clone)]
+	struct Prepared {
+		calls:  Arc<AtomicUsize>,
+		errors: Arc<Mutex<Vec<Error>>>,
+	}
+	impl Service<LayerCall<()>> for Prepared {
+		type Error = Error;
+		type Future = Ready<Result<(), Error>>;
+		type Response = ();
+
+		fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Error>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn call(&mut self, _: LayerCall<()>) -> Self::Future {
+			self.calls.fetch_add(1, Ordering::SeqCst);
+			let mut errors = self.errors.lock();
+			if errors.is_empty() {
+				return ready(Ok(()));
+			}
+			ready(Err(errors.remove(0)))
+		}
+	}
+
+	fn usage_limit_error() -> Error {
+		let mut error = refresh_error(0, RetryAction::RotateAccount);
+		error.kind = ErrorKind::RateLimited;
+		error.phase = ErrorPhase::Handshake;
+		error.status = Some(429);
+		error
+			.code(Str::new("usage_limit_reached"))
+			.detail(ErrorDetail::provider(Str::new("The usage limit has been reached")))
+	}
+
+	async fn run_prepared(errors: Vec<Error>) -> (Result<(), Error>, usize) {
+		let calls = Arc::new(AtomicUsize::new(0));
+		let context =
+			ExecutionContext::new(ExecutionBudget { max_attempts: 3, ..ExecutionBudget::default() });
+		let mut service = AttemptService {
+			inner: Prepared { calls: calls.clone(), errors: Arc::new(Mutex::new(errors)) },
+		};
+		futures::future::poll_fn(|cx| service.poll_ready(cx))
+			.await
+			.unwrap();
+		let result = service.call(LayerCall { payload: (), context }).await;
+		(result, calls.load(Ordering::SeqCst))
+	}
+
+	#[tokio::test]
+	async fn refused_rotation_reports_the_failure_that_triggered_it() {
+		// A pinned account hits its usage limit; rotation is refused because
+		// no sibling account may stand in. The caller must hear about the
+		// usage limit, not about the refusal.
+		let refusal = Error::new(
+			ErrorKind::Authentication,
+			ErrorPhase::Authentication,
+			RetryAction::ReselectRoute,
+			ExecutionReceipt::default(),
+		)
+		.detail(ErrorDetail::account(Str::new("no eligible account")));
+		let (result, calls) = run_prepared(vec![usage_limit_error(), refusal]).await;
+		let error = result.unwrap_err();
+		assert_eq!(calls, 2);
+		assert_eq!(error.kind, ErrorKind::RateLimited);
+		assert_eq!(error.status, Some(429));
+		assert_eq!(error.code.as_deref(), Some("usage_limit_reached"));
+		assert_eq!(error.action, RetryAction::Never);
+		assert!(matches!(error.detail_ref(), Some(ErrorDetail::Provider { .. })));
+		assert_eq!(error.receipt().attempts.len(), 1, "the failed attempt stays accounted");
+		assert!(error.receipt().attempts[0].hidden);
+	}
+
+	#[tokio::test]
+	async fn bare_refusal_after_rotation_is_replaced_too() {
+		let bare = Error::new(
+			ErrorKind::Authentication,
+			ErrorPhase::Admission,
+			RetryAction::ReselectRoute,
+			ExecutionReceipt::default(),
+		);
+		let (result, _) = run_prepared(vec![usage_limit_error(), bare]).await;
+		assert_eq!(result.unwrap_err().kind, ErrorKind::RateLimited);
+	}
+
+	#[tokio::test]
+	async fn rotation_that_reaches_the_provider_reports_the_new_failure() {
+		let mut upstream = refresh_error(1, RetryAction::Never);
+		upstream.kind = ErrorKind::ResourceExhausted;
+		upstream.phase = ErrorPhase::Handshake;
+		upstream.status = Some(503);
+		let (result, calls) = run_prepared(vec![usage_limit_error(), upstream]).await;
+		let error = result.unwrap_err();
+		assert_eq!(calls, 2);
+		assert_eq!(error.kind, ErrorKind::ResourceExhausted);
+		assert_eq!(error.status, Some(503));
+	}
+
+	#[tokio::test]
+	async fn cancellation_during_rotation_is_never_replaced() {
+		let cancelled = Error::new(
+			ErrorKind::Cancelled,
+			ErrorPhase::Authentication,
+			RetryAction::Never,
+			ExecutionReceipt::default(),
+		);
+		let (result, _) = run_prepared(vec![usage_limit_error(), cancelled]).await;
+		assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled);
 	}
 }
