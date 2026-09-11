@@ -899,6 +899,9 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		("edit", "hl.1".to_owned()),
 		("glob", "1".to_owned()),
 		("grep", "1".to_owned()),
+		// The fork advertises `write` as an essential slot tool, not a `dyn`
+		// device (see the fork's write-slot commit).
+		("write", "2".to_owned()),
 		("read", "2".to_owned()),
 	]);
 	for name in ["eval", "write"] {

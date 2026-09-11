@@ -89,6 +89,9 @@ pub struct JobRecord {
 	pub job_type:    Str,
 	/// Nonempty work label captured when the job started.
 	pub label:       Str,
+	/// Agent class of a subagent job (`scout`, `reviewer`, or the default
+	/// `task`), when present.
+	pub agent:       Option<Str>,
 	/// Owning session or agent identity, when present.
 	pub owner:       Option<Str>,
 	/// Start timestamp, when present.
@@ -1131,6 +1134,7 @@ fn record(dom: &Dom, handle: Handle) -> Option<JobRecord> {
 				|| prop(node, PropId::Id).map_or_else(|| Str::new(handle.to_string()), Str::new),
 				Str::new,
 			),
+		agent: custom(node, "agent").map(Str::new),
 		owner: custom(node, "owner").map(Str::new),
 		started: custom(node, "started").map(Str::new),
 		duration_ms: prop_int(node, PropId::DurationMs).and_then(|value| u64::try_from(value).ok()),

@@ -1112,20 +1112,32 @@ fn rpc_state(
 	})
 }
 
-fn rpc_subagents(jobs: &omp_agent::JobBoard) -> Vec<Value> {
+/// Every subagent the board knows, in spawn order, with what a host needs to
+/// show it: the agent class, when it started, how long it ran, how it failed,
+/// and the journal a host can read its transcript from.
+fn rpc_subagents(jobs: &omp_agent::JobBoard, sessions_dir: &Path) -> Vec<Value> {
 	let mut snapshots = jobs
 		.list()
 		.into_iter()
 		.filter(|job| job.kind == omp_agent::JobKind::Subagent)
 		.enumerate()
 		.map(|(index, job)| {
+			let started_ms = job
+				.started
+				.as_deref()
+				.and_then(|started| started.parse::<u64>().ok());
 			json!({
 				"id": job.id,
 				"index": index,
 				"agent": job.job_type,
+				"agentClass": job.agent,
 				"agentSource": "configured",
 				"description": job.label,
 				"status": job.status,
+				"startedMs": started_ms,
+				"durationMs": job.duration_ms,
+				"error": job.error,
+				"sessionFile": sessions_dir.join(format!("{}.oms", safe_session_name(&job.id))),
 				"lastUpdate": 0,
 			})
 		})
@@ -1136,10 +1148,11 @@ fn rpc_subagents(jobs: &omp_agent::JobBoard) -> Vec<Value> {
 
 fn observe_subagents(
 	jobs: &omp_agent::JobBoard,
+	sessions_dir: &Path,
 	level: omp_rpc::protocol::SubscriptionLevel,
 	seen: &mut HashMap<String, Value>,
 ) -> Vec<Value> {
-	let snapshots = rpc_subagents(jobs);
+	let snapshots = rpc_subagents(jobs, sessions_dir);
 	let current = snapshots
 		.iter()
 		.filter_map(|snapshot| {
@@ -1670,7 +1683,7 @@ where
 								let response = RpcResponse::success(
 									id,
 									command.as_str(),
-									json!({ "subagents": rpc_subagents(&jobs) }),
+									json!({ "subagents": rpc_subagents(&jobs, &home.sessions_dir) }),
 								).into_diagnostic()?;
 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
 							},
@@ -2466,7 +2479,7 @@ where
 						outgoing_tx.send(Outgoing::Frame(value)).into_diagnostic()?;
 					}
 				}
-				for frame in observe_subagents(&jobs, subagent_subscription, &mut subagent_seen) {
+				for frame in observe_subagents(&jobs, &home.sessions_dir, subagent_subscription, &mut subagent_seen) {
 					outgoing_tx.send(Outgoing::Frame(frame)).into_diagnostic()?;
 				}
 				if let Some(last) = rpc_messages(&replica)
@@ -2545,7 +2558,7 @@ where
 						for frame in projection.observe(&replica) {
 							outgoing_tx.send(Outgoing::Frame(frame)).into_diagnostic()?;
 						}
-						for frame in observe_subagents(&jobs, subagent_subscription, &mut subagent_seen) {
+						for frame in observe_subagents(&jobs, &home.sessions_dir, subagent_subscription, &mut subagent_seen) {
 							outgoing_tx.send(Outgoing::Frame(frame)).into_diagnostic()?;
 						}
 					},
