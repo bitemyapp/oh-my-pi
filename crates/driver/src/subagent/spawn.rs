@@ -841,7 +841,7 @@ fn spawn_child_task(
 			Err(source) => JobSettlement {
 				status:     Str::new_static("failed"),
 				output:     None,
-				error:      Some(Str::new(source.to_string())),
+				error:      Some(Str::new(describe_error(&source))),
 				completion: None,
 			},
 		}
@@ -926,13 +926,28 @@ async fn run_child(prepared: PreparedChild) -> Result<ChildExecution, SpawnError
 		structured_output(&prepared.child, &child_session, turn.assistant_text.as_str());
 	let cancelled =
 		(turn.stop == TurnStop::Cancelled).then(|| Str::new_static("subagent was cancelled"));
-	let error = cancelled.or(schema_error);
+	let mut error = cancelled.or(schema_error);
+	// A workspace merge or teardown failure must not swallow the child's
+	// answer: the text, tokens, and journal path still reach the parent, with
+	// the workspace failure (and its cause) as the error.
 	let workspace = match isolation {
 		Some(isolation) if error.is_some() => {
-			Some(discard_isolation(&prepared.env, isolation).await?)
+			match discard_isolation(&prepared.env, isolation).await {
+				Ok(outcome) => Some(outcome),
+				Err(source) => {
+					tracing::warn!(error = %describe_error(&source), "subagent workspace discard failed");
+					None
+				},
+			}
 		},
 		Some(isolation) => {
-			Some(finish_isolation(&prepared.env, isolation, &prepared.settings).await?)
+			match finish_isolation(&prepared.env, isolation, &prepared.settings).await {
+				Ok(outcome) => Some(outcome),
+				Err(source) => {
+					error = Some(Str::new(describe_error(&source)));
+					None
+				},
+			}
 		},
 		None => None,
 	};
@@ -954,6 +969,23 @@ async fn run_child(prepared: PreparedChild) -> Result<ChildExecution, SpawnError
 			error,
 		},
 	})
+}
+
+/// The error and every cause beneath it, so a job records "subagent
+/// workspace operation failed: <what the environment said>" rather than the
+/// top line alone.
+fn describe_error(error: &dyn std::error::Error) -> String {
+	let mut text = error.to_string();
+	let mut cause = error.source();
+	while let Some(source) = cause {
+		let detail = source.to_string();
+		if !detail.is_empty() && !text.contains(&detail) {
+			text.push_str(": ");
+			text.push_str(&detail);
+		}
+		cause = source.source();
+	}
+	text
 }
 
 pub(crate) struct IsolationRun {

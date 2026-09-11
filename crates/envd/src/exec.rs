@@ -4928,6 +4928,75 @@ mod tests {
 		host.close_session(&opened.session).unwrap();
 	}
 
+	/// The shell tool closes the session it ran in as soon as a foreground
+	/// command is detached; the detached process must keep running to its own
+	/// exit and settle with its real status, not as cancelled.
+	#[tokio::test]
+	async fn detached_command_survives_closing_its_session() {
+		let root = tempfile::tempdir().unwrap();
+		let host = ExecHost::new();
+		let opened = host
+			.open_session(OpenSessionRequest {
+				cwd_uri: Url::from_directory_path(root.path()).unwrap().to_string(),
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		let (started, run) = host
+			.exec(
+				ExecRequest {
+					session: opened.session.clone(),
+					source: Some(v1::Script {
+						text: String::from("printf before; sleep 0.5; printf after"),
+						..Default::default()
+					}),
+					..Default::default()
+				},
+				None,
+			)
+			.await
+			.unwrap();
+		loop {
+			match run.next_event().await {
+				Some(ExecEvent::Output(output)) if output.data.as_ref() == b"before" => break,
+				Some(_) => {},
+				None => panic!("foreground event stream closed before detachment"),
+			}
+		}
+		let detached = host.detach_exec(&started.exec, "detach-survives").unwrap();
+		drop(run);
+		host.close_session(&opened.session).unwrap();
+		wait_for_terminal(&host, &detached.name, detached.generation).await;
+		let attachment = host
+			.attach_output(&AttachOutput {
+				name: detached.name.clone(),
+				generation: detached.generation,
+				max_bytes: 1024,
+				..Default::default()
+			})
+			.unwrap();
+		assert_eq!(
+			attachment.state.state,
+			ProcessState::Exited as i32,
+			"state {:?}",
+			attachment.state
+		);
+		assert_eq!(
+			attachment
+				.state
+				.status
+				.as_ref()
+				.and_then(|status| status.exit_code),
+			Some(0)
+		);
+		let output = attachment
+			.backlog
+			.iter()
+			.flat_map(|frame| frame.data.iter().copied())
+			.collect::<Vec<_>>();
+		assert_eq!(output, b"after");
+	}
+
 	#[test]
 	fn second_host_on_a_leased_store_degrades_to_in_memory_state() {
 		let directory = tempfile::tempdir().unwrap();
