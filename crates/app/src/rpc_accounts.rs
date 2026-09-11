@@ -686,6 +686,13 @@ fn auth_prompt_kind(kind: AuthPromptKind) -> RpcAuthPromptKind {
 	}
 }
 
+/// Whether a host's answer fits the prompt that is waiting for it.
+///
+/// A PKCE login whose loopback server is listening asks for a confirmation,
+/// yet the exchange also completes from a pasted callback URL: the browser
+/// that finished the login may be on another machine, where the redirect to
+/// `localhost` went nowhere, and the user carries the address it landed on
+/// back by hand. The engine accepts that URL, so the seam does too.
 fn auth_input_matches(input: RpcAuthInputKind, prompt: RpcAuthPromptKind) -> bool {
 	matches!(
 		(input, prompt),
@@ -696,6 +703,7 @@ fn auth_input_matches(input: RpcAuthInputKind, prompt: RpcAuthPromptKind) -> boo
 			| (RpcAuthInputKind::OptionalSecret, RpcAuthPromptKind::OptionalSecret)
 			| (RpcAuthInputKind::DeviceConfirmed, RpcAuthPromptKind::Confirmation)
 			| (RpcAuthInputKind::CallbackUrl, RpcAuthPromptKind::AuthorizationCode)
+			| (RpcAuthInputKind::CallbackUrl, RpcAuthPromptKind::Confirmation)
 	)
 }
 
@@ -803,6 +811,13 @@ mod tests {
 		assert!(auth_input_matches(
 			RpcAuthInputKind::CallbackUrl,
 			RpcAuthPromptKind::AuthorizationCode
+		));
+		// A browser on another machine cannot reach the loopback server; the
+		// callback URL it landed on is carried back by hand.
+		assert!(auth_input_matches(RpcAuthInputKind::CallbackUrl, RpcAuthPromptKind::Confirmation));
+		assert!(!auth_input_matches(
+			RpcAuthInputKind::AuthorizationCode,
+			RpcAuthPromptKind::Confirmation
 		));
 		assert!(!auth_input_matches(RpcAuthInputKind::ApiKey, RpcAuthPromptKind::PlainText));
 		assert!(rpc_auth_input(RpcAuthInputKind::DeviceConfirmed, Some("x".into())).is_err());
