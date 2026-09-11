@@ -2,6 +2,7 @@ use std::{
 	io, mem,
 	net::{Ipv4Addr, Ipv6Addr, SocketAddr},
 	str,
+	sync::Arc,
 	time::Duration,
 };
 
@@ -19,6 +20,11 @@ use super::{OAuthError, callback_code, decode_form_component};
 use crate::{auth::login::LoginDriver, call::AuthInput};
 
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long one connection may take to send its request line and headers.
+/// Browsers open speculative connections to a host they were just redirected
+/// to and leave them idle for minutes; such a socket must never stand in
+/// front of the callback.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
 const OAUTH_HTML: &str = include_str!("oauth.html");
 const STATE_MARKER: &str = "__OAUTH_STATE__";
@@ -202,37 +208,81 @@ async fn serve(
 	mut shutdown: Receiver<()>,
 	authorization_url: Receiver<Option<Str>>,
 ) {
-	while let Some(accepted) = listeners.accept(&mut shutdown).await {
-		let Ok(mut stream) = accepted else {
+	// Every connection is served on its own task. A browser's idle speculative
+	// connection, or one that sends nothing, is then a task waiting on its own
+	// timeout, not a lock on the accept loop while the real callback queues
+	// behind it. The first decisive callback closes the server.
+	let (settled, mut settled_rx) = tokio::sync::watch::channel(false);
+	let connection = Arc::new(Connection {
+		callback_path: callback_path.to_owned(),
+		callback_origin: callback_origin.to_owned(),
+		expected_state: expected_state.to_owned(),
+		result: result.clone(),
+		settled,
+		authorization_url,
+	});
+	loop {
+		let accepted = tokio::select! {
+			biased;
+			_ = settled_rx.changed() => break,
+			accepted = listeners.accept(&mut shutdown) => accepted,
+		};
+		let Some(accepted) = accepted else {
+			break;
+		};
+		let Ok(stream) = accepted else {
 			continue;
 		};
-		let Ok(request_target) = read_request_target(&mut stream).await else {
-			let _ = write_plain(&mut stream, 400, "Bad Request").await;
-			continue;
-		};
+		let connection = Arc::clone(&connection);
+		tokio::spawn(async move { connection.handle(stream).await });
+	}
+}
+
+/// What every connection to the loopback server shares.
+struct Connection {
+	callback_path:     String,
+	callback_origin:   String,
+	expected_state:    String,
+	result:            flume::Sender<CallbackOutcome>,
+	settled:           tokio::sync::watch::Sender<bool>,
+	authorization_url: Receiver<Option<Str>>,
+}
+
+impl Connection {
+	async fn handle(&self, mut stream: TcpStream) {
+		let request_target =
+			match time::timeout(REQUEST_TIMEOUT, read_request_target(&mut stream)).await {
+				Ok(Ok(target)) => target,
+				Ok(Err(_)) => {
+					let _ = write_plain(&mut stream, 400, "Bad Request").await;
+					return;
+				},
+				// Nothing arrived in time: an idle connection, closed quietly.
+				Err(_) => return,
+			};
 		let path = request_target
 			.split_once('?')
 			.map_or(request_target.as_str(), |(path, _)| path);
 		if path == "/launch" {
-			let authorization_url = authorization_url.borrow().clone();
+			let authorization_url = self.authorization_url.borrow().clone();
 			if let Some(authorization_url) = authorization_url {
 				let _ = write_redirect(&mut stream, &authorization_url).await;
 			} else {
 				let _ = write_plain(&mut stream, 503, "Authorization URL is not ready").await;
 			}
-			continue;
+			return;
 		}
-		if path != callback_path {
+		if path != self.callback_path {
 			let _ = write_plain(&mut stream, 404, "Not Found").await;
-			continue;
+			return;
 		}
 
 		let mut callback =
-			Zeroizing::new(String::with_capacity(callback_origin.len() + request_target.len()));
-		callback.push_str(callback_origin);
+			Zeroizing::new(String::with_capacity(self.callback_origin.len() + request_target.len()));
+		callback.push_str(&self.callback_origin);
 		callback.push_str(&request_target);
 		let callback = SecretString::from(mem::take(&mut *callback));
-		let decision = callback_decision(&callback, expected_state);
+		let decision = callback_decision(&callback, &self.expected_state);
 		let (status, page, outcome) = match decision {
 			CallbackDecision::Success { code, state } => (
 				200,
@@ -252,12 +302,15 @@ async fn serve(
 				(500, render_page(&PageState::Failure { ok: false, error: message }), None)
 			},
 		};
+		// The browser gets its page before the outcome can end the login and,
+		// with it, the process that would have answered.
 		if write_html(&mut stream, status, &page).await.is_err() {
-			continue;
+			return;
 		}
 		if let Some(outcome) = outcome {
-			let _ = result.send(outcome);
-			return;
+			// A second decisive callback finds the channel full; the first won.
+			let _ = self.result.try_send(outcome);
+			let _ = self.settled.send(true);
 		}
 	}
 }
@@ -509,6 +562,34 @@ mod tests {
 				.lines()
 				.any(|line| line == "Cache-Control: no-store")
 		);
+	}
+
+	/// A browser's speculative connection that never sends a request must
+	/// not stand in front of the callback that follows it.
+	#[tokio::test]
+	async fn an_idle_connection_does_not_block_the_callback() {
+		let server = callback_server().await;
+		server.arm(Str::new("https://auth.example/authorize"));
+		let launch = Url::parse(&server.launch_url()).expect("valid launch URL");
+		let host = launch.host_str().expect("host");
+		let port = launch.port().expect("port");
+		// Connected, silent, and kept open for the whole test.
+		let _idle = TcpStream::connect((host, port))
+			.await
+			.expect("idle connection");
+		let mut callback_url = launch.clone();
+		callback_url.set_path("/callback");
+		callback_url.set_query(Some("code=accepted&state=expected-state"));
+
+		let response =
+			tokio::time::timeout(std::time::Duration::from_secs(5), get(callback_url.as_str()))
+				.await
+				.expect("the callback is answered while the idle connection is still open");
+		assert_eq!(response.lines().next(), Some("HTTP/1.1 200 OK"));
+		assert!(matches!(
+			server.receive().await.expect("callback outcome"),
+			CallbackOutcome::Callback(_)
+		));
 	}
 
 	#[tokio::test]
