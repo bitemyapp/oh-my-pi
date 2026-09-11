@@ -904,13 +904,16 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		("write", "2".to_owned()),
 		("read", "2".to_owned()),
 	]);
-	for name in ["eval", "write"] {
-		assert_eq!(
-			registry.presentation(name).expect("long-tail presentation"),
-			Presentation::Device,
-			"{name} must remain reachable through dyn without entering the wire roster",
-		);
-	}
+	assert_eq!(
+		registry.presentation("eval").expect("long-tail presentation"),
+		Presentation::Device,
+		"eval must remain reachable through dyn without entering the wire roster",
+	);
+	assert_eq!(
+		registry.presentation("write").expect("write presentation"),
+		Presentation::Slot,
+		"the fork advertises write on the wire roster",
+	);
 	let hidden_yield = registry
 		.advertise_selected(
 			LoweringCaps {
