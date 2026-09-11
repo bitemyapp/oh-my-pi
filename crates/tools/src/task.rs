@@ -73,6 +73,9 @@ pub struct ChildRequest {
 #[serde(deny_unknown_fields)]
 pub struct BatchRequest {
 	/// Shared goal, constraints, and interface contract for every child.
+	/// Optional: a batch of independent children needs none, and a model
+	/// that omits it must not lose the whole call.
+	#[serde(default)]
 	pub context: Str,
 	/// Independent child assignments. The driver runs these concurrently.
 	pub tasks:   Vec<ChildRequest>,
@@ -149,7 +152,7 @@ impl JsonSchema for Params {
 			},
 			"oneOf": [
 				{"required": ["task"]},
-				{"required": ["context", "tasks"]}
+				{"required": ["tasks"]}
 			],
 			"additionalProperties": false
 		})
@@ -561,6 +564,15 @@ mod tests {
 		.expect("batch task shape");
 		let batch = batch.into_batch();
 		assert_eq!(batch.context, "shared");
+		// A batch without shared context is a batch, not an invalid call.
+		let bare = serde_json::from_value::<Params>(serde_json::json!({
+			"tasks": [{"name": "alpha", "task": "first", "effort": "lo"}, {"task": "second"}]
+		}))
+		.expect("batch without context")
+		.into_batch();
+		assert!(bare.context.is_empty());
+		assert_eq!(bare.tasks.len(), 2);
+		assert_eq!(bare.tasks[0].name.as_deref(), Some("alpha"));
 		assert_eq!(batch.tasks.len(), 2);
 		assert_eq!(batch.tasks[1].effort, Some(TaskEffort::Lo));
 	}

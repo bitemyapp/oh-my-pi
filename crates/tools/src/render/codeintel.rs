@@ -574,6 +574,7 @@ mod tests {
 			action:  LspAction::Hover,
 			servers: vec![],
 			output:  Str::default(),
+			omitted: 0,
 			data:    serde_json::json!({
 				"contents": {
 					"kind": "markdown",

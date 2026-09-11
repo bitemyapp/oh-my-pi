@@ -905,7 +905,9 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		("read", "2".to_owned()),
 	]);
 	assert_eq!(
-		registry.presentation("eval").expect("long-tail presentation"),
+		registry
+			.presentation("eval")
+			.expect("long-tail presentation"),
 		Presentation::Device,
 		"eval must remain reachable through dyn without entering the wire roster",
 	);

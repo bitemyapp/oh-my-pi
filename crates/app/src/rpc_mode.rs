@@ -2520,7 +2520,7 @@ where
 								.unwrap_or_default(),
 							"isTerminal": true,
 							"cancelled": false,
-							"error": source.to_string(),
+							"error": error_chain(&source),
 						});
 						if let KernelError::Inference(error) = &source
 							&& let Some(object) = frame.as_object_mut()
@@ -2845,6 +2845,23 @@ fn up_response(
 		},
 		None => missing_message(id, command),
 	}
+}
+
+/// The error and every cause beneath it, so a host shows "session tool JSON
+/// is invalid: data did not match any variant of untagged enum Params"
+/// rather than the top line alone.
+fn error_chain(error: &dyn std::error::Error) -> String {
+	let mut text = error.to_string();
+	let mut cause = error.source();
+	while let Some(source) = cause {
+		let detail = source.to_string();
+		if !detail.is_empty() && !text.contains(&detail) {
+			text.push_str(": ");
+			text.push_str(&detail);
+		}
+		cause = source.source();
+	}
+	text
 }
 
 /// Structured companions to `agent_end.error` for an inference failure, so a

@@ -234,6 +234,7 @@ mod tests {
 	};
 
 	use bytes::Bytes;
+	use omp_tool::Unit;
 	use parking_lot::Mutex;
 	use smallvec::SmallVec;
 

@@ -887,7 +887,11 @@ async fn run_child(prepared: PreparedChild) -> Result<ChildExecution, SpawnError
 		let deadline = (prepared.settings.max_runtime_ms != 0).then(|| {
 			std::time::Instant::now() + Duration::from_millis(prepared.settings.max_runtime_ms)
 		});
-		let mut prompt = format!("{}\n\n{}", prepared.context, prepared.child.task);
+		let mut prompt = if prepared.context.trim().is_empty() {
+			prepared.child.task.to_string()
+		} else {
+			format!("{}\n\n{}", prepared.context, prepared.child.task)
+		};
 		if let Some(schema) = prepared.child.output_schema.as_ref() {
 			prompt.push_str("\n\n");
 			prompt.push_str(&crate::prompt_templates::schema::render(schema));
