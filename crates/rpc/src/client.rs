@@ -873,7 +873,7 @@ impl RpcClient {
 				}
 			}
 		});
-		let client = Self {
+		let mut client = Self {
 			state,
 			child: Mutex::new(Some(child)),
 			stderr,
@@ -890,8 +890,13 @@ impl RpcClient {
 			Ok(Ok(ready)) => ready,
 			Ok(Err(_)) => {
 				tracing::warn!("RPC child exited before ready handshake");
+				// The child said why on stderr as it left; let the reader
+				// finish draining it (bounded, since a grandchild can hold
+				// the pipe open) before the shutdown aborts that task.
+				let _ = time::timeout(Duration::from_millis(200), &mut client.stderr_task).await;
+				let reason = exit_reason(&client.stderr().await);
 				client.shutdown().await?;
-				return Err(ClientError::Disconnected("child exited before ready".into()));
+				return Err(ClientError::Disconnected(reason));
 			},
 			Err(_) => {
 				tracing::warn!("RPC ready handshake timed out");
@@ -1649,9 +1654,83 @@ impl RpcClient {
 	}
 }
 
+/// One line saying why a child left before its ready handshake: the report it
+/// printed on stderr with the box-drawing and blank lines taken out, so "child
+/// exited before ready" can carry "journal … is locked by another writer".
+fn exit_reason(stderr: &str) -> String {
+	const BASE: &str = "child exited before ready";
+	const LIMIT: usize = 400;
+	let summary = stderr
+		.lines()
+		.map(|line| line.trim_matches(|c: char| c.is_whitespace() || "×╰╭─▶│├╮╯╵╷".contains(c)))
+		.filter(|line| !line.is_empty())
+		.collect::<Vec<_>>()
+		.join(" ");
+	if summary.is_empty() {
+		return BASE.to_owned();
+	}
+	let mut reason = format!("{BASE}: {summary}");
+	if reason.len() > LIMIT {
+		let mut cut = LIMIT;
+		while !reason.is_char_boundary(cut) {
+			cut -= 1;
+		}
+		reason.truncate(cut);
+		reason.push('…');
+	}
+	reason
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn exit_reason_carries_the_childs_report_on_one_line() {
+		let stderr = "\n  × session journal operation failed\n  ╰─▶ journal /tmp/a.oms is locked by \
+		              another writer\n\n";
+		assert_eq!(
+			exit_reason(stderr),
+			"child exited before ready: session journal operation failed journal /tmp/a.oms is \
+			 locked by another writer"
+		);
+		assert_eq!(exit_reason("   \n"), "child exited before ready");
+		let long = exit_reason(&"x".repeat(1000));
+		assert!(long.len() <= 404 && long.ends_with('…'));
+	}
+
+	/// A child that prints its reason and leaves before the ready handshake
+	/// surfaces that reason to the host, not just that it left.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn a_child_that_dies_before_ready_reports_what_it_said() {
+		use std::os::unix::fs::PermissionsExt as _;
+		let dir = tempfile::tempdir().unwrap();
+		let script = dir.path().join("omp");
+		std::fs::write(
+			&script,
+			"#!/bin/sh\necho '  × session journal operation failed' >&2\necho '  ╰─▶ journal a.oms \
+			 is locked by another writer' >&2\nexit 1\n",
+		)
+		.unwrap();
+		std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+		let error = RpcClient::spawn(RpcClientOptions {
+			executable: script.into_os_string(),
+			ready_timeout: Duration::from_secs(5),
+			..RpcClientOptions::default()
+		})
+		.await
+		.err()
+		.expect("a child that exits cannot become ready");
+		match error {
+			ClientError::Disconnected(reason) => assert_eq!(
+				reason,
+				"child exited before ready: session journal operation failed journal a.oms is locked \
+				 by another writer"
+			),
+			other => panic!("expected a disconnection, got {other:?}"),
+		}
+	}
 
 	fn in_memory_state() -> Arc<ClientState> {
 		let (writer, _) = flume::unbounded();
