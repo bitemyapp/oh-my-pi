@@ -926,10 +926,11 @@ async fn run_child(prepared: PreparedChild) -> Result<ChildExecution, SpawnError
 		structured_output(&prepared.child, &child_session, turn.assistant_text.as_str());
 	let cancelled =
 		(turn.stop == TurnStop::Cancelled).then(|| Str::new_static("subagent was cancelled"));
-	let mut error = cancelled.or(schema_error);
-	// A workspace merge or teardown failure must not swallow the child's
-	// answer: the text, tokens, and journal path still reach the parent, with
-	// the workspace failure (and its cause) as the error.
+	let error = cancelled.or(schema_error);
+	// The child's work stands whatever becomes of its workspace. A merge that
+	// fails outright is reported on the workspace outcome, with its cause, so
+	// the parent knows the changes were not applied; it does not turn a
+	// finished task into a failed one.
 	let workspace = match isolation {
 		Some(isolation) if error.is_some() => {
 			match discard_isolation(&prepared.env, isolation).await {
@@ -941,12 +942,17 @@ async fn run_child(prepared: PreparedChild) -> Result<ChildExecution, SpawnError
 			}
 		},
 		Some(isolation) => {
+			let worktree = isolation.id.clone();
 			match finish_isolation(&prepared.env, isolation, &prepared.settings).await {
 				Ok(outcome) => Some(outcome),
-				Err(source) => {
-					error = Some(Str::new(describe_error(&source)));
-					None
-				},
+				Err(source) => Some(WorkspaceOutcome {
+					worktree,
+					patch: None,
+					branch: None,
+					applied: false,
+					conflicts: Vec::new(),
+					error: Some(Str::new(describe_error(&source))),
+				}),
 			}
 		},
 		None => None,
@@ -1055,7 +1061,7 @@ pub(crate) async fn finish_isolation(
 	if settings.isolation.merge == TaskIsolationMerge::Patch {
 		destroy_isolation(env, isolation.id.as_str()).await?;
 	}
-	Ok(WorkspaceOutcome { worktree: isolation.id, patch, branch, applied, conflicts })
+	Ok(WorkspaceOutcome { worktree: isolation.id, patch, branch, applied, conflicts, error: None })
 }
 
 pub(crate) async fn discard_isolation(
@@ -1069,6 +1075,7 @@ pub(crate) async fn discard_isolation(
 		branch:    None,
 		applied:   false,
 		conflicts: Vec::new(),
+		error:     None,
 	})
 }
 

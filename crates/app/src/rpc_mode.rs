@@ -1126,6 +1126,19 @@ fn rpc_subagents(jobs: &omp_agent::JobBoard, sessions_dir: &Path) -> Vec<Value> 
 				.started
 				.as_deref()
 				.and_then(|started| started.parse::<u64>().ok());
+			// A child that finished but whose changes were not merged back
+			// says so; a host shows it beside "done" rather than as a failure.
+			let warning = job
+				.output
+				.as_deref()
+				.and_then(|output| serde_json::from_str::<Value>(output.get()).ok())
+				.and_then(|output| {
+					output
+						.get("workspace")?
+						.get("error")?
+						.as_str()
+						.map(|reason| format!("changes were not merged back: {reason}"))
+				});
 			json!({
 				"id": job.id,
 				"index": index,
@@ -1137,6 +1150,7 @@ fn rpc_subagents(jobs: &omp_agent::JobBoard, sessions_dir: &Path) -> Vec<Value> 
 				"startedMs": started_ms,
 				"durationMs": job.duration_ms,
 				"error": job.error,
+				"warning": warning,
 				"sessionFile": sessions_dir.join(format!("{}.oms", safe_session_name(&job.id))),
 				"lastUpdate": 0,
 			})

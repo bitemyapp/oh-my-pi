@@ -221,6 +221,10 @@ pub struct WorkspaceOutcome {
 	pub applied:   bool,
 	/// Paths that conflicted with the parent while applying.
 	pub conflicts: Vec<Str>,
+	/// Why the merge back into the parent failed outright, when it did. The
+	/// child's work stands; its changes, if any, were not applied.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub error:     Option<Str>,
 }
 
 /// Presentation-safe accounting retained for one settled child.
