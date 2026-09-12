@@ -4453,6 +4453,7 @@ pub(crate) fn production_registry<
 	let resolvers = production_url_resolvers(
 		Arc::clone(&conflicts),
 		blobs.store().clone(),
+		blobs.verdict_store().cloned(),
 		session_id,
 		state_dir.join("sessions"),
 		workspace.root().to_path_buf(),

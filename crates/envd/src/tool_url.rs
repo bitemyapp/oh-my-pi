@@ -412,6 +412,7 @@ pub(super) fn local_scheme_entry() -> SchemeEntry {
 pub(super) fn production_url_resolvers(
 	conflicts: Arc<ConflictRegistry>,
 	blob_store: BlobStore,
+	verdict_store: Option<BlobStore>,
 	session_id: &str,
 	sessions_dir: PathBuf,
 	workspace_root: PathBuf,
@@ -521,7 +522,7 @@ pub(super) fn production_url_resolvers(
 			)
 			.with_capabilities(true, true, true),
 			UrlResolver::Artifact(
-				artifact::ArtifactUrlResolver::open(blob_store.clone(), session_id)
+				artifact::ArtifactUrlResolver::open(blob_store.clone(), verdict_store, session_id)
 					.expect("artifact catalog opens with the environment blob store"),
 			),
 		)

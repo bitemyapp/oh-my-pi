@@ -17,18 +17,38 @@ use url::Url;
 
 const MAX_INLINE_BYTES: u64 = 8 * 1024 * 1024;
 
+/// The stores an `artifact://` digest may live in, in lookup order: the
+/// environment's own blob store, then the verdict store that retains every
+/// tool outcome delivered to a session. A job settlement the kernel spills is
+/// the tool's own verdict, so an address the kernel hands the model resolves
+/// here even though the kernel keeps its copy in the session journal's CAS.
 #[derive(Clone, Debug)]
 struct BlobStoreAuthority {
-	store: BlobStore,
+	stores: Vec<BlobStore>,
 }
 
 impl BlobStoreAuthority {
-	fn reference(&self, digest: &str) -> Result<BlobRef, Fault> {
+	/// The store holding `digest` and the reference into it, or the I/O fault
+	/// of the last store tried.
+	fn locate(&self, digest: &str) -> Result<(&BlobStore, BlobRef), Fault> {
 		let probe = BlobRef::parse_hex(digest, 0).map_err(storage_fault)?;
-		let size = fs::metadata(self.store.path(&probe))
-			.map_err(io_fault)?
-			.len();
-		BlobRef::parse_hex(digest, size).map_err(storage_fault)
+		let mut missing = None;
+		for store in &self.stores {
+			match fs::metadata(store.path(&probe)) {
+				Ok(metadata) => {
+					let reference = BlobRef::parse_hex(digest, metadata.len()).map_err(storage_fault)?;
+					return Ok((store, reference));
+				},
+				Err(source) => missing = Some(source),
+			}
+		}
+		Err(io_fault(missing.unwrap_or_else(|| {
+			io::Error::new(io::ErrorKind::NotFound, "no artifact store is configured")
+		})))
+	}
+
+	fn reference(&self, digest: &str) -> Result<BlobRef, Fault> {
+		self.locate(digest).map(|(_, reference)| reference)
 	}
 }
 
@@ -64,8 +84,8 @@ impl BlobAuthority for BlobStoreAuthority {
 		digest: &'a str,
 		range: Range<u64>,
 	) -> Result<CowBytes<'static>, Fault> {
-		let reference = self.reference(digest)?;
-		let bytes = self.store.get(&reference).map_err(storage_fault)?;
+		let (store, reference) = self.locate(digest)?;
+		let bytes = store.get(&reference).map_err(storage_fault)?;
 		let start = usize::try_from(range.start).map_err(|_| Fault::Invalid {
 			message: Str::new_static("Artifact range exceeds host address limits."),
 		})?;
@@ -88,8 +108,16 @@ pub(crate) struct ArtifactUrlResolver {
 }
 
 impl ArtifactUrlResolver {
-	pub(super) fn open(store: BlobStore, _session: &str) -> Result<Self, io::Error> {
-		let blobs = BlobStoreAuthority { store };
+	/// Opens the resolver over `store`, falling back to `verdicts` for a
+	/// digest the environment store does not hold.
+	pub(super) fn open(
+		store: BlobStore,
+		verdicts: Option<BlobStore>,
+		_session: &str,
+	) -> Result<Self, io::Error> {
+		let mut stores = vec![store];
+		stores.extend(verdicts);
+		let blobs = BlobStoreAuthority { stores };
 		let catalog = DigestCatalog { blobs: blobs.clone() };
 		Ok(Self { inner: ArtifactResolver::new(catalog, blobs.clone()), blobs })
 	}
@@ -147,11 +175,10 @@ impl Resolve for ArtifactUrlResolver {
 	}
 
 	async fn path(&self, resource: &str) -> Result<Option<Str>, Fault> {
-		let reference = self.blobs.reference(self.digest(resource)?)?;
-		let url =
-			Url::from_file_path(self.blobs.store.path(&reference)).map_err(|()| Fault::Invalid {
-				message: Str::new_static("Artifact path cannot be represented as a file URI."),
-			})?;
+		let (store, reference) = self.blobs.locate(self.digest(resource)?)?;
+		let url = Url::from_file_path(store.path(&reference)).map_err(|()| Fault::Invalid {
+			message: Str::new_static("Artifact path cannot be represented as a file URI."),
+		})?;
 		Ok(Some(Str::new(url.as_str())))
 	}
 
@@ -176,4 +203,40 @@ fn storage_fault(error: impl fmt::Display) -> Fault {
 
 fn io_fault(source: io::Error) -> Fault {
 	Fault::Source { message: Str::new(format!("Artifact storage I/O failed: {source}")) }
+}
+
+#[cfg(test)]
+mod tests {
+	use omp_journal::blob::BlobStore;
+	use omp_tools::read::{resolver::Resolve, selector::ParsedSelector};
+
+	use super::ArtifactUrlResolver;
+
+	#[tokio::test]
+	async fn a_digest_only_the_verdict_store_holds_still_resolves() {
+		// A job settlement the kernel hands the model as artifact://sha256/…
+		// is the tool's own verdict, retained in the verdict namespace rather
+		// than the environment's main store.
+		let root = tempfile::tempdir().expect("temporary directory");
+		let store = BlobStore::open(root.path().join("blobs")).expect("main store");
+		let verdicts = BlobStore::open(root.path().join("verdicts")).expect("verdict store");
+		let reference = verdicts.put(b"{\"kind\":\"ok\"}").expect("verdict blob");
+		let digest = format!("sha256/{}", reference.to_hex());
+
+		let alone = ArtifactUrlResolver::open(store.clone(), None, "session").expect("resolver");
+		assert!(alone.read(&digest, &ParsedSelector::None).await.is_err());
+
+		let resolver = ArtifactUrlResolver::open(store, Some(verdicts), "session").expect("resolver");
+		let bytes = resolver
+			.read(&digest, &ParsedSelector::None)
+			.await
+			.expect("verdict resolves");
+		assert_eq!(bytes.as_ref(), b"{\"kind\":\"ok\"}");
+		let path = resolver
+			.path(&digest)
+			.await
+			.expect("path resolves")
+			.expect("a file URI");
+		assert!(path.contains("verdicts"), "{path}");
+	}
 }

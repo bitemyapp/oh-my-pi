@@ -835,6 +835,11 @@ impl BlobHost {
 		self.verdict_store.as_ref().unwrap_or(&self.store)
 	}
 
+	/// The separate verdict namespace, when this host keeps one.
+	pub(crate) const fn verdict_store(&self) -> Option<&BlobStore> {
+		self.verdict_store.as_ref()
+	}
+
 	/// Opens the single staged minting path shared by every blob producer.
 	pub(crate) fn begin_spill(&self) -> Result<BlobStage, BlobError> {
 		self.store.begin_put().map_err(BlobError::from)
