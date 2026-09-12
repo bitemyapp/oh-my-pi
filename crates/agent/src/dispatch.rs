@@ -2920,6 +2920,16 @@ impl Committer {
 			self.policy.max_output_bytes
 		};
 		let inline = !force_spill && outcome.get().len() <= inline_limit;
+		// An error the model cannot read is an error it cannot recover from,
+		// and a provider rejects a tool result that is flagged as an error
+		// but says nothing (Anthropic: "content cannot be empty if
+		// `is_error` is true"), which ends the turn. A fault whose projection
+		// came back empty is described from its outcome instead.
+		let parts = if is_error && !parts_have_text(&parts) {
+			vec![Part::Text { text: fault_text(&outcome) }]
+		} else {
+			parts
+		};
 		let outcome = if inline {
 			outcome
 		} else {
@@ -3016,6 +3026,43 @@ fn detached_outcome(job: &JobRef) -> Result<Box<RawValue>, serde_json::Error> {
 		"id": job.id,
 		"job": job,
 	}))
+}
+
+/// Whether any part would put text in front of the model.
+fn parts_have_text(parts: &[Part]) -> bool {
+	parts.iter().any(|part| match part {
+		Part::Text { text } => !text.trim().is_empty(),
+		Part::Json { json } => !json.is_empty(),
+		Part::Blob { alt, .. } => alt.as_deref().is_some_and(|alt| !alt.trim().is_empty()),
+	})
+}
+
+/// The model-facing line for a fault whose projection carried no text: its
+/// `message` when the outcome has one, else the outcome itself, bounded.
+fn fault_text(outcome: &RawValue) -> Str {
+	const MAX_BYTES: usize = 2 * 1024;
+	let raw = outcome.get();
+	let message = serde_json::from_str::<serde_json::Value>(raw)
+		.ok()
+		.and_then(|value| {
+			let value = value.get("value").cloned().unwrap_or(value);
+			value
+				.get("message")
+				.or_else(|| value.get("reason"))
+				.and_then(serde_json::Value::as_str)
+				.filter(|message| !message.trim().is_empty())
+				.map(str::to_owned)
+		});
+	let text =
+		message.map_or_else(|| sf!("tool failed: {raw}"), |message| sf!("tool failed: {message}"));
+	if text.len() <= MAX_BYTES {
+		return text;
+	}
+	let mut end = MAX_BYTES;
+	while !text.is_char_boundary(end) {
+		end -= 1;
+	}
+	sf!("{}…", &text[..end])
 }
 
 fn timeout_job(identity: &ToolIdentity) -> JobRef {

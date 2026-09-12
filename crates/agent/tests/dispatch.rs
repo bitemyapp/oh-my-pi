@@ -573,6 +573,56 @@ impl ExternalToolExecutor for ScriptedExternal {
 	}
 }
 
+/// An external unit that fails with a fault whose projection carries no
+/// text, the way a tool that cannot find an artifact did.
+struct MuteFailureExternal;
+
+impl ExternalToolExecutor for MuteFailureExternal {
+	fn invoke(&self, _request: ExternalDispatchRequest) -> ExternalDispatchStream {
+		let outcome = CallOutcome::<serde_json::Value, serde_json::Value>::Faulted(
+			serde_json::json!({"kind": "source", "message": "Artifact storage I/O failed"}),
+		);
+		Box::pin(futures::stream::iter([ExternalDispatchEvent::Done {
+			outcome,
+			parts: Vec::new(),
+			is_error: true,
+			source_artifact: None,
+		}]))
+	}
+}
+
+#[tokio::test]
+async fn an_error_result_without_text_is_described_from_its_fault() {
+	// Anthropic rejects a tool result flagged as an error with no content,
+	// which would end the turn; the model must always be told what failed.
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let tools = worker_registry();
+	let identity = tools.resolved_identity("worker").expect("worker identity");
+	let dispatcher = Dispatcher::new(
+		Arc::clone(&tools),
+		DispatchPolicy::new(BlobStore::open(directory.path()).expect("blob store")),
+	)
+	.with_external_executor(Arc::new(MuteFailureExternal));
+	let mut session = session(&directory.path().join("mute.oms"));
+	let (entry, args) = call(&mut session, &identity, "mute-1");
+	let report = dispatcher
+		.dispatch(
+			&mut session,
+			request(
+				entry,
+				identity,
+				args,
+				ToolCancellation::ReadOnly(CancelTree::new().begin_turn().read_only_tool()),
+				false,
+			),
+		)
+		.await
+		.expect("fault journals a terminal");
+	assert!(report.is_error);
+	let text = result_text(&session, "mute-1").join("");
+	assert_eq!(text, "tool failed: Artifact storage I/O failed");
+}
+
 /// An external unit that either settles once its cancellation token fires
 /// (a shell whose process group the environment kills) or never settles at
 /// all (a unit that ignores the stop request).
