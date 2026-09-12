@@ -91,8 +91,15 @@ pub struct DispatchPolicy {
 	pub artifact_tail_bytes:       usize,
 	/// Maximum lines retained in each artifact-spilled output head/tail window.
 	pub artifact_tail_lines:       usize,
-	/// Maximum time a call may block the turn.
+	/// Maximum time a call may block the turn. A call still running when it
+	/// elapses is detached into a job and keeps running.
 	pub blocking_limit:            Duration,
+	/// Maximum time an invocation may run in its environment at all, blocking
+	/// or detached, before the environment interrupts it. This is the ceiling
+	/// handed to the environment as the invocation deadline; it must not be
+	/// the blocking limit, or the environment would kill every call at the
+	/// moment the turn stopped waiting for it.
+	pub execution_limit:           Duration,
 	/// Bounded wait after a stop request before a call that has not settled
 	/// is forcibly terminated and journaled as effects-unknown (ADR 0011).
 	/// Execution units apply their own courtesy grace inside this bound.
@@ -102,6 +109,9 @@ pub struct DispatchPolicy {
 }
 
 impl DispatchPolicy {
+	/// How long an invocation may run in its environment before the
+	/// environment interrupts it, blocking or detached.
+	pub const DEFAULT_EXECUTION_LIMIT: Duration = Duration::from_secs(300);
 	/// Standard inline output bound shared by tool terminals and job
 	/// settlements.
 	pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
@@ -120,9 +130,18 @@ impl DispatchPolicy {
 			artifact_tail_bytes: 0,
 			artifact_tail_lines: usize::MAX,
 			blocking_limit: Duration::from_secs(30),
+			execution_limit: Self::DEFAULT_EXECUTION_LIMIT,
 			interrupt_grace: Duration::from_secs(1),
 			spill,
 		}
+	}
+
+	/// Replaces the ceiling on how long an invocation may run in its
+	/// environment, blocking or detached.
+	#[must_use]
+	pub const fn with_execution_limit(mut self, execution_limit: Duration) -> Self {
+		self.execution_limit = execution_limit;
+		self
 	}
 
 	/// Replaces the bounded settle window granted after a stop request.
@@ -213,27 +232,31 @@ pub struct DispatchRequest {
 /// One externally routed invocation with committed canonical arguments.
 pub struct ExternalDispatchRequest {
 	/// Exact selected tool identity.
-	pub identity:       ToolIdentity,
+	pub identity:        ToolIdentity,
 	/// Stable durable session identity owning this call.
-	pub session_id:     Str,
+	pub session_id:      Str,
 	/// Content-addressed store owned by the session currently dispatching the
 	/// call. Session switches and relocation therefore cannot leave the
 	/// external executor writing into its launch-time namespace.
-	pub blobs:          BlobStore,
+	pub blobs:           BlobStore,
 	/// Stable provider call identity.
-	pub call_id:        Str,
+	pub call_id:         Str,
 	/// Canonical committed argument object.
-	pub args:           Box<RawValue>,
+	pub args:            Box<RawValue>,
 	/// Resolved worker or remote execution route.
-	pub route:          ToolRoute,
-	/// Maximum time the invocation may block this turn.
-	pub blocking_limit: Duration,
+	pub route:           ToolRoute,
+	/// Maximum time the invocation may block this turn. Once it elapses the
+	/// dispatcher detaches the call into a job; the invocation keeps running.
+	pub blocking_limit:  Duration,
+	/// Maximum time the invocation may run at all. The executor hands this to
+	/// the environment as the invocation deadline, never `blocking_limit`.
+	pub execution_limit: Duration,
 	/// Caller-selected output projection policy. The environment still enforces
 	/// its fixed security ceiling.
-	pub output_request: OutputRequest,
+	pub output_request:  OutputRequest,
 	/// Turn/session cancellation the executor must honor (ADR 0011): once
 	/// cancelled, the invocation is interrupted and settles aborted.
-	pub cancellation:   CancellationToken,
+	pub cancellation:    CancellationToken,
 }
 
 /// One state mutation produced by an externally routed tool executor.
@@ -1963,6 +1986,7 @@ impl Dispatcher {
 						args,
 						route: route.clone(),
 						blocking_limit: self.committer.policy.blocking_limit,
+						execution_limit: self.committer.policy.execution_limit,
 						output_request: call.options.output_request(),
 						cancellation: call.interrupt.clone(),
 					};

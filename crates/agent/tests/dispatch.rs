@@ -530,11 +530,13 @@ async fn notrunc_disables_the_per_line_clamp() {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExternalObserved {
-	session_id: Str,
-	blobs:      PathBuf,
-	call_id:    Str,
-	args:       Str,
-	route:      ToolRoute,
+	session_id:      Str,
+	blobs:           PathBuf,
+	call_id:         Str,
+	args:            Str,
+	route:           ToolRoute,
+	blocking_limit:  Duration,
+	execution_limit: Duration,
 }
 
 struct ScriptedExternal {
@@ -544,11 +546,13 @@ struct ScriptedExternal {
 impl ExternalToolExecutor for ScriptedExternal {
 	fn invoke(&self, request: ExternalDispatchRequest) -> ExternalDispatchStream {
 		self.observed.lock().push(ExternalObserved {
-			session_id: request.session_id,
-			blobs:      request.blobs.root().to_path_buf(),
-			call_id:    request.call_id,
-			args:       Str::new(request.args.get()),
-			route:      request.route,
+			session_id:      request.session_id,
+			blobs:           request.blobs.root().to_path_buf(),
+			call_id:         request.call_id,
+			args:            Str::new(request.args.get()),
+			route:           request.route,
+			blocking_limit:  request.blocking_limit,
+			execution_limit: request.execution_limit,
 		});
 		let update = serde_json::value::to_raw_value(&serde_json::json!({
 			"text": "external progress"
@@ -805,6 +809,54 @@ async fn dispatch_timed_out_call_remains_observable_as_an_adopted_job() {
 	assert_eq!(dispatcher.jobs().list()[0].status, "cancelled");
 }
 
+#[tokio::test]
+async fn an_adopted_job_survives_the_board_rebuild_a_later_tool_call_runs() {
+	// The next session tool the model calls (`hub jobs`, say) rebuilds the
+	// board from the DOM. A detached call adopted moments earlier must come
+	// through that rebuild still running: the process it detached is doing
+	// exactly what the model asked, and nothing has asked it to stop.
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let tools = worker_registry();
+	let identity = tools.resolved_identity("worker").expect("worker identity");
+	let started = Arc::new(tokio::sync::Notify::new());
+	let dispatcher = Dispatcher::new(
+		Arc::clone(&tools),
+		DispatchPolicy::new(BlobStore::open(directory.path()).expect("blob store")).with_limits(
+			64 * 1024,
+			512,
+			Duration::from_millis(20),
+		),
+	)
+	.with_external_executor(Arc::new(StuckExternal { honors_cancel: true, started }));
+	let mut session = session(&directory.path().join("rebuilt.oms"));
+	let (entry, args) = call(&mut session, &identity, "detached-1");
+	let report = tokio::time::timeout(
+		Duration::from_secs(1),
+		dispatcher.dispatch(
+			&mut session,
+			request(
+				entry,
+				identity,
+				args,
+				ToolCancellation::ReadOnly(CancelTree::new().begin_turn().read_only_tool()),
+				false,
+			),
+		),
+	)
+	.await
+	.expect("blocking limit detaches promptly")
+	.expect("detachment journals a terminal");
+	let detached = report.detached.expect("call returns a job reference");
+	dispatcher.jobs().rebuild(&session);
+	// Give a wrongly cancelled unit time to settle its abort.
+	tokio::time::sleep(Duration::from_millis(100)).await;
+	dispatcher.jobs().poll(&mut session).expect("poll journals");
+	let jobs = dispatcher.jobs().list();
+	assert_eq!(jobs.len(), 1);
+	assert_eq!(jobs[0].id, detached.id);
+	assert_eq!(jobs[0].status, "running", "rebuild must not cancel an adopted job: {jobs:?}");
+}
+
 /// The journaled `tool.result@1` abort kind for `call_id`, after proving the
 /// aborted result projects to the model.
 fn abort_kind(session: &omp_session::Session, call_id: &str) -> String {
@@ -939,8 +991,11 @@ async fn worker_routed_tools_use_the_injected_external_executor() {
 	let launch_store =
 		BlobStore::open(directory.path().join("launch")).expect("launch-time blob store");
 	let launch_root = launch_store.root().to_path_buf();
-	let dispatcher = Dispatcher::new(Arc::clone(&tools), DispatchPolicy::new(launch_store))
-		.with_external_executor(Arc::new(ScriptedExternal { observed: Arc::clone(&observed) }));
+	let dispatcher = Dispatcher::new(
+		Arc::clone(&tools),
+		DispatchPolicy::new(launch_store).with_limits(64 * 1024, 512, Duration::from_secs(30)),
+	)
+	.with_external_executor(Arc::new(ScriptedExternal { observed: Arc::clone(&observed) }));
 	let active = directory.path().join("active");
 	std::fs::create_dir_all(&active).expect("active session directory");
 	let mut session = session(&active.join("worker.oms"));
@@ -967,18 +1022,25 @@ async fn worker_routed_tools_use_the_injected_external_executor() {
 	assert!(!report.is_error);
 	assert_eq!(result_text(&session, "worker-1"), ["external result"]);
 	assert_eq!(observed.lock().as_slice(), [ExternalObserved {
-		session_id: {
+		session_id:      {
 			let path = active.join("worker.oms");
 			let digest = omp_core::Hash32::sum(path.as_os_str().as_encoded_bytes()).to_hex();
 			Str::new(digest.as_str())
 		},
-		blobs:      session.blobs().root().to_path_buf(),
-		call_id:    Str::new_static("worker-1"),
-		args:       Str::new_static("{}"),
-		route:      ToolRoute::Worker {
+		blobs:           session.blobs().root().to_path_buf(),
+		call_id:         Str::new_static("worker-1"),
+		args:            Str::new_static("{}"),
+		route:           ToolRoute::Worker {
 			site: omp_tool::WorkerSiteKind::Env,
 			name: Str::new_static("worker"),
 		},
+		// The environment is told how long the call may run, which is
+		// longer than how long the turn will wait for it: a call detached
+		// at the blocking limit must not be killed at the same moment.
+		blocking_limit:  Duration::from_secs(30),
+		execution_limit: DispatchPolicy::DEFAULT_EXECUTION_LIMIT,
 	}]);
+	let observed = observed.lock();
+	assert!(observed[0].execution_limit > observed[0].blocking_limit);
 	assert_journal_cause(&session, entry);
 }
