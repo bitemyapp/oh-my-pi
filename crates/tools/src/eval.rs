@@ -42,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
 	auto_background::{
 		DEFAULT_AUTO_BACKGROUND_THRESHOLD, DetachedJob, ForegroundWait, JobWait,
-		managed_job_terminal, next_background_name,
+		client_owns_lifetime, managed_job_terminal, next_background_name,
 	},
 	render::TextProjection,
 };
@@ -1682,7 +1682,9 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 			let reset = run.reset();
 			let foreground_wait =
 				ForegroundWait::new(self.auto_background_threshold, timeout);
-			let mut auto_background = true;
+			// As for the shell: a client that owns the invocation's lifetime
+			// detaches the call itself.
+			let mut auto_background = !client_owns_lifetime();
 
 			let mut cell_id = Bytes::new();
 			let mut had_output = false;

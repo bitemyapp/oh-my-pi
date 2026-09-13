@@ -31,7 +31,7 @@ use tracing::Instrument as _;
 use crate::{
 	auto_background::{
 		DEFAULT_AUTO_BACKGROUND_THRESHOLD, DetachedJob, ForegroundWait, JobWait,
-		managed_job_terminal, next_background_name,
+		client_owns_lifetime, managed_job_terminal, next_background_name,
 	},
 	render::TextProjection,
 	shell_intercept,
@@ -782,7 +782,10 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 				self.auto_background_threshold,
 				timeout_ms.map(Duration::from_millis),
 			);
-			let mut auto_background = self.auto_background_enabled && !terminal;
+			// A client that owns the invocation's lifetime detaches the call
+			// itself; the shell must not end the invocation on its own clock.
+			let mut auto_background =
+				self.auto_background_enabled && !terminal && !client_owns_lifetime();
 
 			let mut exec_id = Bytes::new();
 			let mut started = false;

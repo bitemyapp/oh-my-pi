@@ -9102,6 +9102,9 @@ async fn spawn_native_invocation(
 ) {
 	let (started, start) = flume::bounded(1);
 	let retention_session = session_id.clone();
+	// A client that asks for no env deadline owns the invocation's lifetime:
+	// the tools it runs must not detach the invocation on their own clock.
+	let client_owns_lifetime = deadline.is_none();
 	tokio::spawn(with_invocation_scope(
 		pty_denied,
 		with_output_request_scope(
@@ -9110,164 +9113,173 @@ async fn spawn_native_invocation(
 				session_id,
 				with_edit_repair_scope(
 					edit_repair,
-					with_acp_scope(acp, async move {
-						let result = registry.invoke(&name, params);
-						let _ = started.send(());
-						match result {
-							Ok(mut stream) => {
-								// No deadline: the client owns the invocation's lifetime and
-								// ends it by interrupting, cancelling, or dropping the stream.
-								let mut deadline: Option<pin::Pin<Box<Sleep>>> =
-									deadline.map(|deadline| Box::pin(time::sleep(deadline)));
-								let mut cancel_grace: Option<pin::Pin<Box<Sleep>>> = None;
-								let mut timed_out = false;
-								let mut grace_expired = false;
-								loop {
-									if lifecycle.is_terminal() {
-										break;
-									}
-									if let Some(grace) = cancel_grace.as_mut() {
-										tokio::select! {
-											biased;
-											() = grace.as_mut() => {
-												grace_expired = true;
+					with_acp_scope(
+						acp,
+						omp_tools::auto_background::with_client_owned_lifetime(
+							client_owns_lifetime,
+							async move {
+								let result = registry.invoke(&name, params);
+								let _ = started.send(());
+								match result {
+									Ok(mut stream) => {
+										// No deadline: the client owns the invocation's lifetime and
+										// ends it by interrupting, cancelling, or dropping the stream.
+										let mut deadline: Option<pin::Pin<Box<Sleep>>> =
+											deadline.map(|deadline| Box::pin(time::sleep(deadline)));
+										let mut cancel_grace: Option<pin::Pin<Box<Sleep>>> = None;
+										let mut timed_out = false;
+										let mut grace_expired = false;
+										loop {
+											if lifecycle.is_terminal() {
 												break;
-											},
-											event = stream.next() => {
-												let reason = if timed_out {
-													"native invocation ended without reporting timeout truth"
-												} else {
-													"native invocation ended without reporting cancellation truth"
-												};
-												if matches!(
-													forward_native_event(
-														event,
-														true,
-														reason,
-														request_id,
-														&invocation_id,
-														retention_session.as_deref(),
-														&lifecycle,
-														output_request,
-														&blobs,
-														&responses,
-													)
-													.await,
-													NativeForward::Terminal
-												) {
-													break;
+											}
+											if let Some(grace) = cancel_grace.as_mut() {
+												tokio::select! {
+													biased;
+													() = grace.as_mut() => {
+														grace_expired = true;
+														break;
+													},
+													event = stream.next() => {
+														let reason = if timed_out {
+															"native invocation ended without reporting timeout truth"
+														} else {
+															"native invocation ended without reporting cancellation truth"
+														};
+														if matches!(
+															forward_native_event(
+																event,
+																true,
+																reason,
+																request_id,
+																&invocation_id,
+																retention_session.as_deref(),
+																&lifecycle,
+																output_request,
+																&blobs,
+																&responses,
+															)
+															.await,
+															NativeForward::Terminal
+														) {
+															break;
+														}
+													},
 												}
-											},
-										}
-									} else {
-										tokio::select! {
-											biased;
-											() = deadline_elapsed(deadline.as_mut()) => {
-												let reason = sf!("native invocation deadline exceeded");
-												let _ = feed.interrupt(Interrupt {
-													class: sf!("deadline"),
-													reason: reason.clone(),
-												});
-												if lifecycle.is_committed() {
-													timed_out = true;
-													cancel_grace = Some(Box::pin(time::sleep(
-														NATIVE_CANCEL_GRACE,
-													)));
-												} else if lifecycle.claim_precommit_terminal() {
-													send_abort_verdict(
-														&responses,
-														request_id,
-														&invocation_id,
-														omp_tool::Abort::Interrupted { reason },
-													)
-													.await;
-													break;
-												} else {
-													break;
-												}
-											},
-											() = cancel.cancelled() => {
-												if lifecycle.is_committed() {
-													cancel_grace = Some(Box::pin(time::sleep(
-														NATIVE_CANCEL_GRACE,
-													)));
-												} else {
-													break;
-												}
-											},
-											event = stream.next() => {
-												match forward_native_event(
-													event,
-													false,
-													"",
-													request_id,
-													&invocation_id,
-													retention_session.as_deref(),
-													&lifecycle,
-													output_request,
-													&blobs,
-													&responses,
-												)
-												.await
-												{
-													NativeForward::Continue => {},
-													NativeForward::Terminal => break,
-													NativeForward::Backpressure => {
+											} else {
+												tokio::select! {
+													biased;
+													() = deadline_elapsed(deadline.as_mut()) => {
+														let reason = sf!("native invocation deadline exceeded");
 														let _ = feed.interrupt(Interrupt {
-															class: sf!("backpressure"),
-															reason: sf!(
-																"invocation response consumer stopped reading",
-															),
+															class: sf!("deadline"),
+															reason: reason.clone(),
 														});
+														if lifecycle.is_committed() {
+															timed_out = true;
+															cancel_grace = Some(Box::pin(time::sleep(
+																NATIVE_CANCEL_GRACE,
+															)));
+														} else if lifecycle.claim_precommit_terminal() {
+															send_abort_verdict(
+																&responses,
+																request_id,
+																&invocation_id,
+																omp_tool::Abort::Interrupted { reason },
+															)
+															.await;
+															break;
+														} else {
+															break;
+														}
+													},
+													() = cancel.cancelled() => {
 														if lifecycle.is_committed() {
 															cancel_grace = Some(Box::pin(time::sleep(
 																NATIVE_CANCEL_GRACE,
 															)));
 														} else {
-															lifecycle.claim_terminal();
 															break;
 														}
 													},
+													event = stream.next() => {
+														match forward_native_event(
+															event,
+															false,
+															"",
+															request_id,
+															&invocation_id,
+															retention_session.as_deref(),
+															&lifecycle,
+															output_request,
+															&blobs,
+															&responses,
+														)
+														.await
+														{
+															NativeForward::Continue => {},
+															NativeForward::Terminal => break,
+															NativeForward::Backpressure => {
+																let _ = feed.interrupt(Interrupt {
+																	class: sf!("backpressure"),
+																	reason: sf!(
+																		"invocation response consumer stopped reading",
+																	),
+																});
+																if lifecycle.is_committed() {
+																	cancel_grace = Some(Box::pin(time::sleep(
+																		NATIVE_CANCEL_GRACE,
+																	)));
+																} else {
+																	lifecycle.claim_terminal();
+																	break;
+																}
+															},
+														}
+													},
 												}
-											},
+											}
 										}
-									}
+										if grace_expired
+											&& lifecycle.is_committed()
+											&& lifecycle.claim_terminal()
+										{
+											drop(stream);
+											let reason = if timed_out {
+												sf!(
+													"native invocation exceeded its deadline and did not stop \
+													 within grace",
+												)
+											} else {
+												sf!("native invocation did not stop within cancellation grace")
+											};
+											send_abort_verdict(
+												&responses,
+												request_id,
+												&invocation_id,
+												omp_tool::Abort::EffectsUnknown { reason },
+											)
+											.await;
+										}
+									},
+									Err(error) => {
+										if lifecycle.claim_terminal() {
+											let _ = send_invocation_error(
+												&responses,
+												request_id,
+												pb::ProtocolErrorCode::NotFound,
+												&error.to_string(),
+											)
+											.await;
+										}
+									},
 								}
-								if grace_expired && lifecycle.is_committed() && lifecycle.claim_terminal() {
-									drop(stream);
-									let reason = if timed_out {
-										sf!(
-											"native invocation exceeded its deadline and did not stop within \
-											 grace",
-										)
-									} else {
-										sf!("native invocation did not stop within cancellation grace")
-									};
-									send_abort_verdict(
-										&responses,
-										request_id,
-										&invocation_id,
-										omp_tool::Abort::EffectsUnknown { reason },
-									)
+								let _ = finished
+									.send_async(Finished { request_id, invocation_id: Some(invocation_id) })
 									.await;
-								}
 							},
-							Err(error) => {
-								if lifecycle.claim_terminal() {
-									let _ = send_invocation_error(
-										&responses,
-										request_id,
-										pb::ProtocolErrorCode::NotFound,
-										&error.to_string(),
-									)
-									.await;
-								}
-							},
-						}
-						let _ = finished
-							.send_async(Finished { request_id, invocation_id: Some(invocation_id) })
-							.await;
-					}),
+						),
+					),
 				),
 			),
 		),

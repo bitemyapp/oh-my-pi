@@ -20,6 +20,30 @@ use tokio::{runtime, time};
 pub const DEFAULT_AUTO_BACKGROUND_THRESHOLD: Duration = Duration::from_secs(15);
 const TIMEOUT_BUFFER: Duration = Duration::from_secs(1);
 
+tokio::task_local! {
+	static CLIENT_OWNS_LIFETIME: bool;
+}
+
+/// Runs `future` with the knowledge of whether the invoking client owns the
+/// invocation's lifetime. A client that does (the kernel, which detaches a
+/// long call into a job at its own blocking limit and cancels through its
+/// job board) must not have the invocation ended from underneath it by a
+/// tool's foreground threshold; the tool keeps the work attached and lets
+/// the client decide when it stops waiting.
+pub async fn with_client_owned_lifetime<T>(owned: bool, future: impl Future<Output = T>) -> T {
+	CLIENT_OWNS_LIFETIME.scope(owned, future).await
+}
+
+/// Whether the invoking client owns this invocation's lifetime, so a tool
+/// must not detach it on its own. Outside any scope the answer is no, which
+/// keeps the historical foreground threshold for callers that rely on it.
+#[must_use]
+pub fn client_owns_lifetime() -> bool {
+	CLIENT_OWNS_LIFETIME
+		.try_with(|owned| *owned)
+		.unwrap_or(false)
+}
+
 /// Detached work returned by a resource adapter after ownership transfer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DetachedJob {

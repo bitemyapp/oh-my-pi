@@ -624,6 +624,28 @@ async fn foreground_wait_threshold_detaches_the_exact_running_command() {
 	assert_eq!(job.owner, JobOwner::NamedProcess { name: sf!("bash-bg-1"), generation: 1 },);
 }
 
+#[tokio::test]
+async fn a_client_that_owns_the_lifetime_keeps_the_command_in_the_foreground() {
+	// The kernel detaches a long call into a job at its own blocking limit
+	// and keeps the invocation running; the shell must not end that
+	// invocation on its own threshold, or the kernel's job dies with it.
+	let exec = FakeExec::default();
+	let tool = shell::shell(exec.clone()).with_auto_background(true, Duration::ZERO);
+	let (feed, params) = IncomingParams::channel();
+	feed
+		.args_committed(sf!(r#"{{"command":"wait"}}"#))
+		.expect("shell invocation remains live");
+	let next = omp_tools::auto_background::with_client_owned_lifetime(true, async {
+		let mut events = Box::pin(tool.call(params));
+		let started = events.next().await.expect("the command starts");
+		assert!(matches!(started, Ev::Update(Update { started: true, .. })), "{started:?}");
+		tokio::time::timeout(Duration::from_millis(200), events.next()).await
+	})
+	.await;
+	assert!(next.is_err(), "the shell detached a command whose lifetime its client owns: {next:?}");
+	assert!(exec.state.lock().detaches.is_empty());
+}
+
 #[test]
 fn interrupt_during_async_setup_reports_effect_uncertainty() {
 	let exec = FakeExec::default();
