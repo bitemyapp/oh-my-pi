@@ -446,7 +446,9 @@ fn inline_option<'a>(arguments: &[&'a str], prefix: &str) -> Option<&'a str> {
 pub struct AdmissionGate {
 	invocation_id:      Str,
 	tool_name:          Str,
-	deadline:           Instant,
+	/// When env stops waiting for Core's answer; `None` leaves the wait to
+	/// the client, which owns the invocation's lifetime.
+	deadline:           Option<Instant>,
 	fragments:          BytesMut,
 	requested:          Option<Value>,
 	query_emitted:      bool,
@@ -460,14 +462,14 @@ impl AdmissionGate {
 	/// Starts an OPEN invocation gate whose deadline is enforced by env.
 	#[cfg(test)]
 	pub(crate) fn new(invocation_id: Str, tool_name: Str, deadline: Duration) -> Self {
-		Self::with_policy(invocation_id, tool_name, deadline, ApprovalPolicy::Prompt)
+		Self::with_policy(invocation_id, tool_name, Some(deadline), ApprovalPolicy::Prompt)
 	}
 
 	/// Starts an OPEN invocation gate with its resolved admission policy.
 	pub(crate) fn with_policy(
 		invocation_id: Str,
 		tool_name: Str,
-		deadline: Duration,
+		deadline: Option<Duration>,
 		policy: ApprovalPolicy,
 	) -> Self {
 		Self::with_policy_mode(invocation_id, tool_name, deadline, policy, false)
@@ -477,7 +479,7 @@ impl AdmissionGate {
 	pub(crate) fn with_deferred_policy(
 		invocation_id: Str,
 		tool_name: Str,
-		deadline: Duration,
+		deadline: Option<Duration>,
 		policy: ApprovalPolicy,
 	) -> Self {
 		Self::with_policy_mode(invocation_id, tool_name, deadline, policy, true)
@@ -486,7 +488,7 @@ impl AdmissionGate {
 	fn with_policy_mode(
 		invocation_id: Str,
 		tool_name: Str,
-		deadline: Duration,
+		deadline: Option<Duration>,
 		policy: ApprovalPolicy,
 		defer_until_commit: bool,
 	) -> Self {
@@ -494,7 +496,7 @@ impl AdmissionGate {
 		Self {
 			invocation_id,
 			tool_name,
-			deadline: Instant::now() + deadline,
+			deadline: deadline.map(|deadline| Instant::now() + deadline),
 			fragments: BytesMut::new(),
 			requested: None,
 			query_emitted: false,
@@ -555,12 +557,14 @@ impl AdmissionGate {
 		let query = AdmitInvocation {
 			invocation_id: self.invocation_id.to_string(),
 			bash,
-			deadline_ms: self
-				.deadline
-				.saturating_duration_since(Instant::now())
-				.as_millis()
-				.try_into()
-				.unwrap_or(u64::MAX),
+			// Zero tells Core there is no env-side deadline on its answer.
+			deadline_ms: self.deadline.map_or(0, |deadline| {
+				deadline
+					.saturating_duration_since(Instant::now())
+					.as_millis()
+					.try_into()
+					.unwrap_or(u64::MAX)
+			}),
 			props: Default::default(),
 		};
 		match self.policy {
@@ -617,13 +621,18 @@ impl AdmissionGate {
 
 	/// Returns the deadline for a query that is waiting on Core.
 	pub(crate) fn pending_deadline(&self) -> Option<Instant> {
-		(self.query_emitted && self.answer_tx.is_some()).then_some(self.deadline)
+		(self.query_emitted && self.answer_tx.is_some())
+			.then_some(self.deadline)
+			.flatten()
 	}
 
 	/// Converts an unanswered query whose deadline has elapsed into env's
 	/// synthetic denial. The connection loop owns this transition.
 	pub(crate) fn expire(&mut self, now: Instant) -> Option<PolicyDenied> {
-		(self.query_emitted && self.answer_tx.is_some() && now >= self.deadline).then(|| {
+		(self.query_emitted
+			&& self.answer_tx.is_some()
+			&& self.deadline.is_some_and(|deadline| now >= deadline))
+		.then(|| {
 			self.answer_tx.take();
 			timeout_denial(&self.invocation_id)
 		})
@@ -635,7 +644,10 @@ impl AdmissionGate {
 		let admission = match self.answer_rx.try_recv() {
 			Ok(admission) => admission,
 			Err(flume::TryRecvError::Empty) => {
-				let answer = time::timeout_at(self.deadline, self.answer_rx.recv_async()).await;
+				let answer = match self.deadline {
+					Some(deadline) => time::timeout_at(deadline, self.answer_rx.recv_async()).await,
+					None => Ok(self.answer_rx.recv_async().await),
+				};
 				let Ok(Ok(admission)) = answer else {
 					return AdmissionDecision::Denied(timeout_denial(&self.invocation_id));
 				};
@@ -809,7 +821,7 @@ mod tests {
 		let mut gate = AdmissionGate::with_policy(
 			sf!("call"),
 			sf!("bash"),
-			Duration::ZERO,
+			Some(Duration::ZERO),
 			ApprovalPolicy::Allow,
 		);
 		assert!(
@@ -828,8 +840,12 @@ mod tests {
 
 	#[tokio::test]
 	async fn deny_policy_finalizes_without_emitting_a_query() {
-		let mut gate =
-			AdmissionGate::with_policy(sf!("call"), sf!("bash"), Duration::ZERO, ApprovalPolicy::Deny);
+		let mut gate = AdmissionGate::with_policy(
+			sf!("call"),
+			sf!("bash"),
+			Some(Duration::ZERO),
+			ApprovalPolicy::Deny,
+		);
 		assert!(
 			gate
 				.finalize(br#"{"command":"echo denied"}"#, Path::new("/work"), Path::new("/work"))
@@ -863,6 +879,42 @@ mod tests {
 			.await
 			.is_err(),
 			"prompt policy must wait for the client admission answer"
+		);
+		gate
+			.answer(Admission { invocation_id: "call".into(), allow: true, ..Admission::default() })
+			.expect("prompt answer");
+		assert!(matches!(
+			gate.decide(Path::new("/work"), Path::new("/work")).await,
+			AdmissionDecision::Allowed { .. }
+		));
+	}
+
+	#[tokio::test]
+	async fn a_gate_without_a_deadline_never_expires_on_its_own() {
+		// The client owns the invocation's lifetime: env does not deny an
+		// unanswered prompt by its own clock, and tells Core so with a zero
+		// deadline on the query.
+		let mut gate =
+			AdmissionGate::with_policy(sf!("call"), sf!("bash"), None, ApprovalPolicy::Prompt);
+		let query = gate
+			.finalize(br#"{"command":"echo prompt"}"#, Path::new("/work"), Path::new("/work"))
+			.expect("valid arguments")
+			.expect("prompt policy queries");
+		assert_eq!(query.deadline_ms, 0);
+		assert!(gate.pending_deadline().is_none());
+		assert!(
+			gate
+				.expire(time::Instant::now() + Duration::from_secs(86_400))
+				.is_none()
+		);
+		assert!(
+			time::timeout(
+				Duration::from_millis(10),
+				gate.decide(Path::new("/work"), Path::new("/work")),
+			)
+			.await
+			.is_err(),
+			"an undeadlined gate keeps waiting for the client's answer"
 		);
 		gate
 			.answer(Admission { invocation_id: "call".into(), allow: true, ..Admission::default() })

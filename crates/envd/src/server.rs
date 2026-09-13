@@ -174,7 +174,27 @@ use crate::{
 const MIN_SCHEMA_REV: u32 = 4;
 const FRAME_LIMIT: usize = 64 * 1024 * 1024;
 const BLOB_CHUNK_BYTES: usize = 64 * 1024;
-const DEFAULT_TOOL_DEADLINE: Duration = Duration::from_secs(300);
+
+/// The env-enforced deadline an `InvokeTool` asks for: none when the request
+/// says zero, because the client then owns the invocation's lifetime (it
+/// detaches, cancels, or drops the stream) and env must not kill work the
+/// client is still waiting on.
+const fn invocation_deadline(deadline_ms: u64) -> Option<Duration> {
+	if deadline_ms == 0 {
+		None
+	} else {
+		Some(Duration::from_millis(deadline_ms))
+	}
+}
+
+/// Resolves when an env-enforced deadline elapses, or never when the
+/// invocation has none.
+async fn deadline_elapsed(deadline: Option<&mut pin::Pin<Box<Sleep>>>) {
+	match deadline {
+		Some(deadline) => deadline.await,
+		None => std::future::pending().await,
+	}
+}
 const PRELUDE_CALL_DEADLINE: Duration = Duration::from_secs(600);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const NATIVE_CANCEL_GRACE: Duration = Duration::from_millis(250);
@@ -648,7 +668,7 @@ impl DeviceInvoker for WorkerDeviceInvoker {
 				invocation_id: request.invocation_id.clone(),
 				name: request.name.clone(),
 				rev: request.rev.clone(),
-				deadline,
+				deadline: Some(deadline),
 			}) {
 				Ok(invocation) => invocation,
 				Err(error) => {
@@ -728,7 +748,7 @@ impl PreludeInvoker for PreludeBridgeInvoker {
 				invocation_id: invocation_id.clone(),
 				name:          Str::new(name),
 				rev:           Str::new(rev),
-				deadline:      PRELUDE_CALL_DEADLINE,
+				deadline:      Some(PRELUDE_CALL_DEADLINE),
 			})
 			.map_err(|error| {
 				BridgeHostError::message(sf!("failed to open prelude helper invocation: {error}"))
@@ -7323,11 +7343,7 @@ impl EnvServer {
 		let route = registry
 			.route(&request.name)
 			.expect("a live registry identity always has an execution route");
-		let deadline = if request.deadline_ms == 0 {
-			DEFAULT_TOOL_DEADLINE
-		} else {
-			Duration::from_millis(request.deadline_ms)
-		};
+		let deadline = invocation_deadline(request.deadline_ms);
 		let output_request = match pb::OutputRequest::try_from(request.output_request) {
 			Ok(pb::OutputRequest::Complete) => omp_tool::OutputRequest::Complete,
 			Ok(pb::OutputRequest::Bounded | pb::OutputRequest::Unspecified) | Err(_) => {
@@ -9074,7 +9090,7 @@ async fn spawn_native_invocation(
 	edit_repair: InvocationEditRepairContext,
 	acp: InvocationAcpBackends,
 	feed: omp_tool::InvocationFeed,
-	deadline: Duration,
+	deadline: Option<Duration>,
 	output_request: omp_tool::OutputRequest,
 	params: IncomingParams<'static>,
 	registry: Arc<Registry>,
@@ -9099,7 +9115,10 @@ async fn spawn_native_invocation(
 						let _ = started.send(());
 						match result {
 							Ok(mut stream) => {
-								let mut deadline = Box::pin(time::sleep(deadline));
+								// No deadline: the client owns the invocation's lifetime and
+								// ends it by interrupting, cancelling, or dropping the stream.
+								let mut deadline: Option<pin::Pin<Box<Sleep>>> =
+									deadline.map(|deadline| Box::pin(time::sleep(deadline)));
 								let mut cancel_grace: Option<pin::Pin<Box<Sleep>>> = None;
 								let mut timed_out = false;
 								let mut grace_expired = false;
@@ -9143,7 +9162,7 @@ async fn spawn_native_invocation(
 									} else {
 										tokio::select! {
 											biased;
-											() = deadline.as_mut() => {
+											() = deadline_elapsed(deadline.as_mut()) => {
 												let reason = sf!("native invocation deadline exceeded");
 												let _ = feed.interrupt(Interrupt {
 													class: sf!("deadline"),
@@ -12257,6 +12276,12 @@ fn ensure_directory(path: &Path) -> io::Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
 	use std::{fs, os::unix::fs::PermissionsExt as _, sync::Arc};
+
+	#[test]
+	fn a_zero_deadline_means_the_client_owns_the_invocation() {
+		assert_eq!(super::invocation_deadline(0), None);
+		assert_eq!(super::invocation_deadline(50), Some(std::time::Duration::from_millis(50)));
+	}
 
 	use flume::Receiver;
 	use omp_agent::{ApprovalBook, ApprovalDecision, ApprovalRoute, ApprovalScope, ApprovalSource};

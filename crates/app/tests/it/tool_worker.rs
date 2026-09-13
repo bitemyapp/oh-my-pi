@@ -549,9 +549,9 @@ fn open_committed(
 ) -> Result<ExtHostInvocation, ExtHostError> {
 	let mut invocation = supervisor.open(ExtHostToolCall {
 		invocation_id: sf!(invocation_id),
-		name: sf!(name),
-		rev: sf!("1"),
-		deadline,
+		name:          sf!(name),
+		rev:           sf!("1"),
+		deadline:      Some(deadline),
 	})?;
 	invocation.args_committed(ArgsCommitted {
 		invocation_id:    invocation_id.to_owned(),

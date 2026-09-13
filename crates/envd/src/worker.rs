@@ -504,8 +504,9 @@ pub struct ExtHostToolCall {
 	pub name:          Str,
 	/// Registered tool revision.
 	pub rev:           Str,
-	/// Maximum execution duration after the worker receives the call.
-	pub deadline:      Duration,
+	/// Maximum execution duration after the worker receives the call; `None`
+	/// leaves the call's lifetime to the client, which cancels or drops it.
+	pub deadline:      Option<Duration>,
 }
 
 /// Why the supervisor terminated an invocation.
@@ -3769,7 +3770,7 @@ async fn run_control_supervisor(
 						direct_filesystem: None,
 					},
 					policy: invocation.callback_policy,
-					deadline: EventDeadline { at: Instant::now() + invocation.call.deadline },
+					deadline: EventDeadline::after(invocation.call.deadline),
 				};
 				in_flight
 					.lock()
@@ -4245,7 +4246,7 @@ mod tests {
 					invocation_id: sf!("queued"),
 					name:          sf!("tool"),
 					rev:           sf!("1"),
-					deadline:      Duration::from_secs(1),
+					deadline:      Some(Duration::from_secs(1)),
 				},
 				events,
 				callback_policy: CallbackConcurrency::Threadsafe,

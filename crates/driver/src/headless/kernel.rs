@@ -696,10 +696,13 @@ impl ExternalToolExecutor for EnvToolExecutor {
 				invocation_id: request.call_id.to_string(),
 				name: request.identity.name.to_string(),
 				rev: request.identity.rev.to_string(),
-				// The environment's deadline is the execution ceiling, not the
-				// blocking limit: a call the turn stops waiting on at the
-				// blocking limit is detached into a job and must keep running.
-				deadline_ms: u64::try_from(request.execution_limit.as_millis()).unwrap_or(u64::MAX),
+				// Zero asks the environment for no deadline: the kernel owns the
+				// invocation's lifetime. A call the turn stops waiting on at the
+				// blocking limit is detached into a job and must keep running
+				// until it finishes or the job board cancels it.
+				deadline_ms: request.execution_limit.map_or(0, |limit| {
+					u64::try_from(limit.as_millis()).unwrap_or(u64::MAX)
+				}),
 				output_request: match request.output_request {
 					omp_tool::OutputRequest::Bounded => {
 						omp_env::frame::OutputRequest::Bounded as i32

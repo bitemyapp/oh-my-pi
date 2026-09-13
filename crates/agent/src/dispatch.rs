@@ -94,12 +94,14 @@ pub struct DispatchPolicy {
 	/// Maximum time a call may block the turn. A call still running when it
 	/// elapses is detached into a job and keeps running.
 	pub blocking_limit:            Duration,
-	/// Maximum time an invocation may run in its environment at all, blocking
-	/// or detached, before the environment interrupts it. This is the ceiling
-	/// handed to the environment as the invocation deadline; it must not be
-	/// the blocking limit, or the environment would kill every call at the
-	/// moment the turn stopped waiting for it.
-	pub execution_limit:           Duration,
+	/// A ceiling on how long an invocation may run in its environment at
+	/// all, blocking or detached, after which the environment interrupts
+	/// it. `None`, the default: the dispatcher owns every invocation's
+	/// lifetime (it detaches at the blocking limit, cancels through the job
+	/// board, and ends the session), so the environment enforces no
+	/// wall-clock limit of its own and a detached job runs until it is done.
+	/// A tool's own timeout still applies.
+	pub execution_limit:           Option<Duration>,
 	/// Bounded wait after a stop request before a call that has not settled
 	/// is forcibly terminated and journaled as effects-unknown (ADR 0011).
 	/// Execution units apply their own courtesy grace inside this bound.
@@ -109,9 +111,6 @@ pub struct DispatchPolicy {
 }
 
 impl DispatchPolicy {
-	/// How long an invocation may run in its environment before the
-	/// environment interrupts it, blocking or detached.
-	pub const DEFAULT_EXECUTION_LIMIT: Duration = Duration::from_secs(300);
 	/// Standard inline output bound shared by tool terminals and job
 	/// settlements.
 	pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
@@ -130,16 +129,16 @@ impl DispatchPolicy {
 			artifact_tail_bytes: 0,
 			artifact_tail_lines: usize::MAX,
 			blocking_limit: Duration::from_secs(30),
-			execution_limit: Self::DEFAULT_EXECUTION_LIMIT,
+			execution_limit: None,
 			interrupt_grace: Duration::from_secs(1),
 			spill,
 		}
 	}
 
-	/// Replaces the ceiling on how long an invocation may run in its
-	/// environment, blocking or detached.
+	/// Sets, or with `None` removes, the environment's ceiling on how long
+	/// an invocation may run, blocking or detached.
 	#[must_use]
-	pub const fn with_execution_limit(mut self, execution_limit: Duration) -> Self {
+	pub const fn with_execution_limit(mut self, execution_limit: Option<Duration>) -> Self {
 		self.execution_limit = execution_limit;
 		self
 	}
@@ -248,9 +247,11 @@ pub struct ExternalDispatchRequest {
 	/// Maximum time the invocation may block this turn. Once it elapses the
 	/// dispatcher detaches the call into a job; the invocation keeps running.
 	pub blocking_limit:  Duration,
-	/// Maximum time the invocation may run at all. The executor hands this to
-	/// the environment as the invocation deadline, never `blocking_limit`.
-	pub execution_limit: Duration,
+	/// The environment's ceiling on how long the invocation may run at all,
+	/// or `None` when the dispatcher owns its lifetime. The executor hands
+	/// this to the environment as the invocation deadline, never
+	/// `blocking_limit`.
+	pub execution_limit: Option<Duration>,
 	/// Caller-selected output projection policy. The environment still enforces
 	/// its fixed security ceiling.
 	pub output_request:  OutputRequest,

@@ -536,7 +536,7 @@ struct ExternalObserved {
 	args:            Str,
 	route:           ToolRoute,
 	blocking_limit:  Duration,
-	execution_limit: Duration,
+	execution_limit: Option<Duration>,
 }
 
 struct ScriptedExternal {
@@ -1084,13 +1084,12 @@ async fn worker_routed_tools_use_the_injected_external_executor() {
 			site: omp_tool::WorkerSiteKind::Env,
 			name: Str::new_static("worker"),
 		},
-		// The environment is told how long the call may run, which is
-		// longer than how long the turn will wait for it: a call detached
-		// at the blocking limit must not be killed at the same moment.
+		// The turn waits thirty seconds before detaching the call into a job;
+		// the environment is asked for no deadline of its own, so the
+		// detached job runs until it is done rather than being killed at
+		// the moment the turn stopped waiting for it.
 		blocking_limit:  Duration::from_secs(30),
-		execution_limit: DispatchPolicy::DEFAULT_EXECUTION_LIMIT,
+		execution_limit: None,
 	}]);
-	let observed = observed.lock();
-	assert!(observed[0].execution_limit > observed[0].blocking_limit);
 	assert_journal_cause(&session, entry);
 }

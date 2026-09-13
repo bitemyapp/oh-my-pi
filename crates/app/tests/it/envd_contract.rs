@@ -2391,6 +2391,67 @@ async fn native_interrupt_is_steering_only_and_preserves_cooperative_truth() {
 }
 
 #[tokio::test]
+async fn an_invocation_without_a_deadline_runs_until_its_client_ends_it() {
+	// A zero deadline asks env for none: the client owns the invocation's
+	// lifetime. The blocked tool is left alone until the client interrupts
+	// it, rather than being cut off by a default env clock.
+	let scratch = tempfile::tempdir().expect("undeadlined scratch");
+	let started = scratch.path().join("undeadlined-started");
+	let mut registry = Registry::new();
+	registry
+		.register(BlockingTool::new(started.clone()), Presentation::Slot, test_claims())
+		.expect("register blocking native tool");
+	let harness = Harness::start(registry).await;
+	let mut invocation = harness
+		.client()
+		.invoke(v1::InvokeTool {
+			invocation_id: "native-undeadlined".into(),
+			name: "native_block".into(),
+			rev: "test.1".into(),
+			deadline_ms: 0,
+			..Default::default()
+		})
+		.await
+		.expect("open undeadlined native invocation");
+	assert!(matches!(
+		invocation.next_event().await.expect("undeadlined accepted"),
+		Some(InvocationEvent::Accepted(_))
+	));
+	invocation
+		.commit_args(
+			Bytes::from_static(b"{}"),
+			Bytes::from_static(b"contract-test-token"),
+			1000,
+			None,
+		)
+		.await
+		.expect("commit undeadlined native invocation");
+	assert!(matches!(
+		invocation.next_event().await.expect("undeadlined update"),
+		Some(InvocationEvent::Update(_))
+	));
+	assert!(
+		time::timeout(Duration::from_millis(400), invocation.next_event())
+			.await
+			.is_err(),
+		"env ended an invocation the client had not"
+	);
+	invocation.guard().cancel();
+	let terminal = time::timeout(Duration::from_secs(2), invocation.next_event())
+		.await
+		.expect("client cancel plus grace exceeded bound")
+		.expect("client cancel event")
+		.expect("client cancel stream closed");
+	let InvocationEvent::Verdict(terminal) = terminal else {
+		panic!("client cancel did not produce a verdict");
+	};
+	let verdict: CallOutcome<Value, Value> =
+		serde_json::from_slice(&terminal.json).expect("decode client cancel verdict");
+	assert!(matches!(verdict, CallOutcome::Aborted { .. }), "{verdict:?}");
+	assert!(started.exists());
+}
+
+#[tokio::test]
 async fn native_deadline_interrupts_then_structurally_reports_effects_unknown() {
 	let scratch = tempfile::tempdir().expect("native deadline scratch");
 	let started = scratch.path().join("deadline-started");

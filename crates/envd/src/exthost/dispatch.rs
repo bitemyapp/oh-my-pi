@@ -730,6 +730,23 @@ pub struct EventDeadline {
 	pub at: Instant,
 }
 
+impl EventDeadline {
+	/// A deadline `timeout` from now, or one that never arrives when the
+	/// caller owns the event's lifetime.
+	pub fn after(timeout: Option<Duration>) -> Self {
+		match timeout {
+			Some(timeout) => Self { at: Instant::now() + timeout },
+			None => Self::never(),
+		}
+	}
+
+	/// A deadline far enough away never to fire: about thirty years, the
+	/// same horizon tokio itself uses for a timer that must not elapse.
+	pub fn never() -> Self {
+		Self { at: Instant::now() + Duration::from_secs(86_400 * 365 * 30) }
+	}
+}
+
 /// Maximum encoded payload for an observational extension lifecycle event.
 pub const MAX_LIFECYCLE_EVENT_BYTES: usize = 8 * 1024;
 
