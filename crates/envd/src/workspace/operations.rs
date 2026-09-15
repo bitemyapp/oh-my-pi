@@ -985,6 +985,14 @@ impl WorkspaceOperations {
 			if cancel.is_cancelled() {
 				return Err(WorkspaceError::Cancelled.into());
 			}
+			// The target carries the whole tree, so most of its entries are the
+			// files the current manifest already has, byte for byte and mode for
+			// mode. Those need no document at all: opening one for every file in
+			// the workspace activated an actor and a native watch per file, and
+			// a large merge invalidated actors of files nobody touched.
+			if restore_settled(entry, current) {
+				continue;
+			}
 			let path = checked_join(self.inner.workspace.root(), entry.path.as_str())?;
 			let uri = file_uri(&path)?;
 			let lease = self.inner.documents.open(uri, None, cancel).await?;
@@ -1242,6 +1250,13 @@ impl WorkspaceOperations {
 		}
 		Ok(())
 	}
+}
+
+/// Whether the current manifest already records `entry` exactly, so a restore
+/// or merge has nothing to do for its path. A file that differs only in mode
+/// still needs its plan.
+fn restore_settled(entry: &ManifestEntry, current: &Manifest) -> bool {
+	current.entries.get(&entry.path) == Some(entry)
 }
 
 fn merge_target(
@@ -1882,6 +1897,35 @@ mod tests {
 	use std::cell::Cell;
 
 	use super::*;
+
+	fn manifest_of(entries: &[ManifestEntry]) -> Manifest {
+		Manifest {
+			prefixes: Vec::new(),
+			entries:  entries
+				.iter()
+				.map(|entry| (entry.path.clone(), entry.clone()))
+				.collect(),
+		}
+	}
+
+	#[test]
+	fn a_restore_only_plans_entries_the_current_manifest_lacks() {
+		let kept = ManifestEntry { path: Str::from("docs/BASELINE.md"), mode: 0o644, hash: [1; 32] };
+		let current = manifest_of(&[kept.clone()]);
+		assert!(restore_settled(&kept, &current), "same path, mode, and hash");
+		assert!(
+			!restore_settled(&ManifestEntry { hash: [2; 32], ..kept.clone() }, &current),
+			"changed content"
+		);
+		assert!(
+			!restore_settled(&ManifestEntry { mode: 0o755, ..kept.clone() }, &current),
+			"changed mode"
+		);
+		assert!(
+			!restore_settled(&ManifestEntry { path: Str::from("docs/NEW.md"), ..kept }, &current),
+			"a path the current manifest lacks"
+		);
+	}
 
 	#[test]
 	fn oversized_untracked_content_is_typed_and_prevents_snapshot_capture() {
