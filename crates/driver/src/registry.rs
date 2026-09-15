@@ -399,8 +399,23 @@ pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, Reg
 		let explicit = loaded
 			.as_ref()
 			.and_then(|loaded| loaded.config.providers.get(key.provider.as_str()));
+		// A cached row for a model the bundle already knows never replaces
+		// it: the bundle keeps its pricing, thinking policy, and routes, and
+		// the live listing contributes only which processing tiers this
+		// account is offered (the Codex "Fast" tier). Such rows skip the
+		// normalizer altogether so a shape it dislikes cannot cost the
+		// catalog. Everything else is a genuinely new model.
+		let mut fresh_rows = Vec::new();
+		for row in &cached.rows {
+			let bundled_key =
+				omp_catalog::ModelKey::from(format!("{}/{}", key.provider, row.wire_model));
+			match configured.model(&bundled_key) {
+				Some(bundled) => normalized.extend(offered_tiers_patch(bundled, row, now_ms)),
+				None => fresh_rows.push(row.clone()),
+			}
+		}
 		for record in DiscoveryNormalizer::new(defaults)
-			.normalize_batch(&cached.rows)
+			.normalize_batch(&fresh_rows)
 			.map_err(catalog_composition)?
 		{
 			let explicitly_configured = explicit.is_some_and(|provider| {
@@ -446,6 +461,48 @@ pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, Reg
 		)
 		.map_err(catalog_composition)?;
 	Ok(Arc::new(catalog))
+}
+
+/// The one fact a live listing may change on a bundled model: the service
+/// tiers this account is offered on it. `None` when the listing said nothing
+/// or agrees with the bundle.
+fn offered_tiers_patch(
+	bundled: &omp_catalog::ModelSpec,
+	row: &omp_catalog::DiscoveredModel,
+	now_ms: u64,
+) -> Option<CatalogOverlay> {
+	let offered = row
+		.declared_capabilities
+		.as_ref()
+		.and_then(|capabilities| capabilities.chat.as_ref())
+		.map(|chat| &chat.service_tiers)
+		.filter(|tiers| !matches!(tiers, omp_catalog::Availability::Unknown))?;
+	let mut capabilities = bundled.capabilities.clone();
+	let chat = capabilities.chat.as_mut()?;
+	if &chat.service_tiers == offered {
+		return None;
+	}
+	chat.service_tiers = offered.clone();
+	let (provider, _) = bundled.key.as_str().split_once('/')?;
+	let overlay = omp_catalog::ModelOverlay {
+		selector: omp_catalog::ExactSelector {
+			provider: omp_catalog::ProviderId::from(provider),
+			model:    bundled.key.clone(),
+		},
+		added:    None,
+		patch:    omp_catalog::ModelPatch { capabilities: Some(capabilities), ..Default::default() },
+	};
+	Some(
+		omp_catalog::CatalogOverlayBuilder::new(ProvenanceSource {
+			kind:           ProvenanceKind::Discovered,
+			origin:         Str::new_static("models.db"),
+			revision:       None,
+			confidence:     omp_catalog::EvidenceConfidence::Declared,
+			observed_at_ms: Some(now_ms),
+		})
+		.with_model(overlay)
+		.build(),
+	)
 }
 
 fn catalog_composition(source: impl std::error::Error + Send + Sync + 'static) -> RegistryError {
@@ -1320,6 +1377,73 @@ fn production_azure_endpoint() -> Result<Option<AzureEndpointConfig>, RegistryEr
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_cached_row_for_a_bundled_model_changes_only_its_offered_tiers() {
+		use omp_catalog::{
+			Availability, DiscoveredModel, ModelKey, OperationBits, OperationKind, ProviderFamily,
+			ProviderId, RouteId, ServiceTier, WireModelId,
+		};
+		let data_dir = tempfile::tempdir().expect("data dir");
+		let bundled = snapshot::Catalog::embedded();
+		let key = ModelKey::from("openai-codex/gpt-5.6-sol");
+		let before = bundled.model(&key).expect("bundled sol").clone();
+		let fast = ServiceTier::for_family(ProviderFamily::OpenAi, "priority").expect("priority");
+		let mut capabilities = before.capabilities.clone();
+		capabilities.chat.as_mut().expect("chat").service_tiers =
+			Availability::Native(vec![fast.clone()].into_boxed_slice());
+		let mut operations = OperationBits::empty();
+		operations.insert_kind(OperationKind::Chat);
+		let row = DiscoveredModel {
+			provider:              ProviderId::from("openai-codex"),
+			route:                 RouteId::from("openai-codex/primary"),
+			wire_model:            WireModelId::from("gpt-5.6-sol"),
+			aliases:               Box::new([]),
+			display_name:          Some(Str::new_static("GPT-5.6 Sol")),
+			declared_class:        Some(before.class.clone()),
+			declared_operations:   operations,
+			declared_capabilities: Some(capabilities),
+			declared_limits:       Some(before.limits.clone()),
+			declared_pricing:      Box::new([]),
+			extended_context_mode: None,
+			availability:          Some(before.availability.clone()),
+			source:                Str::new_static("test"),
+			observed_at_ms:        Some(1),
+			updated_at_ms:         None,
+			deprecated:            None,
+		};
+		let now_ms = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.expect("clock")
+			.as_millis()
+			.try_into()
+			.expect("ms");
+		omp_ai::discovery::DiscoveryStore::open(&data_dir.path().join("models.db"))
+			.expect("store")
+			.publish(
+				&omp_ai::discovery::DiscoveryCacheKey::provider(ProviderId::from("openai-codex")),
+				&[row],
+				now_ms,
+				std::time::Duration::from_secs(3600),
+			)
+			.expect("publish");
+		let catalog = production_catalog(data_dir.path()).expect("catalog hydrates");
+		let after = catalog.model(&key).expect("sol survives hydration");
+		assert_eq!(
+			after
+				.capabilities
+				.chat
+				.as_ref()
+				.expect("chat")
+				.service_tiers,
+			Availability::Native(vec![fast].into_boxed_slice()),
+			"the live listing's tiers reach the bundled model"
+		);
+		assert_eq!(after.pricing, before.pricing, "the bundle keeps its pricing");
+		assert_eq!(after.thinking, before.thinking, "the bundle keeps its thinking policy");
+		assert_eq!(after.routes, before.routes, "the bundle keeps its routes");
+		assert_eq!(after.wire_ids, before.wire_ids, "the bundle keeps its wire ids");
+	}
 
 	#[test]
 	fn default_context_declares_credential_key_source() {

@@ -241,7 +241,10 @@ async fn refresh() -> miette::Result<()> {
 			let planner = router::Router::new(registry.clone(), Duration::from_secs(30));
 			let meta = CallMeta {
 				id:             RequestId::from(format!("omp-model-refresh-{}", provider.as_str())),
-				target:         Target::ProviderService(provider.clone()),
+				// Pin the route the page is requested on, as `refresh_provider`
+				// does: a provider-level target lets the planner pick a sibling
+				// route, and the answer then fails page validation.
+				target:         Target::RouteService(route.clone()),
 				deadline:       None,
 				budget:         ExecutionBudget::default(),
 				session:        None,
@@ -365,10 +368,20 @@ fn discovered(
 	route: &omp_catalog::RouteId<str>,
 	now_ms: u64,
 ) -> Option<DiscoveredModel> {
+	// A bundled model comes back from the mixed projector as its own spec,
+	// served on its per-model route rather than the discovery route. It is
+	// still worth a row: the live listing is the only source of what this
+	// account is offered on it (the Codex "Fast" tier, say), and hydration
+	// applies only that to a bundled key.
 	let wire_model = model
 		.wire_ids
 		.iter()
-		.find_map(|(candidate, wire)| (candidate == route).then(|| wire.clone()))?;
+		.find_map(|(candidate, wire)| (candidate == route).then(|| wire.clone()))
+		.or_else(|| {
+			model.wire_ids.iter().find_map(|(candidate, wire)| {
+				(candidate.as_str() != route.as_str()).then(|| wire.clone())
+			})
+		})?;
 	let mut declared_operations = model.capabilities.operations;
 	// The Claude subscription bootstrap endpoint is itself an authoritative
 	// list of chat-selectable models. The mixed discovery projector may replace
