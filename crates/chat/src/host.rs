@@ -1285,6 +1285,7 @@ impl Presenter {
 				routed = routed.max(Routed::Repaint);
 			},
 			KernelEvent::Usage { .. }
+			| KernelEvent::InferenceReceipt(_)
 			| KernelEvent::ToolReady { .. }
 			| KernelEvent::ToolUpdate { .. }
 			| KernelEvent::ToolSettled { .. } => {},

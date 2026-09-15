@@ -696,9 +696,18 @@ pub struct TurnReceipt {
 	/// on the kernel's clock.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub ttft_ms:                     Option<u64>,
+	/// Milliseconds from request start to the last streamed token, on the
+	/// kernel's clock. Output throughput in the conventional sense is
+	/// `tokens_out` over the span from `ttft_ms` to here.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub last_token_ms:               Option<u64>,
 	/// Milliseconds from request start to completion.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub duration_ms:                 Option<u64>,
+	/// Reasoning subset of `tokens_out`, as the provider reports it; absent in
+	/// journals written before the field existed.
+	#[serde(default, skip_serializing_if = "is_zero")]
+	pub tokens_reasoning:            u64,
 	/// Provider premium-request units billed for this request in millionths
 	/// (`1_000_000` = one premium request; GitHub Copilot
 	/// `premium_interactions`, fractional for discounted models); zero for
@@ -726,7 +735,9 @@ impl TurnReceipt {
 			cache_read: 0,
 			cache_write: 0,
 			ttft_ms: None,
+			last_token_ms: None,
 			duration_ms: None,
+			tokens_reasoning: 0,
 			premium_requests_millionths: 0,
 			identity: None,
 			recoveries: Vec::new(),
@@ -955,6 +966,30 @@ mod tests {
 			r#""identity":{"role":"advisor","provider":"anthropic","model":"claude-sonnet-4-5"}"#
 		));
 		assert_eq!(serde_json::from_str::<TurnReceipt>(&json).expect("round trip"), advisor);
+	}
+
+	#[test]
+	fn receipt_timing_and_reasoning_fields_are_omitted_until_known() {
+		let legacy: TurnReceipt =
+			serde_json::from_str(r#"{"tokens_in":1,"tokens_out":2,"cost_nano_usd":3}"#)
+				.expect("legacy receipt");
+		assert_eq!(legacy.last_token_ms, None);
+		assert_eq!(legacy.tokens_reasoning, 0);
+		let bare = serde_json::to_string(&TurnReceipt::tokens(1, 2, 3)).expect("bare receipt");
+		assert!(!bare.contains("last_token_ms"));
+		assert!(!bare.contains("tokens_reasoning"));
+
+		let timed = TurnReceipt {
+			ttft_ms: Some(800),
+			last_token_ms: Some(4_200),
+			duration_ms: Some(4_260),
+			tokens_reasoning: 300,
+			..TurnReceipt::tokens(1_000, 500, 0)
+		};
+		let json = serde_json::to_string(&timed).expect("timed receipt");
+		assert!(json.contains(r#""last_token_ms":4200"#));
+		assert!(json.contains(r#""tokens_reasoning":300"#));
+		assert_eq!(serde_json::from_str::<TurnReceipt>(&json).expect("round trip"), timed);
 	}
 
 	#[test]

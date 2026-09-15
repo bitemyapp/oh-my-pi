@@ -21,7 +21,8 @@ use omp_journal::{
 	blob::BlobStore,
 	data::{
 		AsyncJobDelivery, AsyncJobStatus, AsyncResult, Attachment, FileMentions, InferenceRecovery,
-		InferenceRecoveryKind, MentionedFile, MentionedFileState, SkillPrompt, TurnReceipt,
+		InferenceRecoveryKind, MentionedFile, MentionedFileState, ReceiptIdentity, ReceiptRole,
+		SkillPrompt, TurnReceipt,
 	},
 };
 use omp_proto::{
@@ -2158,8 +2159,12 @@ impl<C: Inference> Kernel<C> {
 			self.approvals.clone(),
 		);
 		// First visible or reasoning byte (or the first streamed tool-call
-		// fragment) after the request left the kernel.
+		// fragment) after the request left the kernel, and the last one: the
+		// span between them is what the provider spent producing tokens.
 		let mut first_token: Option<Instant> = None;
+		let mut last_token: Option<Instant> = None;
+		// The route that answered, so the receipt names it.
+		let mut identity: Option<ReceiptIdentity> = None;
 		let fold: Result<Fold, KernelError> = async {
 			loop {
 				let signal = tokio::select! {
@@ -2201,6 +2206,11 @@ impl<C: Inference> Kernel<C> {
 						let model = meta
 							.model
 							.map_or_else(|| Str::new_static("unknown"), |value| Str::new(&value));
+						identity = Some(ReceiptIdentity {
+							role:     ReceiptRole::Primary,
+							provider: Str::new(&meta.provider),
+							model:    model.clone(),
+						});
 						session.assistant_start(
 							model,
 							Str::new(&meta.provider),
@@ -2233,7 +2243,9 @@ impl<C: Inference> Kernel<C> {
 						BlockKind::ToolCall | BlockKind::Artifact => {},
 					},
 					ChatEvent::TextDelta { index, text: delta } => {
-						first_token.get_or_insert_with(Instant::now);
+						let now = Instant::now();
+						first_token.get_or_insert(now);
+						last_token = Some(now);
 						let sid = content_sid(session, assistant, &mut content_streams, index, "text")?;
 						session.stream_append(sid, delta.as_str())?;
 						self.apply_live_components(session)?;
@@ -2255,7 +2267,9 @@ impl<C: Inference> Kernel<C> {
 						}
 					},
 					ChatEvent::ThinkingDelta { index, text: delta } => {
-						first_token.get_or_insert_with(Instant::now);
+						let now = Instant::now();
+						first_token.get_or_insert(now);
+						last_token = Some(now);
 						let sid =
 							content_sid(session, assistant, &mut content_streams, index, "thinking")?;
 						session.stream_append(sid, delta.as_str())?;
@@ -2277,7 +2291,9 @@ impl<C: Inference> Kernel<C> {
 						self.events.publish(KernelEvent::ThinkingDelta(delta));
 					},
 					ChatEvent::ToolCallStarted { index, id, name } => {
-						first_token.get_or_insert_with(Instant::now);
+						let now = Instant::now();
+						first_token.get_or_insert(now);
+						last_token = Some(now);
 						let identity = self
 							.dispatcher
 							.registry()
@@ -2330,6 +2346,7 @@ impl<C: Inference> Kernel<C> {
 						});
 					},
 					ChatEvent::ToolArgumentsDelta { index, bytes } => {
+						last_token = Some(Instant::now());
 						let call = pending
 							.get_mut(&index)
 							.ok_or(KernelError::ToolCallMismatch)?;
@@ -2528,14 +2545,18 @@ impl<C: Inference> Kernel<C> {
 								}),
 							)?;
 						}
-						session.receipt(receipt_facts(
+						let receipt = receipt_facts(
 							&usage,
 							cost_nano_usd(&completion),
 							request_started,
 							first_token,
+							last_token,
 							&completion.receipt.recoveries,
-						))?;
+							identity.clone(),
+						);
+						session.receipt(receipt.clone())?;
 						self.apply_live_components(session)?;
+						self.events.publish(KernelEvent::InferenceReceipt(Box::new(receipt)));
 						completed = true;
 						break Ok(Fold::Ended);
 					},
@@ -2704,7 +2725,9 @@ impl<C: Inference> Kernel<C> {
 						cost_nano_usd,
 						request_started,
 						first_token,
+						last_token,
 						&recoveries,
+						identity.clone(),
 					))?;
 					self.apply_live_components(session)?;
 				}
@@ -2729,7 +2752,15 @@ impl<C: Inference> Kernel<C> {
 			self.apply_live_components(session)?;
 			session.assistant_end("stream_closed")?;
 			self.apply_live_components(session)?;
-			session.receipt(receipt_facts(&usage, 0, request_started, first_token, &[]))?;
+			session.receipt(receipt_facts(
+				&usage,
+				0,
+				request_started,
+				first_token,
+				last_token,
+				&[],
+				identity.clone(),
+			))?;
 			self.apply_live_components(session)?;
 		}
 		Ok(DrivenInference {
@@ -3990,7 +4021,9 @@ fn receipt_facts(
 	cost_nano_usd: u64,
 	request_started: Instant,
 	first_token: Option<Instant>,
+	last_token: Option<Instant>,
 	recoveries: &[RecoveryRecord],
+	identity: Option<ReceiptIdentity>,
 ) -> TurnReceipt {
 	let millis =
 		|elapsed: std::time::Duration| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
@@ -4001,9 +4034,11 @@ fn receipt_facts(
 		cache_read: usage.cache_read_tokens,
 		cache_write: usage.cache_write_tokens,
 		ttft_ms: first_token.map(|at| millis(at.duration_since(request_started))),
+		last_token_ms: last_token.map(|at| millis(at.duration_since(request_started))),
 		duration_ms: Some(millis(request_started.elapsed())),
+		tokens_reasoning: usage.reasoning_tokens,
 		premium_requests_millionths: usage.premium_requests_millionths,
-		identity: None,
+		identity,
 		recoveries: recoveries.iter().map(journal_recovery).collect(),
 	}
 }

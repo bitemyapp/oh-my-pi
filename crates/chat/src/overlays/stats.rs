@@ -533,6 +533,8 @@ mod tests {
 				cache_write:                 0,
 				ttft_ms:                     Some(400),
 				duration_ms:                 Some(1_500),
+				last_token_ms:               None,
+				tokens_reasoning:            0,
 				premium_requests_millionths: 0,
 				identity:                    None,
 				recoveries:                  Vec::new(),

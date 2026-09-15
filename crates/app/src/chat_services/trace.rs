@@ -65,6 +65,11 @@ impl TraceLog {
 fn label(event: &KernelEvent) -> Option<Str> {
 	Some(match event {
 		KernelEvent::InferenceStarted => Str::new_static("inference started"),
+		KernelEvent::InferenceReceipt(receipt) => sf!(
+			"inference receipt: {} out in {} ms",
+			receipt.tokens_out,
+			receipt.duration_ms.unwrap_or(0)
+		),
 		KernelEvent::InferenceRetry { attempt, max_attempts, delay, reason } => {
 			sf!("retry {attempt}/{max_attempts} in {:.1}s: {reason}", delay.as_secs_f64())
 		},

@@ -620,7 +620,7 @@ async fn print_kernel_event(
 				"errorMessage": reason,
 			}))
 		},
-		KernelEvent::InferenceStarted => None,
+		KernelEvent::InferenceStarted | KernelEvent::InferenceReceipt(_) => None,
 		KernelEvent::TurnEnded { stop } => state.retry_attempt.take().map(|attempt| {
 			let success = stop == TurnStop::Completed;
 			let mut value = serde_json::json!({

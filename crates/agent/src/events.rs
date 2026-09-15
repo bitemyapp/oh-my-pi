@@ -27,6 +27,10 @@ pub enum KernelEvent {
 		/// Human-readable failure summary.
 		reason:       Str,
 	},
+	/// One inference response settled and its receipt was journaled: the
+	/// provider's token counts and the kernel's timings, so a host can show
+	/// throughput the moment the response ends without reading the journal.
+	InferenceReceipt(Box<omp_journal::data::TurnReceipt>),
 	/// Cumulative provider usage observed mid-stream; ephemeral.
 	Usage {
 		/// Output tokens so far.

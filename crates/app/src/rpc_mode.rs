@@ -2975,6 +2975,24 @@ fn kernel_event_value(event: KernelEvent) -> Option<Value> {
 			"delayMs": delay.as_millis(),
 			"errorMessage": reason,
 		})),
+		// The settled response's accounting, named the way the journal
+		// receipt is, so a host can show throughput and time-to-first-token
+		// as each response ends. Output throughput in the conventional sense
+		// is `tokensOut` over `lastTokenMs - ttftMs`.
+		KernelEvent::InferenceReceipt(receipt) => Some(json!({
+			"type": "inference_receipt",
+			"provider": receipt.identity.as_ref().map(|identity| identity.provider.as_str()),
+			"model": receipt.identity.as_ref().map(|identity| identity.model.as_str()),
+			"tokensIn": receipt.tokens_in,
+			"tokensOut": receipt.tokens_out,
+			"tokensReasoning": receipt.tokens_reasoning,
+			"cacheRead": receipt.cache_read,
+			"cacheWrite": receipt.cache_write,
+			"costNanoUsd": receipt.cost_nano_usd,
+			"ttftMs": receipt.ttft_ms,
+			"lastTokenMs": receipt.last_token_ms,
+			"durationMs": receipt.duration_ms,
+		})),
 		KernelEvent::Usage { .. }
 		| KernelEvent::TextDelta(_)
 		| KernelEvent::ThinkingDelta(_)

@@ -804,7 +804,9 @@ fn advisor_receipt(completion: &Completion) -> Option<TurnReceipt> {
 		cache_read:                  usage.cache_read_tokens,
 		cache_write:                 usage.cache_write_tokens,
 		ttft_ms:                     completion.receipt.timings.first_frame.map(millis),
+		last_token_ms:               None,
 		duration_ms:                 Some(millis(completion.receipt.timings.total)),
+		tokens_reasoning:            usage.reasoning_tokens,
 		premium_requests_millionths: usage.premium_requests_millionths,
 		identity:                    Some(ReceiptIdentity {
 			role:     ReceiptRole::Advisor,
