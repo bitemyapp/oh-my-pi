@@ -1042,7 +1042,10 @@ fn offers_fast_tier(model: &omp_catalog::ModelSpec) -> bool {
 
 /// Whether the session asks for the OpenAI `priority` tier (`ai_tier_openai`).
 fn fast_mode_enabled(runtime: &RpcRuntime) -> bool {
-	con_text(runtime, "ai_tier_openai").as_deref() == Some("priority")
+	match con_value(runtime, "ai_tier_openai") {
+		Some(omp_con::Value::Enum(value) | omp_con::Value::Str(value)) => value == "priority",
+		_ => false,
+	}
 }
 
 /// Whether the model at `key` is offered the `priority` tier.
