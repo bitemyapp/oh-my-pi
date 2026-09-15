@@ -2009,10 +2009,18 @@ impl OpenAiResponsesDecoder {
 			}
 		}
 		if let Some(response_id) = self.response_id.clone() {
+			let service_tier = response.and_then(|value| value.service_tier.clone());
+			// The tier the provider actually served on is the only proof a
+			// "Fast" request was honoured; it is worth a line in the log.
+			tracing::debug!(
+				response_id = %response_id,
+				service_tier = service_tier.as_deref().unwrap_or("-"),
+				"response completed"
+			);
 			out.push(ResponsesProjection::Continuation {
 				response_id,
 				model: self.model.clone(),
-				service_tier: response.and_then(|value| value.service_tier.clone()),
+				service_tier,
 			});
 		}
 		let reason = if incomplete {

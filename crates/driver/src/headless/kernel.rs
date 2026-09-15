@@ -306,6 +306,10 @@ impl ProductionInference {
 				.model(omp_catalog::ModelKey::from_ref(model.as_str())),
 			request,
 		);
+		if let omp_ai::Setting::Prefer(tier) | omp_ai::Setting::Require(tier) = &request.service_tier
+		{
+			tracing::debug!(tier = %tier.name, model = %model, "request asks for a service tier");
+		}
 	}
 }
 
