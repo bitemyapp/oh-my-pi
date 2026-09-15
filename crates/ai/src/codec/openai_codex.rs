@@ -892,6 +892,14 @@ impl Decoder for CodexModelsDecoder {
 			let context_window = raw.context_window.unwrap_or(272_000);
 			let declared_operations = OperationBits::for_kind(OperationKind::Chat)
 				| omp_catalog::model_operation_overrides("openai-codex", wire_model.as_str());
+			tracing::debug!(
+				model = %wire_model,
+				service_tiers = ?raw
+					.service_tiers
+					.as_ref()
+					.map(|tiers| tiers.iter().map(|tier| tier.id.as_str()).collect::<Vec<_>>()),
+				"codex listing row"
+			);
 			rows.push(DiscoveredModel {
 				provider: self.provider.clone(),
 				route: self.route.clone(),
