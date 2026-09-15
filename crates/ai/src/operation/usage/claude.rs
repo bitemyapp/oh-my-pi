@@ -181,7 +181,10 @@ async fn fetch_claude_usage_until(
 fn claude_headers(access_token: &str) -> Result<HeaderMap, UsageFetchError> {
 	let mut headers = HeaderMap::new();
 	headers.insert(ACCEPT, HeaderValue::from_static("application/json, text/plain, */*"));
-	headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip, compress, deflate, br"));
+	// The OAuth transport hands the body back as text without decoding a
+	// `content-encoding`, and Anthropic gzips whatever accepts gzip, so ask for
+	// plain bytes; the payload is a few hundred bytes either way.
+	headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
 	headers.insert("anthropic-beta", HeaderValue::from_static(ANTHROPIC_BETA));
 	headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 	headers.insert(USER_AGENT, HeaderValue::from_static("claude-cli/2.1.258 (external, cli)"));

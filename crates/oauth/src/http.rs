@@ -176,31 +176,49 @@ impl OAuthHttpClient for SystemOAuthHttpClient {
 					.body(Full::new(body))
 					.map_err(|_| OAuthTransportError)?;
 				*outbound.headers_mut() = headers;
-				let response = client
-					.request(outbound)
-					.await
-					.map_err(|_| OAuthTransportError)?;
+				let response = client.request(outbound).await.map_err(|error| {
+					tracing::debug!(%error, "OAuth HTTP request could not be sent");
+					OAuthTransportError
+				})?;
 				let status = response.status().as_u16();
 				let headers = response.headers().clone();
 				let mut incoming = response.into_body();
 				let mut bytes = BytesMut::new();
 				while let Some(frame) = incoming.frame().await {
-					let frame = frame.map_err(|_| OAuthTransportError)?;
+					let frame = frame.map_err(|error| {
+						tracing::debug!(%error, status, "OAuth HTTP response body broke off");
+						OAuthTransportError
+					})?;
 					if let Some(data) = frame.data_ref() {
 						if bytes.len().saturating_add(data.len()) > MAX_OAUTH_RESPONSE_BYTES {
+							tracing::debug!(status, "OAuth HTTP response exceeded the response ceiling");
 							return Err(OAuthTransportError);
 						}
 						bytes.extend_from_slice(data);
 					}
 				}
-				let body = String::from_utf8(bytes.to_vec()).map_err(|_| OAuthTransportError)?;
+				let body = String::from_utf8(bytes.to_vec()).map_err(|_| {
+					let encoding = headers
+						.get(http::header::CONTENT_ENCODING)
+						.and_then(|value| value.to_str().ok())
+						.unwrap_or("identity");
+					tracing::debug!(
+						status,
+						encoding,
+						"OAuth HTTP response body is not UTF-8; this transport does not decode compressed bodies"
+					);
+					OAuthTransportError
+				})?;
 				Ok(OAuthHttpResponse { status, headers, body: SecretString::from(body) })
 			};
 			tokio::select! {
 				biased;
 				() = cancellation.cancelled() => Err(OAuthTransportError),
 				result = time::timeout(timeout, exchange) => {
-					result.map_err(|_| OAuthTransportError)?
+					result.map_err(|_| {
+						tracing::debug!(?timeout, "OAuth HTTP request timed out");
+						OAuthTransportError
+					})?
 				},
 			}
 		}
