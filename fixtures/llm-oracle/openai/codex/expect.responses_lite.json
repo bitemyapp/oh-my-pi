@@ -5,7 +5,7 @@
       "type": "additional_tools",
       "role": "developer",
       "tools": [
-        { "type": "function", "name": "read", "description": "Read a file", "parameters": { "type": "object" } }
+        { "type": "function", "name": "read", "description": "Read a file", "parameters": { "type": "object" }, "strict": false }
       ]
     },
     {

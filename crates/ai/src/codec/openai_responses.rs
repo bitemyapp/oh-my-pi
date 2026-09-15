@@ -388,8 +388,8 @@ pub struct ResponsesInputItem {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub output: Option<ResponsesToolOutput>,
 	/// Reasoning summaries.
-	#[serde(default, skip_serializing_if = "Vec::is_empty")]
-	pub summary: Vec<ResponsesSummaryPart>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub summary: Option<Vec<ResponsesSummaryPart>>,
 	/// Encrypted reasoning continuation payload.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub encrypted_content: Option<Str>,
@@ -430,7 +430,7 @@ impl ResponsesInputItem {
 			arguments: None,
 			input: None,
 			output: None,
-			summary: Vec::new(),
+			summary: None,
 			encrypted_content: None,
 			actions: Vec::new(),
 			pending_safety_checks: Vec::new(),
@@ -2569,7 +2569,7 @@ impl OpenAiResponsesCodec {
 						arguments: None,
 						input: None,
 						output: None,
-						summary: Vec::new(),
+						summary: None,
 						encrypted_content: None,
 						actions: Vec::new(),
 						pending_safety_checks: Vec::new(),
@@ -2687,11 +2687,11 @@ impl OpenAiResponsesCodec {
 							arguments: None,
 							input: None,
 							output: None,
-							summary: if text.is_empty() {
+							summary: Some(if text.is_empty() {
 								Vec::new()
 							} else {
 								vec![ResponsesSummaryPart { kind: sf!("summary_text"), text: text.clone() }]
-							},
+							}),
 							encrypted_content: decoded.encrypted_reasoning,
 							actions: Vec::new(),
 							pending_safety_checks: Vec::new(),
@@ -2771,7 +2771,7 @@ impl OpenAiResponsesCodec {
 								arguments: (!custom).then(|| serialized.into()),
 								input: custom_input,
 								output: None,
-								summary: Vec::new(),
+								summary: None,
 								encrypted_content: None,
 								actions: Vec::new(),
 								pending_safety_checks: Vec::new(),
@@ -2814,7 +2814,7 @@ impl OpenAiResponsesCodec {
 							arguments: None,
 							input: None,
 							output: Some(output),
-							summary: Vec::new(),
+							summary: None,
 							encrypted_content: None,
 							actions: Vec::new(),
 							pending_safety_checks: Vec::new(),
@@ -3732,6 +3732,12 @@ impl ResponsesDecoderAdapter {
 				emit(RawEvent::Completion(*completion));
 			},
 			ResponsesProjection::ToolCallComplete { index, id, name, arguments, custom } => {
+				let proof = encode_provider_proof(&ResponsesProviderProof {
+					call_id: Some(Str::new(id.as_str())),
+					custom_tool: custom,
+					..ResponsesProviderProof::default()
+				})
+				.map_or_else(|_| Bytes::new(), |value| value);
 				emit(RawEvent::ToolCallComplete {
 					index,
 					call: UnvalidatedToolCall {
@@ -3745,17 +3751,31 @@ impl ResponsesDecoderAdapter {
 						arguments,
 					},
 				});
+				emit(RawEvent::ProviderState(ProviderStateEvent::ToolCallProof {
+					index,
+					value: proof,
+				}));
 			},
 			ResponsesProjection::OutputItem { index, id } => {
 				emit(RawEvent::ProviderState(ProviderStateEvent::OutputItem { index, id }));
 			},
 			ResponsesProjection::ReasoningSignature { index, item_id, signature } => {
-				if let Some(id) = item_id {
-					emit(RawEvent::ProviderState(ProviderStateEvent::OutputItem { index, id }));
+				if let Some(id) = item_id.as_ref() {
+					emit(RawEvent::ProviderState(ProviderStateEvent::OutputItem {
+						index,
+						id: id.clone(),
+					}));
 				}
+				let proof = encode_provider_proof(&ResponsesProviderProof {
+					item_id,
+					encrypted_reasoning: (!signature.is_empty())
+						.then(|| Str::from_utf8_lossy(&signature)),
+					..ResponsesProviderProof::default()
+				})
+				.map_or_else(|_| Bytes::new(), |value| value);
 				emit(RawEvent::ProviderState(ProviderStateEvent::ReasoningSignature {
 					index,
-					signature,
+					signature: proof,
 				}));
 			},
 			ResponsesProjection::HostedTool { index, kind, completed } => {
@@ -4312,7 +4332,7 @@ mod tests {
 		ResponsesEncodeError, ResponsesErrorEvidence, ResponsesImageDetail, ResponsesInputItem,
 		ResponsesInputItemKind, ResponsesProjection, ResponsesProviderProof, ResponsesRole,
 		ResponsesToolOutput, ResponsesToolOutputPart, classify_continuation_error,
-		encode_provider_proof, hoist_interleaved_tool_batch_messages,
+		decode_provider_proof, encode_provider_proof, hoist_interleaved_tool_batch_messages,
 	};
 	use crate::{
 		answer::GenerationEvent,
@@ -4324,7 +4344,7 @@ mod tests {
 			ToolInputConstraint, ToolResultContent,
 		},
 		catalog::{ProviderId, RouteId},
-		codec::{Codec as _, Decoder as _, EncodeContext, RawEvent},
+		codec::{Codec as _, Decoder as _, EncodeContext, ProviderStateEvent, RawEvent},
 		event::{ChatEvent, FinishReason},
 		id::{RequestId, ToolCallId},
 		receipt::Usage,
@@ -6016,6 +6036,66 @@ mod tests {
 		assert_eq!(unrelated.kind, ErrorKind::Protocol);
 		assert_eq!(unrelated.action, RetryAction::Never);
 	}
+
+	#[test]
+	fn decoder_adapter_emits_replayable_reasoning_and_tool_proofs() {
+		let adapter = ResponsesDecoderAdapter {
+			inner: OpenAiResponsesDecoder::default(),
+			request_id: RequestId::new("request"),
+			provider: ProviderId::from("openai-codex"),
+			route: RouteId::from("openai-codex/primary"),
+			wire_model: Some(sf!("gpt-5.6-luna")),
+			thinking_close_max_retries: None,
+		};
+		let mut events = Vec::new();
+		adapter.emit_projection(
+			ResponsesProjection::ReasoningSignature {
+				index:     0,
+				item_id:   Some(sf!("rs_1")),
+				signature: Bytes::from_static(b"enc_reasoning"),
+			},
+			&mut |event| events.push(event),
+		);
+		adapter.emit_projection(
+			ResponsesProjection::ToolCallComplete {
+				index:     1,
+				id:        ToolCallId::new("call_1"),
+				name:      sf!("read"),
+				arguments: Bytes::from_static(br#"{"path":"README.md"}"#),
+				custom:    false,
+			},
+			&mut |event| events.push(event),
+		);
+
+		let reasoning = events.iter().find_map(|event| match event {
+			RawEvent::ProviderState(ProviderStateEvent::ReasoningSignature { signature, .. }) => {
+				decode_provider_proof(signature).ok()
+			},
+			_ => None,
+		});
+		assert_eq!(
+			reasoning,
+			Some(ResponsesProviderProof {
+				item_id: Some(sf!("rs_1")),
+				encrypted_reasoning: Some(sf!("enc_reasoning")),
+				..ResponsesProviderProof::default()
+			})
+		);
+		let tool = events.iter().find_map(|event| match event {
+			RawEvent::ProviderState(ProviderStateEvent::ToolCallProof { value, .. }) => {
+				decode_provider_proof(value).ok()
+			},
+			_ => None,
+		});
+		assert_eq!(
+			tool,
+			Some(ResponsesProviderProof {
+				call_id: Some(sf!("call_1")),
+				..ResponsesProviderProof::default()
+			})
+		);
+	}
+
 	#[test]
 	fn streamed_error_codes_preserve_precommit_retry_policy() {
 		use crate::error::{ErrorKind, RetryAction};

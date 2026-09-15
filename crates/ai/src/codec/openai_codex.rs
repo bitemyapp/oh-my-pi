@@ -8,12 +8,12 @@ use super::{
 	Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest, RawEvent,
 	RequestHeader, RequestMethod, SizeBounds,
 	openai_responses::{
-		OpenAiResponsesCodec, OpenAiResponsesDecoder, OpenAiResponsesOptions, ResponsesInputContent,
-		ResponsesInputItem, ResponsesInputItemKind, ResponsesMetadata, ResponsesMetadataValue,
-		ResponsesNamedToolKind, ResponsesOutputItem, ResponsesOutputItemKind, ResponsesReasoning,
-		ResponsesRequest, ResponsesRole, ResponsesStreamEvent, ResponsesStreamEventKind,
-		ResponsesStreamOptions, ResponsesTool, ResponsesToolChoice, ResponsesToolChoiceMode,
-		ResponsesToolKind, hosted_image_body,
+		OpenAiResponsesCodec, OpenAiResponsesDecoder, OpenAiResponsesOptions, ResponsesContentKind,
+		ResponsesEncodeError, ResponsesInputContent, ResponsesInputItem, ResponsesInputItemKind,
+		ResponsesMetadata, ResponsesMetadataValue, ResponsesNamedToolKind, ResponsesOutputItem,
+		ResponsesOutputItemKind, ResponsesReasoning, ResponsesRequest, ResponsesRole,
+		ResponsesStreamEvent, ResponsesStreamEventKind, ResponsesStreamOptions, ResponsesTool,
+		ResponsesToolChoice, ResponsesToolChoiceMode, ResponsesToolKind, hosted_image_body,
 	},
 };
 use crate::{
@@ -126,6 +126,23 @@ pub fn transform_codex_request(
 			reasoning_summary_delivery: Some(sf!("sequential_cutoff")),
 		});
 	}
+	for item in &mut request.input {
+		if item.role != Some(ResponsesRole::Assistant) {
+			continue;
+		}
+		if let Some(parts) = item.content.parts_mut() {
+			for content in parts {
+				if content.kind == ResponsesContentKind::InputText {
+					content.kind = ResponsesContentKind::OutputText;
+				}
+			}
+		}
+	}
+	for tool in &mut request.tools {
+		if tool.kind == ResponsesToolKind::Function {
+			tool.strict = Some(false);
+		}
+	}
 	if !responses_lite {
 		return Ok(());
 	}
@@ -213,7 +230,7 @@ pub fn transform_codex_request(
 			arguments: None,
 			input: None,
 			output: None,
-			summary: Vec::new(),
+			summary: None,
 			encrypted_content: None,
 			actions: Vec::new(),
 			pending_safety_checks: Vec::new(),
@@ -1066,7 +1083,38 @@ impl Codec for OpenAiCodexCodec {
 		let encoded = self
 			.responses
 			.encode_chat(context, chat)
-			.map_err(|_| fail("codex_responses_encoding"))?;
+			.map_err(|error| match error {
+				ResponsesEncodeError::MismatchedProviderProof => {
+					fail("codex_mismatched_responses_provider_proof")
+				},
+				ResponsesEncodeError::UnreplayableProviderProof => {
+					fail("codex_unreplayable_responses_provider_proof")
+				},
+				ResponsesEncodeError::MissingWireTarget => fail("codex_missing_responses_wire_target"),
+				ResponsesEncodeError::MissingCallIdentity => {
+					fail("codex_missing_responses_call_identity")
+				},
+				ResponsesEncodeError::UnresolvedStoredMedia => fail("codex_unresolved_responses_media"),
+				ResponsesEncodeError::UnsupportedOutputFormat => {
+					fail("codex_unsupported_responses_output_format")
+				},
+				ResponsesEncodeError::UnsupportedComputerUse => {
+					fail("codex_unsupported_responses_computer_use")
+				},
+				ResponsesEncodeError::UnsupportedComputerUseConfig => {
+					fail("codex_unsupported_responses_computer_use_config")
+				},
+				ResponsesEncodeError::MalformedServerState => {
+					fail("codex_malformed_responses_server_state")
+				},
+				ResponsesEncodeError::MismatchedServerState => {
+					fail("codex_mismatched_responses_server_state")
+				},
+				ResponsesEncodeError::UnreplayableImageFileReference { .. } => {
+					fail("codex_unreplayable_responses_image_file_reference")
+				},
+				_ => fail("codex_responses_encoding"),
+			})?;
 		if !encoded.adjustments.is_empty() {
 			return Err(fail("codex_adjustment_requires_planning"));
 		}
@@ -1087,7 +1135,7 @@ impl Codec for OpenAiCodexCodec {
 			.options
 			.transport
 			.unwrap_or(match context.route.codex_transport {
-				CodexTransportPreference::WebsocketPreferred => CodexWireTransport::WebSocket,
+				CodexTransportPreference::WebsocketPreferred => CodexWireTransport::Http,
 				CodexTransportPreference::HttpOnly => CodexWireTransport::Http,
 			});
 		// Codec options pin an identity for hosts that own the session; a bare
@@ -1266,6 +1314,61 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn assistant_history_uses_codex_output_content() {
+		let original: ResponsesRequest = serde_json::from_value(serde_json::json!({
+			"model": "gpt-5.6-luna",
+			"input": [
+				{
+					"role": "assistant",
+					"content": [{"type": "input_text", "text": "prior answer"}]
+				},
+				{
+					"role": "user",
+					"content": [{"type": "input_text", "text": "next question"}]
+				}
+			]
+		}))
+		.expect("typed request");
+
+		for responses_lite in [false, true] {
+			let mut request = original.clone();
+			transform_codex_request(&mut request, responses_lite, false)
+				.expect("Codex request rewrite");
+			let encoded = serde_json::to_value(request).expect("request JSON");
+			assert_eq!(encoded["input"][0]["content"][0]["type"], "output_text");
+			assert_eq!(encoded["input"][1]["content"][0]["type"], "input_text");
+		}
+	}
+	#[test]
+	fn function_tools_use_permissive_codex_schemas() {
+		let original: ResponsesRequest = serde_json::from_value(serde_json::json!({
+			"model": "gpt-5.6-luna",
+			"input": [],
+			"tools": [{
+				"type": "function",
+				"name": "ask",
+				"parameters": {
+					"type": "object",
+					"properties": {"optional": {"type": "string"}}
+				},
+				"strict": true
+			}]
+		}))
+		.expect("typed request");
+
+		for responses_lite in [false, true] {
+			let mut request = original.clone();
+			transform_codex_request(&mut request, responses_lite, false)
+				.expect("Codex request rewrite");
+			let tool = if responses_lite {
+				&request.input[0].tools[0]
+			} else {
+				&request.tools[0]
+			};
+			assert_eq!(tool.strict, Some(false));
+		}
+	}
 	#[test]
 	fn residency_header_is_applied_only_for_claimed_regions() {
 		let account = AccountRoutingContext {
