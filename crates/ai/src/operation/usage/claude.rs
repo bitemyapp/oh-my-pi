@@ -155,13 +155,15 @@ async fn fetch_claude_usage_until(
 		return Err(UsageFetchError::Unavailable);
 	}
 
+	// The usage payload never names the plan; the profile's organization does,
+	// so it is fetched every time and doubles as the identity backfill.
 	let (mut account_id, mut email) = extract_usage_identity(root);
-	if (account_id.is_none() || email.is_none())
-		&& let Some(profile) = fetch_profile(http, &base_url, headers, deadline).await
-	{
+	let mut plan = None;
+	if let Some(profile) = fetch_profile(http, &base_url, headers, deadline).await {
 		let (profile_id, profile_email) = extract_profile_identity(&profile);
 		account_id = account_id.or(profile_id);
 		email = email.or(profile_email);
+		plan = extract_profile_plan(&profile);
 	}
 
 	Ok(ConsoleUsageObservation {
@@ -170,7 +172,7 @@ async fn fetch_claude_usage_until(
 			email,
 			..UsageAccountMetadata::default()
 		},
-		plan: None,
+		plan,
 		source_label: Some(sf!("anthropic-oauth")),
 		notes: Box::default(),
 		reset_credits: None,
@@ -603,6 +605,47 @@ fn extract_profile_identity(root: &Map<String, Value>) -> (Option<Str>, Option<S
 	(account_id, email)
 }
 
+/// The plan slug a Claude profile describes: `max_20x`, `max_5x`, `max`,
+/// `pro`, `team`, `enterprise`, or whatever else the organization type says
+/// once its `claude_` prefix is dropped. The organization's rate-limit tier
+/// tells the Max sizes apart (`default_claude_max_20x`), the organization
+/// type names the plan (`claude_max`), and the account's own flags are the
+/// last resort for a profile that carries neither.
+fn extract_profile_plan(root: &Map<String, Value>) -> Option<Str> {
+	let organization = root.get("organization").and_then(Value::as_object);
+	let tier = organization
+		.and_then(|organization| organization.get("rate_limit_tier"))
+		.and_then(Value::as_str)
+		.unwrap_or_default();
+	if tier.contains("max_20x") {
+		return Some(sf!("max_20x"));
+	}
+	if tier.contains("max_5x") {
+		return Some(sf!("max_5x"));
+	}
+	if let Some(kind) = organization
+		.and_then(|organization| first_string(organization, &["organization_type"]))
+		.and_then(|kind| kind.strip_prefix("claude_").map(Str::new))
+		.filter(|kind| !kind.is_empty())
+	{
+		return Some(kind);
+	}
+	let account = root.get("account").and_then(Value::as_object);
+	let flag = |key: &str| {
+		account
+			.and_then(|account| account.get(key))
+			.and_then(Value::as_bool)
+			.unwrap_or(false)
+	};
+	if flag("has_claude_max") {
+		Some(sf!("max"))
+	} else if flag("has_claude_pro") {
+		Some(sf!("pro"))
+	} else {
+		None
+	}
+}
+
 fn first_string(root: &Map<String, Value>, keys: &[&str]) -> Option<Str> {
 	keys.iter().find_map(|key| {
 		root
@@ -683,12 +726,11 @@ mod tests {
 				.requests
 				.lock()
 				.push(RecordedRequest { method, url: url.to_string(), headers });
-			let response = self
-				.responses
-				.lock()
-				.pop_front()
-				.expect("scripted response");
-			async move { Ok(response) }.boxed()
+			// A request past the script fails like a dead transport would, so
+			// a test that only scripts the usage reply sees the profile fetch
+			// come back empty rather than panic.
+			let response = self.responses.lock().pop_front();
+			async move { response.ok_or(OAuthTransportError) }.boxed()
 		}
 	}
 
@@ -732,6 +774,55 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn the_plan_comes_from_the_profiles_organization() {
+		let http = ScriptedHttp::new([
+			(200, r#"{"account_id":"a","email":"u@example.com","five_hour":{"utilization":1}}"#),
+			(
+				200,
+				r#"{"account":{"uuid":"a","email":"u@example.com","has_claude_max":true,"has_claude_pro":false},
+				"organization":{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_20x"}}"#,
+			),
+		]);
+		let report = fetch_claude_usage("token", &http, now())
+			.await
+			.expect("usage");
+		assert_eq!(report.plan.as_deref(), Some("max_20x"));
+		assert_eq!(http.requests.lock().len(), 2, "the profile is fetched even when identity is known");
+
+		let profile = |body: &str| {
+			serde_json::from_str::<serde_json::Value>(body)
+				.expect("json")
+				.as_object()
+				.cloned()
+				.expect("object")
+		};
+		assert_eq!(
+			super::extract_profile_plan(&profile(
+				r#"{"organization":{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_5x"}}"#
+			))
+			.as_deref(),
+			Some("max_5x")
+		);
+		assert_eq!(
+			super::extract_profile_plan(&profile(
+				r#"{"organization":{"organization_type":"claude_pro","rate_limit_tier":"default_claude_pro"}}"#
+			))
+			.as_deref(),
+			Some("pro")
+		);
+		assert_eq!(
+			super::extract_profile_plan(&profile(r#"{"organization":{"organization_type":"claude_team"}}"#))
+				.as_deref(),
+			Some("team")
+		);
+		assert_eq!(
+			super::extract_profile_plan(&profile(r#"{"account":{"has_claude_pro":true}}"#)).as_deref(),
+			Some("pro")
+		);
+		assert_eq!(super::extract_profile_plan(&profile(r#"{"account":{}}"#)), None);
+	}
+
+	#[tokio::test]
 	async fn organization_response_header_is_not_account_identity() {
 		let mut headers = HeaderMap::new();
 		headers.insert("anthropic-organization-id", "org_header".parse().expect("header value"));
@@ -768,7 +859,8 @@ mod tests {
 		let report = fetch_claude_usage("token", &http, now())
 			.await
 			.expect("usage");
-		assert_eq!(http.requests.lock().len(), 1);
+		assert_eq!(http.requests.lock().len(), 2, "usage, then the profile for the plan");
+		assert_eq!(report.plan, None, "an unanswered profile leaves the plan unknown");
 		assert_eq!(report.windows.len(), 3);
 		assert_eq!(report.windows[0].id.as_str(), "anthropic:5h");
 		assert_eq!(report.windows[1].id.as_str(), "anthropic:7d");

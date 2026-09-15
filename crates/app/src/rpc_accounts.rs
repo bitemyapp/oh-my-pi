@@ -761,20 +761,17 @@ fn account_usage_value(
 				.windows
 				.iter()
 				.map(|window| {
-					let percent = |quantity: &Option<omp_ai::answer::UsageQuantity>| {
+					let decimal = |quantity: &Option<omp_ai::answer::UsageQuantity>| {
 						quantity.as_ref().map(|quantity| {
 							quantity.units as f64 / 10f64.powi(i32::from(quantity.decimal_exponent))
 						})
 					};
+					let (used, limit) = (decimal(&window.amount.consumed), decimal(&window.amount.limit));
 					let used_percent = match window.amount.unit {
-						omp_ai::answer::UsageUnit::Percent => percent(&window.amount.consumed),
-						_ => match (&window.amount.consumed, &window.amount.limit) {
-							(Some(consumed), Some(limit)) if limit.units > 0 => {
-								let consumed =
-									consumed.units as f64 / 10f64.powi(i32::from(consumed.decimal_exponent));
-								let limit =
-									limit.units as f64 / 10f64.powi(i32::from(limit.decimal_exponent));
-								Some((consumed / limit * 100.0).clamp(0.0, 100.0))
+						omp_ai::answer::UsageUnit::Percent => used,
+						_ => match (used, limit) {
+							(Some(used), Some(limit)) if limit > 0.0 => {
+								Some((used / limit * 100.0).clamp(0.0, 100.0))
 							},
 							_ => None,
 						},
@@ -784,6 +781,11 @@ fn account_usage_value(
 						"label": window.label.as_deref(),
 						"scope": window.scope.as_deref(),
 						"usedPercent": used_percent,
+						// The raw amounts too, so a billing window can be shown as
+						// money rather than as a bare percentage of its cap.
+						"unit": format!("{:?}", window.amount.unit).to_lowercase(),
+						"used": used,
+						"limit": limit,
 						"resetsAtMs": window.resets_at.and_then(|at| {
 							at.duration_since(std::time::UNIX_EPOCH)
 								.ok()
