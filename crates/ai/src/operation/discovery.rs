@@ -15,8 +15,8 @@ use crate::{
 	answer::{Answer, AnswerBody, ModelDiscoveryPage},
 	call::{Call, DiscoveryRequest, OperationCall},
 	catalog::{
-		DiscoveredModel, DiscoveryNormalizer, ModelKey, ModelSpec, OperationKind, Pricing,
-		ProviderId, RouteDef, RouteId, WireModelId, snapshot::Catalog, taxonomy,
+		Availability, DiscoveredModel, DiscoveryNormalizer, ModelKey, ModelSpec, OperationKind,
+		Pricing, ProviderId, RouteDef, RouteId, WireModelId, snapshot::Catalog, taxonomy,
 	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	layer::recover::DiscoveryProjector,
@@ -401,7 +401,9 @@ fn project_mixed_page(
 			provider_bundled.and_then(|bundled| bundled.get(&row.wire_model))
 		});
 		let model = if let Some(model) = bundled {
-			model.clone()
+			let mut model = model.clone();
+			adopt_declared_service_tiers(&mut model, &row);
+			model
 		} else if let Some(plain) =
 			routing_variant_counterpart(provider_bundled, provider, &row.wire_model)
 		{
@@ -410,7 +412,9 @@ fn project_mixed_page(
 			// metadata derived from the plain spec, then keep the
 			// plain identity itself resolvable under authoritative
 			// discovery.
-			push(routing_variant_spec(plain, &row), &mut seen_models, &mut models);
+			let mut variant = routing_variant_spec(plain, &row);
+			adopt_declared_service_tiers(&mut variant, &row);
+			push(variant, &mut seen_models, &mut models);
 			plain.clone()
 		} else {
 			let mut model = normalizer
@@ -436,6 +440,26 @@ fn project_mixed_page(
 		push(model, &mut seen_models, &mut models);
 	}
 	Ok(ModelDiscoveryPage { models, next_cursor })
+}
+
+/// Carries the processing tiers the backend advertises for this account onto
+/// a bundled spec. A bundle cannot know whether a subscription is offered the
+/// `priority` ("Fast") tier on a given model; the live listing does, and it
+/// is the one fact of a bundled model that discovery is allowed to override.
+/// Unknown stays unknown, so a listing that says nothing changes nothing.
+fn adopt_declared_service_tiers(model: &mut ModelSpec, row: &DiscoveredModel) {
+	let Some(declared) = row
+		.declared_capabilities
+		.as_ref()
+		.and_then(|capabilities| capabilities.chat.as_ref())
+		.map(|chat| &chat.service_tiers)
+		.filter(|tiers| !matches!(tiers, Availability::Unknown))
+	else {
+		return;
+	};
+	if let Some(chat) = model.capabilities.chat.as_mut() {
+		chat.service_tiers = declared.clone();
+	}
 }
 
 /// Returns the bundled plain counterpart backing a declared routing-variant
@@ -735,8 +759,8 @@ mod tests {
 	use crate::{
 		call::DiscoveryRequest,
 		catalog::{
-			ContextStrategy, DiscoveredModel, DiscoveryDefaults, DiscoveryNormalizer, ModelKey,
-			ModelLimits, ModelSpec, OperationBits, OperationKind, Price, PriceUnit, Pricing,
+			Availability, ContextStrategy, DiscoveredModel, DiscoveryDefaults, DiscoveryNormalizer,
+			ModelKey, ModelLimits, ModelSpec, OperationBits, OperationKind, Price, PriceUnit, Pricing,
 			ProviderId, RouteId, ThinkingPolicyId, WireModelId, WirePolicyId, snapshot::Catalog,
 		},
 		layer::recover::DiscoveryProjector,
@@ -1042,6 +1066,77 @@ mod tests {
 		assert_eq!(plain.key.as_str(), "openai-codex/gpt-5.6-luna");
 		assert_eq!(plain.limits.context_window, Some(1_000_000));
 		assert_eq!(worker.pricing, plain.pricing);
+	}
+
+	#[test]
+	fn codex_bundled_model_adopts_the_tiers_the_account_is_offered() {
+		// The ChatGPT client's "Fast" switch is the `priority` tier the live
+		// listing advertises per model; a bundle cannot know it, so the
+		// listing's word is carried onto the bundled spec.
+		let (provider, route, normalizer, mut bundled) = codex_fixture();
+		// The bundle knows Luna chats but says nothing about its tiers.
+		bundled
+			.get_mut(&WireModelId::from("gpt-5.6-luna"))
+			.expect("bundled luna")
+			.capabilities
+			.chat = Some(crate::catalog::discover::unknown_chat_capabilities());
+		let request = DiscoveryRequest {
+			provider:  Some(provider.clone()),
+			route:     Some(route.clone()),
+			cursor:    None,
+			page_size: 4,
+			operation: None,
+		};
+		let mut advertised = discovered(&provider, &route, "gpt-5.6-luna");
+		let mut capabilities = crate::catalog::discover::unknown_capabilities();
+		let fast = crate::catalog::ServiceTier::for_family(
+			crate::catalog::ProviderFamily::OpenAi,
+			"priority",
+		)
+		.expect("priority is an OpenAI tier");
+		capabilities.chat = Some(crate::catalog::discover::unknown_chat_capabilities());
+		capabilities.chat.as_mut().expect("chat").service_tiers =
+			Availability::Native(vec![fast.clone()].into_boxed_slice());
+		advertised.declared_capabilities = Some(capabilities);
+		let page = project_mixed_page(
+			&BTreeMap::new(),
+			Some(&bundled),
+			None,
+			None,
+			&normalizer,
+			&provider,
+			&route,
+			&request,
+			vec![advertised],
+			None,
+		)
+		.expect("advertised page");
+		let luna = &page.models[0];
+		assert_eq!(luna.key.as_str(), "openai-codex/gpt-5.6-luna");
+		let chat = luna.capabilities.chat.as_ref().expect("chat capabilities");
+		assert_eq!(chat.service_tiers, Availability::Native(vec![fast].into_boxed_slice()));
+		assert_eq!(luna.limits.context_window, Some(1_000_000), "bundled metadata survives");
+
+		// A listing that says nothing about tiers leaves the bundle alone.
+		let page = project_mixed_page(
+			&BTreeMap::new(),
+			Some(&bundled),
+			None,
+			None,
+			&normalizer,
+			&provider,
+			&route,
+			&request,
+			vec![discovered(&provider, &route, "gpt-5.6-luna")],
+			None,
+		)
+		.expect("silent page");
+		let chat = page.models[0]
+			.capabilities
+			.chat
+			.as_ref()
+			.expect("chat capabilities");
+		assert!(matches!(chat.service_tiers, Availability::Unknown));
 	}
 
 	#[test]

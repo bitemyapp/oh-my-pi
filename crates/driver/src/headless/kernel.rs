@@ -300,6 +300,43 @@ impl ProductionInference {
 			Some(model.as_str()),
 			None,
 		);
+		strip_unoffered_service_tier(
+			self
+				.catalog
+				.model(omp_catalog::ModelKey::from_ref(model.as_str())),
+			request,
+		);
+	}
+}
+
+/// Drops a service-tier preference the catalog says `spec` is not offered
+/// (ADR 0017: branch on compiled capabilities, never on model names). The
+/// ChatGPT backend advertises its "Fast" (`priority`) tier per model and per
+/// subscription; a session-wide `ai_tier_openai priority` must not reach a
+/// model such as Daybreak Blue that lists no tiers. A model whose tiers are
+/// unknown keeps the preference and lets the provider decide.
+fn strip_unoffered_service_tier(spec: Option<&omp_catalog::ModelSpec>, request: &mut ChatRequest) {
+	let (omp_ai::Setting::Prefer(tier) | omp_ai::Setting::Require(tier)) = &request.service_tier
+	else {
+		return;
+	};
+	let Some(chat) = spec.and_then(|spec| spec.capabilities.chat.as_ref()) else {
+		return;
+	};
+	let offered = match &chat.service_tiers {
+		omp_catalog::Availability::Unknown | omp_catalog::Availability::Emulated { .. } => return,
+		omp_catalog::Availability::Unsupported => false,
+		omp_catalog::Availability::Native(tiers) => {
+			tiers.iter().any(|offered| offered.name == tier.name)
+		},
+	};
+	if !offered {
+		tracing::debug!(
+			tier = %tier.name,
+			model = spec.map_or("", |spec| spec.key.as_str()),
+			"service tier is not offered on this model; request omits it"
+		);
+		request.service_tier = omp_ai::Setting::Unset;
 	}
 }
 
@@ -2832,7 +2869,7 @@ mod tests {
 		convar_reasoning, install_prompt_facts, install_workpool_yield_contract,
 		install_yield_contract, remember_terminal_session, replicate_outcome_blob,
 		replicate_verdict_parts, route_facts, select_journal_path, session_local_tree,
-		validate_tool_names,
+		strip_unoffered_service_tier, validate_tool_names,
 	};
 
 	const GPT5: &str = "openai/gpt-5";
@@ -3118,6 +3155,60 @@ mod tests {
 			"{}: off falls back to the catalog default level",
 			spec.key
 		);
+	}
+
+	#[test]
+	fn a_service_tier_the_model_is_not_offered_is_left_out_of_the_request() {
+		use omp_catalog::{Availability, ProviderFamily, ServiceTier};
+		let catalog = Catalog::embedded();
+		let mut spec = catalog
+			.model(ModelKey::from_ref(GPT5))
+			.expect("embedded gpt-5")
+			.clone();
+		let fast = ServiceTier::for_family(ProviderFamily::OpenAi, "priority").expect("priority");
+		let prefer_fast = || ChatRequest {
+			messages:          Arc::from([]),
+			tools:             Arc::from([]),
+			hosted_tools:      Arc::from([]),
+			tool_choice:       Setting::Unset,
+			output:            Setting::Unset,
+			reasoning:         Setting::Unset,
+			verbosity:         Setting::Unset,
+			cache_retention:   Setting::Unset,
+			service_tier:      Setting::Prefer(fast.clone()),
+			sampling:          Sampling::default(),
+			max_output_tokens: None,
+			top_logprobs:      None,
+			safety:            Arc::from([]),
+			negotiation:       NegotiationPolicy::default(),
+			forced_call:       None,
+		};
+
+		// Unknown tiers: the provider decides, the preference stands.
+		let mut request = prefer_fast();
+		strip_unoffered_service_tier(Some(&spec), &mut request);
+		assert!(matches!(request.service_tier, Setting::Prefer(_)));
+
+		// The model lists no tiers at all: the preference is dropped.
+		spec.capabilities.chat.as_mut().expect("chat").service_tiers = Availability::Unsupported;
+		let mut request = prefer_fast();
+		strip_unoffered_service_tier(Some(&spec), &mut request);
+		assert!(matches!(request.service_tier, Setting::Unset));
+
+		// The model lists the tier: it goes through.
+		spec.capabilities.chat.as_mut().expect("chat").service_tiers =
+			Availability::Native(vec![fast.clone()].into_boxed_slice());
+		let mut request = prefer_fast();
+		strip_unoffered_service_tier(Some(&spec), &mut request);
+		assert!(matches!(request.service_tier, Setting::Prefer(_)));
+
+		// The model lists other tiers only: dropped.
+		let flex = ServiceTier::for_family(ProviderFamily::OpenAi, "flex").expect("flex");
+		spec.capabilities.chat.as_mut().expect("chat").service_tiers =
+			Availability::Native(vec![flex].into_boxed_slice());
+		let mut request = prefer_fast();
+		strip_unoffered_service_tier(Some(&spec), &mut request);
+		assert!(matches!(request.service_tier, Setting::Unset));
 	}
 
 	#[test]

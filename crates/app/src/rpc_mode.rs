@@ -1010,11 +1010,49 @@ fn rpc_models(runtime: &RpcRuntime) -> Vec<Value> {
 						"contextWindow": model.limits.context_window,
 						"maxTokens": model.limits.maximum_output_tokens,
 						"reasoning": model.thinking.is_some(),
+						"serviceTiers": offered_service_tiers(model),
+						"fast": offers_fast_tier(model),
 					})
 				})
 				.collect()
 		})
 		.unwrap_or_default()
+}
+
+/// The processing tiers the catalog says `model` is offered, or `None` when
+/// it does not know. The ChatGPT client's "Fast" switch is the `priority`
+/// tier, which the Codex backend advertises per model and per subscription.
+fn offered_service_tiers(model: &omp_catalog::ModelSpec) -> Option<Vec<Str>> {
+	let chat = model.capabilities.chat.as_ref()?;
+	match &chat.service_tiers {
+		omp_catalog::Availability::Native(tiers) => {
+			Some(tiers.iter().map(|tier| tier.name.clone()).collect())
+		},
+		omp_catalog::Availability::Unsupported => Some(Vec::new()),
+		omp_catalog::Availability::Unknown | omp_catalog::Availability::Emulated { .. } => None,
+	}
+}
+
+/// Whether the catalog says `model` is offered the `priority` tier, which a
+/// host may present as "Fast". Unknown counts as no: a switch is only shown
+/// where the backend has said it works.
+fn offers_fast_tier(model: &omp_catalog::ModelSpec) -> bool {
+	offered_service_tiers(model).is_some_and(|tiers| tiers.iter().any(|tier| tier == "priority"))
+}
+
+/// Whether the session asks for the OpenAI `priority` tier (`ai_tier_openai`).
+fn fast_mode_enabled(runtime: &RpcRuntime) -> bool {
+	con_text(runtime, "ai_tier_openai").as_deref() == Some("priority")
+}
+
+/// Whether the model at `key` is offered the `priority` tier.
+fn fast_mode_available(runtime: &RpcRuntime, key: &str) -> bool {
+	runtime.catalog.as_ref().is_some_and(|catalog| {
+		catalog
+			.models()
+			.iter()
+			.any(|model| model.key.as_str() == key && offers_fast_tier(model))
+	})
 }
 
 fn available_commands(runtime: &RpcRuntime) -> Vec<Value> {
@@ -1074,7 +1112,10 @@ fn rpc_state(
 		.split_once('/')
 		.unwrap_or(("", model_key.as_str()));
 	let thinking = con_text(runtime, "ai_thinking");
-	let fast = con_bool(runtime, "ai_fastmode", false);
+	// "Fast" is the OpenAI `priority` tier: enabled when the session asks
+	// for it, active when the model in view is actually offered it.
+	let fast = fast_mode_enabled(runtime);
+	let fast_available = fast_mode_available(runtime, model_key.as_str());
 	let session_id = session_file
 		.file_stem()
 		.and_then(|stem| stem.to_str())
@@ -1098,7 +1139,8 @@ fn rpc_state(
 		"autoCompactionEnabled": runtime.automatic_compaction,
 		"autoRetryEnabled": runtime.auto_retry,
 		"fastModeEnabled": fast,
-		"fastModeActive": fast,
+		"fastModeActive": fast && fast_available,
+		"fastModeAvailable": fast_available,
 		"accountPins": runtime.accounts.as_ref().map(|accounts| accounts.pinned_accounts()).unwrap_or_else(|| json!({})),
 		"tokensPerSecond": Value::Null,
 		"messageCount": messages.len(),
@@ -1258,6 +1300,8 @@ fn model_value(runtime: &RpcRuntime, key: &str) -> Value {
 			"contextWindow": model.limits.context_window,
 			"maxTokens": model.limits.maximum_output_tokens,
 			"reasoning": model.thinking.is_some(),
+			"serviceTiers": offered_service_tiers(model),
+			"fast": offers_fast_tier(model),
 		});
 	}
 	let (provider, id) = key.split_once('/').unwrap_or(("", key));
@@ -1749,14 +1793,20 @@ where
 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
 							},
 							"set_fast_mode" => {
+								// The OpenAI `priority` tier for this session, journaled like
+								// the model and thinking level so a resume keeps it.
 								let enabled = request.params.get("enabled").and_then(Value::as_bool);
 								let response = match enabled {
-									Some(enabled) => match set_con(&runtime, "ai_fastmode", if enabled { "true" } else { "false" }) {
-										Ok(()) => RpcResponse::success(
-											id,
-											command.as_str(),
-											json!({ "enabled": enabled, "active": enabled }),
-										).into_diagnostic()?,
+									Some(enabled) => match set_con(&runtime, "ai_tier_openai", if enabled { "priority" } else { "none" }) {
+										Ok(()) => {
+											let key = con_text(&runtime, "ai_model").unwrap_or_else(|| runtime.model.clone());
+											let available = fast_mode_available(&runtime, key.as_str());
+											RpcResponse::success(
+												id,
+												command.as_str(),
+												json!({ "enabled": enabled, "active": enabled && available, "available": available }),
+											).into_diagnostic()?
+										},
 										Err(source) => RpcResponse::error(id, command.as_str(), source, Some(RpcErrorCode::new("config_error"))),
 									},
 									None => RpcResponse::error(id, command.as_str(), "set_fast_mode requires `enabled`", Some(RpcErrorCode::new("invalid_params"))),
@@ -3018,7 +3068,32 @@ mod tests {
 	use omp_core::Str;
 	use serde_json::json;
 
-	use super::inference_error_fields;
+	use super::{inference_error_fields, offered_service_tiers, offers_fast_tier};
+
+	#[test]
+	fn a_model_offers_fast_only_when_its_listing_advertises_the_priority_tier() {
+		use omp_catalog::{Availability, ModelKey, ProviderFamily, ServiceTier, snapshot::Catalog};
+		let catalog = Catalog::embedded();
+		let mut spec = catalog
+			.model(ModelKey::from_ref("openai/gpt-5"))
+			.expect("embedded gpt-5")
+			.clone();
+		let chat = spec.capabilities.chat.as_mut().expect("chat capabilities");
+		// Unknown: the host is told nothing and shows no switch.
+		chat.service_tiers = Availability::Unknown;
+		assert_eq!(offered_service_tiers(&spec), None);
+		assert!(!offers_fast_tier(&spec));
+		// Advertised: the host may show the switch.
+		let fast = ServiceTier::for_family(ProviderFamily::OpenAi, "priority").expect("priority");
+		spec.capabilities.chat.as_mut().expect("chat").service_tiers =
+			Availability::Native(vec![fast].into_boxed_slice());
+		assert_eq!(offered_service_tiers(&spec), Some(vec![Str::new_static("priority")]));
+		assert!(offers_fast_tier(&spec));
+		// Listed as having none (Daybreak Blue): the host is told so.
+		spec.capabilities.chat.as_mut().expect("chat").service_tiers = Availability::Unsupported;
+		assert_eq!(offered_service_tiers(&spec), Some(Vec::new()));
+		assert!(!offers_fast_tier(&spec));
+	}
 
 	#[test]
 	fn agent_end_error_fields_carry_kind_phase_provider_status_code_and_detail() {

@@ -1293,10 +1293,10 @@ omp_con::var! {
 			"legacy.path": "model.provider_order",
 		},
 	};
-	/// Processing tier for OpenAI / OpenAI-Codex requests, and OpenAI-family models routed via OpenRouter (none = omit). Sent as `service_tier`.
+	/// Processing tier for OpenAI / OpenAI-Codex requests, and OpenAI-family models routed via OpenRouter (none = omit). Sent as `service_tier`. Session-scoped as well as archived: `priority` is the ChatGPT client's "Fast" switch, chosen per conversation and kept across a resume like the model and thinking level.
 	pub static AI_TIER_OPENAI = ai_tier_openai: TierSetting {
 		default: TierSetting::None,
-		flags: archive,
+		flags: archive | session,
 		meta: {
 			"ui.tab": "model",
 			"ui.group": "Sampling",

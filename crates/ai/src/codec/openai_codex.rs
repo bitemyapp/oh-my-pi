@@ -697,6 +697,17 @@ struct CodexModelRow {
 	supported_reasoning_levels: Vec<CodexReasoningLevel>,
 	#[serde(default)]
 	input_modalities: Vec<Str>,
+	/// Processing tiers the backend offers for this model on this account.
+	/// The ChatGPT client's "Fast" switch is the `priority` tier. An
+	/// absent field says nothing; an empty list says the model has none.
+	#[serde(default)]
+	service_tiers: Option<Vec<CodexServiceTier>>,
+}
+
+/// One advertised processing tier: `{"id":"priority","name":"Fast",…}`.
+#[derive(Deserialize)]
+struct CodexServiceTier {
+	id: Str,
 }
 
 /// One supported reasoning level. The live endpoint sends presets shaped
@@ -743,7 +754,22 @@ impl CodexModelsDecoder {
 	fn capabilities(row: &CodexModelRow) -> CatalogModelCapabilities {
 		use crate::catalog::{
 			Availability, ChatCapabilities, ModalityBits, ModelCapabilities, OperationBits,
-			OperationKind, ReasoningCapabilities, ReasoningEffort, ReasoningFeatureBits,
+			OperationKind, ProviderFamily, ReasoningCapabilities, ReasoningEffort,
+			ReasoningFeatureBits, ServiceTier,
+		};
+		let service_tiers = match &row.service_tiers {
+			None => Availability::Unknown,
+			Some(tiers) => {
+				let tiers: Vec<ServiceTier> = tiers
+					.iter()
+					.filter_map(|tier| ServiceTier::for_family(ProviderFamily::OpenAi, &tier.id))
+					.collect();
+				if tiers.is_empty() {
+					Availability::Unsupported
+				} else {
+					Availability::Native(tiers.into_boxed_slice())
+				}
+			},
 		};
 		let mut efforts = Vec::new();
 		for level in row.default_reasoning_level.as_deref().into_iter().chain(
@@ -789,13 +815,13 @@ impl CodexModelsDecoder {
 		ModelCapabilities {
 			operations:    OperationBits::for_kind(OperationKind::Chat),
 			chat:          Some(ChatCapabilities {
-				roles:             Availability::Unknown,
+				roles: Availability::Unknown,
 				mid_session_roles: Availability::Unknown,
-				tools:             Availability::Unknown,
+				tools: Availability::Unknown,
 				structured_output: Availability::Unknown,
-				grammar:           Availability::Unknown,
-				text_verbosity:    Availability::Unknown,
-				reasoning:         if reasoning_observed {
+				grammar: Availability::Unknown,
+				text_verbosity: Availability::Unknown,
+				reasoning: if reasoning_observed {
 					Availability::Native(ReasoningCapabilities {
 						features:              ReasoningFeatureBits::EFFORT,
 						efforts:               efforts.into_boxed_slice(),
@@ -805,20 +831,20 @@ impl CodexModelsDecoder {
 				} else {
 					Availability::Unknown
 				},
-				input_modalities:  if modalities.bits() == 0 {
+				input_modalities: if modalities.bits() == 0 {
 					Availability::Unknown
 				} else {
 					Availability::Native(modalities)
 				},
-				hosted_tools:      Availability::Unknown,
-				image_input:       Availability::Unknown,
-				prompt_caching:    Availability::Unknown,
-				service_tiers:     Availability::Unknown,
-				sampling:          Availability::Unknown,
-				safety:            Availability::Unknown,
-				determinism:       Availability::Unknown,
-				server_state:      Availability::Unknown,
-				logprobs:          Availability::Unknown,
+				hosted_tools: Availability::Unknown,
+				image_input: Availability::Unknown,
+				prompt_caching: Availability::Unknown,
+				service_tiers,
+				sampling: Availability::Unknown,
+				safety: Availability::Unknown,
+				determinism: Availability::Unknown,
+				server_state: Availability::Unknown,
+				logprobs: Availability::Unknown,
 			}),
 			embeddings:    None,
 			image:         None,
@@ -1449,6 +1475,9 @@ mod tests {
 				 "service_tiers":[{"id":"priority","name":"Fast","description":"2x speed"}],
 				 "context_window":272000,"max_context_window":872000,
 				 "input_modalities":["text","image"]},
+				{"slug":"gpt-daybreak-blue-latest","display_name":"Daybreak Blue","visibility":"list","priority":2,
+				 "service_tiers":[]},
+				{"slug":"gpt-old","display_name":"GPT-Old","visibility":"list","priority":4},
 				{"slug":"gpt-reserve","display_name":"GPT-Reserve","visibility":"hide","priority":3}
 			]}"#,
 				)),
@@ -1458,8 +1487,31 @@ mod tests {
 		let Some(RawEvent::DiscoveredModels { rows, next_cursor: None }) = output else {
 			panic!("expected discovered rows");
 		};
-		assert_eq!(rows.len(), 1, "hidden models are skipped");
+		assert_eq!(rows.len(), 3, "hidden models are skipped");
 		assert_eq!(rows[0].wire_model.as_str(), "gpt-6-astra");
+		// The tiers a model advertises are what the ChatGPT client's "Fast"
+		// switch stands on: Astra offers `priority`, Daybreak Blue says it
+		// has none, and a payload without the field says nothing.
+		let tiers = |row: usize| {
+			rows[row]
+				.declared_capabilities
+				.as_ref()
+				.and_then(|capabilities| capabilities.chat.as_ref())
+				.map(|chat| chat.service_tiers.clone())
+				.expect("chat capabilities")
+		};
+		let Availability::Native(astra_tiers) = tiers(0) else {
+			panic!("advertised tiers should be native");
+		};
+		assert_eq!(
+			astra_tiers
+				.iter()
+				.map(|tier| tier.name.as_str())
+				.collect::<Vec<_>>(),
+			["priority"]
+		);
+		assert!(matches!(tiers(1), Availability::Unsupported));
+		assert!(matches!(tiers(2), Availability::Unknown));
 		let chat = rows[0]
 			.declared_capabilities
 			.as_ref()
