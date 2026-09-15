@@ -1148,6 +1148,14 @@ pub struct ResponsesStreamEvent {
 	/// Output index.
 	#[serde(default)]
 	pub output_index:      Option<u32>,
+	/// Which summary part of a reasoning item a summary delta or done
+	/// belongs to; an item may carry several.
+	#[serde(default)]
+	pub summary_index:     Option<u32>,
+	/// Which content part of a reasoning item a raw reasoning delta or done
+	/// belongs to.
+	#[serde(default)]
+	pub content_index:     Option<u32>,
 	/// Item identity for item-correlated deltas.
 	#[serde(default)]
 	pub item_id:           Option<Str>,
@@ -1276,10 +1284,16 @@ enum OutputSlot {
 		emitted: bool,
 	},
 	Thinking {
-		item_id:   Option<Str>,
-		text:      BytesMut,
-		encrypted: Bytes,
-		emitted:   bool,
+		item_id:    Option<Str>,
+		text:       BytesMut,
+		encrypted:  Bytes,
+		emitted:    bool,
+		/// The summary or content part now streaming, and where in `text`
+		/// it began: a part's authoritative `done` text covers that part
+		/// alone, while the item's `done` joins every part with a blank
+		/// line, so `text` keeps the parts joined the same way.
+		part:       Option<u32>,
+		part_start: usize,
 	},
 	Tool {
 		item_id:   Option<Str>,
@@ -1592,9 +1606,11 @@ impl OpenAiResponsesDecoder {
 				OutputSlot::Text { item_id: item.id.clone(), text: BytesMut::new(), emitted: false }
 			},
 			ResponsesOutputItemKind::Reasoning => OutputSlot::Thinking {
-				item_id:   item.id.clone(),
-				text:      BytesMut::new(),
-				encrypted: item
+				item_id:    item.id.clone(),
+				text:       BytesMut::new(),
+				part:       None,
+				part_start: 0,
+				encrypted:  item
 					.encrypted_content
 					.as_ref()
 					.map_or_else(Bytes::new, |value| Bytes::copy_from_slice(value.as_bytes())),
@@ -1703,7 +1719,15 @@ impl OpenAiResponsesDecoder {
 					text: delta.clone(),
 				}));
 			},
-			(Some(OutputSlot::Thinking { text, emitted, .. }), SlotClass::Thinking) => {
+			(Some(OutputSlot::Thinking { text, emitted, part, part_start, .. }), SlotClass::Thinking) => {
+				begin_thinking_part(
+					index,
+					event.summary_index.or(event.content_index),
+					text,
+					part,
+					part_start,
+					out,
+				);
 				text.extend_from_slice(delta.as_bytes());
 				*emitted = true;
 				out.push(ResponsesProjection::Canonical(ChatEvent::ThinkingDelta {
@@ -1739,6 +1763,21 @@ impl OpenAiResponsesDecoder {
 		let Some(complete) = complete else {
 			return;
 		};
+		// A summary or content part's done covers that part alone; a part
+		// that streamed no delta begins here.
+		if matches!(class, SlotClass::Thinking)
+			&& let Some(OutputSlot::Thinking { text, part, part_start, .. }) =
+				self.outputs.get_mut(&index)
+		{
+			begin_thinking_part(
+				index,
+				event.summary_index.or(event.content_index),
+				text,
+				part,
+				part_start,
+				out,
+			);
+		}
 		self.reconcile_authoritative(index, class, complete, out);
 	}
 
@@ -1751,8 +1790,10 @@ impl OpenAiResponsesDecoder {
 	) {
 		let prefix = match (self.outputs.get(&index), class) {
 			(Some(OutputSlot::Text { text, .. }), SlotClass::Text)
-			| (Some(OutputSlot::Thinking { text, .. }), SlotClass::Thinking)
 			| (Some(OutputSlot::Tool { arguments: text, .. }), SlotClass::Tool) => text.as_ref(),
+			(Some(OutputSlot::Thinking { text, part_start, .. }), SlotClass::Thinking) => {
+				&text[(*part_start).min(text.len())..]
+			},
 			_ => return,
 		};
 		if !complete.as_bytes().starts_with(prefix) {
@@ -1821,6 +1862,14 @@ impl OpenAiResponsesDecoder {
 						text.push_str("\n\n");
 					}
 					text.push_str(summary.text.as_str());
+				}
+				// The item's summary is every part joined, so it is measured
+				// against the whole buffer, not the last part.
+				if let Some(OutputSlot::Thinking { part, part_start, .. }) =
+					self.outputs.get_mut(&index)
+				{
+					*part = None;
+					*part_start = 0;
 				}
 				Some((SlotClass::Thinking, Str::new(text)))
 			},
@@ -1905,7 +1954,7 @@ impl OpenAiResponsesDecoder {
 					text: Str::from_utf8_lossy(text),
 				}));
 			},
-			Some(OutputSlot::Thinking { item_id, text, encrypted, emitted }) => {
+			Some(OutputSlot::Thinking { item_id, text, encrypted, emitted, .. }) => {
 				if !*emitted && !text.is_empty() {
 					out.push(ResponsesProjection::Canonical(ChatEvent::ThinkingDelta {
 						index,
@@ -2070,6 +2119,37 @@ fn slot_item_id(slot: &OutputSlot) -> Option<&str> {
 		OutputSlot::Hosted { .. } | OutputSlot::Image { .. } => None,
 	}
 }
+/// Moves a Thinking slot on to summary or content part `incoming` when it
+/// differs from the part in progress: the parts are kept apart by a blank
+/// line, the way the item's own summary joins them, and the new part's
+/// start is remembered so its authoritative text is checked against it
+/// alone. The blank line is emitted too, so what the host shows is what
+/// the buffer holds.
+fn begin_thinking_part(
+	index: u32,
+	incoming: Option<u32>,
+	text: &mut BytesMut,
+	part: &mut Option<u32>,
+	part_start: &mut usize,
+	out: &mut Vec<ResponsesProjection>,
+) {
+	let Some(incoming) = incoming else {
+		return;
+	};
+	if *part == Some(incoming) {
+		return;
+	}
+	if part.is_some() && !text.is_empty() {
+		text.extend_from_slice(b"\n\n");
+		out.push(ResponsesProjection::Canonical(ChatEvent::ThinkingDelta {
+			index,
+			text: Str::new_static("\n\n"),
+		}));
+	}
+	*part = Some(incoming);
+	*part_start = text.len();
+}
+
 const fn slot_matches_class(slot: &OutputSlot, class: SlotClass) -> bool {
 	matches!(
 		(slot, class),
@@ -5962,6 +6042,77 @@ mod tests {
 			true,
 		);
 		assert_eq!(action, RetryAction::Never);
+	}
+
+	#[test]
+	fn a_reasoning_item_with_two_summary_parts_settles_part_by_part() {
+		// What the owner hit: OpenAI streams several summary parts for one
+		// reasoning item, each with its own done; measuring the second
+		// part's done against the whole buffer read as corruption.
+		let mut decoder = OpenAiResponsesDecoder::default();
+		decoder.push_json(
+			br#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}"#,
+		);
+		decoder.push_json(
+			br#"{"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"rs_1","summary_index":0,"delta":"**Looking**"}"#,
+		);
+		let first_done = decoder.push_json(
+			br#"{"type":"response.reasoning_summary_text.done","output_index":0,"item_id":"rs_1","summary_index":0,"text":"**Looking**"}"#,
+		);
+		assert!(!first_done.iter().any(|event| matches!(event, ResponsesProjection::Error(_))));
+		let second = decoder.push_json(
+			br#"{"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"rs_1","summary_index":1,"delta":"**Checking**"}"#,
+		);
+		let thinking = second
+			.iter()
+			.filter_map(|event| match event {
+				ResponsesProjection::Canonical(ChatEvent::ThinkingDelta { text, .. }) => {
+					Some(text.as_str())
+				},
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(thinking, ["\n\n", "**Checking**"], "parts are kept apart by a blank line");
+		let second_done = decoder.push_json(
+			br#"{"type":"response.reasoning_summary_text.done","output_index":0,"item_id":"rs_1","summary_index":1,"text":"**Checking** more"}"#,
+		);
+		assert!(
+			!second_done.iter().any(|event| matches!(event, ResponsesProjection::Error(_))),
+			"the second part is measured against itself: {second_done:?}"
+		);
+		assert!(second_done.iter().any(|event| matches!(
+			event,
+			ResponsesProjection::Canonical(ChatEvent::ThinkingDelta { text, .. }) if text == " more"
+		)));
+		// The item's done joins the parts the same way and still agrees.
+		let item_done = decoder.push_json(
+			br#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"**Looking**"},{"type":"summary_text","text":"**Checking** more"}]}}"#,
+		);
+		assert!(
+			!item_done.iter().any(|event| matches!(event, ResponsesProjection::Error(_))),
+			"{item_done:?}"
+		);
+		// A part whose text never streamed still lands whole.
+		let mut quiet = OpenAiResponsesDecoder::default();
+		quiet.push_json(
+			br#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_2","summary":[]}}"#,
+		);
+		quiet.push_json(
+			br#"{"type":"response.reasoning_summary_text.done","output_index":0,"item_id":"rs_2","summary_index":0,"text":"one"}"#,
+		);
+		let two = quiet.push_json(
+			br#"{"type":"response.reasoning_summary_text.done","output_index":0,"item_id":"rs_2","summary_index":1,"text":"two"}"#,
+		);
+		let text = two
+			.iter()
+			.filter_map(|event| match event {
+				ResponsesProjection::Canonical(ChatEvent::ThinkingDelta { text, .. }) => {
+					Some(text.as_str())
+				},
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(text, ["\n\n", "two"]);
 	}
 
 	#[test]
