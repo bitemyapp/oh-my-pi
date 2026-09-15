@@ -445,6 +445,14 @@ impl Router {
 			));
 		}
 		let (route, runtime, decisions) = eligible.remove(0);
+		tracing::debug!(
+			operation = %operation,
+			provider = %provider,
+			pinned = pinned_route.map_or("-", |route| route.as_str()),
+			chosen = %route.id,
+			others = ?eligible.iter().map(|(route, ..)| route.id.as_str()).collect::<Vec<_>>(),
+			"planned a model-less operation"
+		);
 		let fallbacks = eligible
 			.into_iter()
 			.map(|(candidate, runtime, decisions)| PlannedFallback {
