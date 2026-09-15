@@ -18,10 +18,14 @@ use std::{
 use miette::miette;
 use omp_ai::{
 	AccountPins, Registry,
-	answer::{AccountState, AccountSummary, AuthAnswer, AuthEvent, AuthPromptKind, AuthSession},
+	account::AccountStateStore,
+	answer::{
+		AccountState, AccountSummary, AuthAnswer, AuthEvent, AuthPromptKind, AuthSession, UsageReport,
+	},
 	auth::manager::AuthManager,
-	call::{AuthInput, AuthMethod, AuthRequest, LoginRequest},
+	call::{AuthInput, AuthMethod, AuthRequest, LoginRequest, UsageRequest, UsageScope},
 	id::LoginSessionId,
+	operation::usage::ConsoleUsageManager,
 };
 use omp_catalog::{ProviderId, settings::ModelSettings};
 use omp_core::{ExposeSecret as _, SecretString, Str};
@@ -103,8 +107,12 @@ pub(crate) struct AccountAuthority {
 	settings: ModelSettings,
 	/// Host-owned per-provider pins attached to every inference call.
 	pub pins: AccountPins,
+	usage:    ConsoleUsageManager,
 	inner:    Mutex<Inner>,
 }
+
+/// Bound on one account's live usage fetch for `get_account_usage`.
+const ACCOUNT_USAGE_TIMEOUT: Duration = Duration::from_secs(20);
 
 impl AccountAuthority {
 	/// Composes the credential authority, runs account-model discovery for
@@ -123,14 +131,15 @@ impl AccountAuthority {
 	) -> miette::Result<Arc<Self>> {
 		let store = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
 			.map_err(|error| miette!(error))?;
-		let (registry, auth) = omp_driver::registry::production_rpc_registry_from_con(
-			data_dir,
-			store,
-			ctx,
-			Some(project),
-		)
-		.await
-		.map_err(|error| miette!(error))?;
+		let (registry, auth, usage) =
+			omp_driver::registry::production_rpc_registry_with_usage_from_con(
+				data_dir,
+				store,
+				ctx,
+				Some(project),
+			)
+			.await
+			.map_err(|error| miette!(error))?;
 		let settings = ModelSettings::from_con(ctx).resolve_path_scopes(project, home);
 		let accounts = stored_accounts(&auth).await.unwrap_or_default();
 		let authenticated = active_providers(&accounts);
@@ -180,6 +189,7 @@ impl AccountAuthority {
 			data_dir: data_dir.to_path_buf(),
 			settings,
 			pins,
+			usage,
 			inner: Mutex::new(Inner {
 				providers,
 				pinned: BTreeMap::new(),
@@ -315,6 +325,63 @@ impl AccountAuthority {
 			"principal": principal.as_str(),
 			"restartRequired": restart_required,
 		}))
+	}
+
+	/// `get_account_usage`: each stored account's plan and quota windows,
+	/// fetched live from its provider (optionally one account by `accountId`).
+	/// A provider that cannot answer leaves the account with an `error`
+	/// rather than failing the whole listing.
+	pub(crate) async fn get_account_usage(
+		&self,
+		params: &Map<String, Value>,
+	) -> Result<Value, CommandError> {
+		let wanted = params
+			.get("accountId")
+			.and_then(Value::as_str)
+			.filter(|id| !id.is_empty())
+			.map(str::to_owned);
+		let records = AccountStateStore::open(self.data_dir.join("credentials.db"))
+			.and_then(|store| store.load_accounts())
+			.map_err(|error| CommandError::new("account_store", error.to_string()))?;
+		let probes = records
+			.iter()
+			.filter(|record| {
+				wanted
+					.as_deref()
+					.is_none_or(|wanted| record.account.as_str() == wanted)
+			})
+			.map(|record| async move {
+				let Some(route) = record.routes.iter().next() else {
+					return account_usage_value(record, Err("account has no route".to_owned()));
+				};
+				let request = UsageRequest {
+					provider:    Some(record.provider.clone()),
+					account:     Some(record.account.clone()),
+					scope:       UsageScope::All,
+					allow_stale: false,
+				};
+				let fetched = time::timeout(
+					ACCOUNT_USAGE_TIMEOUT,
+					self.usage.execute(
+						&record.provider,
+						route,
+						&request,
+						std::time::Instant::now().checked_add(ACCOUNT_USAGE_TIMEOUT),
+					),
+				)
+				.await;
+				let result = match fetched {
+					Ok(Ok(report)) => Ok(report),
+					Ok(Err(error)) => Err(error.to_string()),
+					Err(_) => Err(format!(
+						"usage did not answer within {} seconds",
+						ACCOUNT_USAGE_TIMEOUT.as_secs()
+					)),
+				};
+				account_usage_value(record, result)
+			});
+		let accounts = futures::future::join_all(probes).await;
+		Ok(json!({ "accounts": accounts }))
 	}
 
 	/// `logout_account`: forgets one stored account and clears its pin.
@@ -675,6 +742,70 @@ async fn discover_provider_models(
 			Vec::new()
 		},
 	}
+}
+
+/// One account's usage as the host sees it: the plan the provider reports
+/// and each quota window as a used percentage with its reset time.
+fn account_usage_value(
+	record: &omp_ai::account::AccountRecord,
+	result: Result<UsageReport, String>,
+) -> Value {
+	let mut value = json!({
+		"accountId": record.account.as_str(),
+		"providerId": record.provider.as_str(),
+		"principal": record.principal.as_str(),
+	});
+	match result {
+		Ok(report) => {
+			let windows = report
+				.windows
+				.iter()
+				.map(|window| {
+					let percent = |quantity: &Option<omp_ai::answer::UsageQuantity>| {
+						quantity.as_ref().map(|quantity| {
+							quantity.units as f64 / 10f64.powi(i32::from(quantity.decimal_exponent))
+						})
+					};
+					let used_percent = match window.amount.unit {
+						omp_ai::answer::UsageUnit::Percent => percent(&window.amount.consumed),
+						_ => match (&window.amount.consumed, &window.amount.limit) {
+							(Some(consumed), Some(limit)) if limit.units > 0 => {
+								let consumed =
+									consumed.units as f64 / 10f64.powi(i32::from(consumed.decimal_exponent));
+								let limit =
+									limit.units as f64 / 10f64.powi(i32::from(limit.decimal_exponent));
+								Some((consumed / limit * 100.0).clamp(0.0, 100.0))
+							},
+							_ => None,
+						},
+					};
+					json!({
+						"id": window.id.as_str(),
+						"label": window.label.as_deref(),
+						"scope": window.scope.as_deref(),
+						"usedPercent": used_percent,
+						"resetsAtMs": window.resets_at.and_then(|at| {
+							at.duration_since(std::time::UNIX_EPOCH)
+								.ok()
+								.map(|since| since.as_millis() as u64)
+						}),
+						"durationSecs": window.duration.map(|duration| duration.as_secs()),
+						"status": window.status.map(|status| format!("{status:?}").to_lowercase()),
+					})
+				})
+				.collect::<Vec<_>>();
+			value["plan"] = json!(report.plan.as_deref());
+			value["email"] = json!(report.account_meta.email.as_deref());
+			value["windows"] = json!(windows);
+			value["error"] = Value::Null;
+		},
+		Err(error) => {
+			value["plan"] = Value::Null;
+			value["windows"] = json!([]);
+			value["error"] = json!(error);
+		},
+	}
+	value
 }
 
 fn anthropic_subscription_models(discovered: Vec<String>) -> HashSet<String> {

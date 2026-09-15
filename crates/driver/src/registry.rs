@@ -740,6 +740,20 @@ pub async fn production_rpc_registry_from_con(
 	ctx: &omp_con::Ctx,
 	project_root: Option<&Path>,
 ) -> Result<(Registry, AuthManager), RegistryError> {
+	production_rpc_registry_with_usage_from_con(data_dir, credential_store, ctx, project_root)
+		.await
+		.map(|(registry, auth, _)| (registry, auth))
+}
+
+/// As [`production_rpc_registry_from_con`], also exposing the console usage
+/// manager so the RPC host can report each stored account's plan and quota
+/// windows.
+pub async fn production_rpc_registry_with_usage_from_con(
+	data_dir: &Path,
+	credential_store: Arc<CredentialStore>,
+	ctx: &omp_con::Ctx,
+	project_root: Option<&Path>,
+) -> Result<(Registry, AuthManager, ConsoleUsageManager), RegistryError> {
 	production_assembly_for_session(
 		data_dir,
 		credential_store,
@@ -748,7 +762,7 @@ pub async fn production_rpc_registry_from_con(
 		inference_settings(ctx, project_root),
 	)
 	.await
-	.map(|(registry, _, _, _, auth, ..)| (registry, auth))
+	.map(|(registry, _, _, _, auth, usage, ..)| (registry, auth, usage))
 }
 
 /// Invocation-owned inference values that must not enter agent or durable

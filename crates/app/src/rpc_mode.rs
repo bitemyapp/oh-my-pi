@@ -2085,7 +2085,7 @@ where
 								let response = RpcResponse::success(id, command.as_str(), providers).into_diagnostic()?;
 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
 							},
-							"login" | "list_accounts" | "set_account" | "logout_account" | "refresh_models" | "auth_answer" => {
+							"login" | "list_accounts" | "set_account" | "logout_account" | "refresh_models" | "get_account_usage" | "auth_answer" => {
 								let response = match runtime.accounts.as_ref() {
 									None => Err(crate::rpc_accounts::CommandError {
 										code:    RpcErrorCode::new("unsupported"),
@@ -2102,6 +2102,7 @@ where
 											"set_account" => accounts.set_account(&request.params).await,
 											"logout_account" => accounts.logout_account(&request.params).await,
 											"refresh_models" => accounts.refresh_models().await,
+											"get_account_usage" => accounts.get_account_usage(&request.params).await,
 											_ => {
 												let mut frame = request.params.clone();
 												frame.insert("type".into(), Value::String("auth_answer".into()));
