@@ -140,12 +140,18 @@ async fn fetch_claude_usage_until(
 		deadline,
 	)
 	.await?;
+	tracing::debug!(status = response.status, "claude usage responded");
 	classify_status(response.status)?;
 	let payload: Value = serde_json::from_str(response.body.expose_secret())
 		.map_err(|_| UsageFetchError::Unavailable)?;
 	let root = payload.as_object().ok_or(UsageFetchError::Unavailable)?;
 	let windows = parse_windows(root, now);
 	if windows.is_empty() {
+		// Key names only: enough to see a changed payload shape, never a value.
+		tracing::debug!(
+			keys = ?root.keys().collect::<Vec<_>>(),
+			"claude usage payload carried no windows"
+		);
 		return Err(UsageFetchError::Unavailable);
 	}
 
