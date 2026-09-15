@@ -204,15 +204,16 @@ async fn execute(
 	request: OAuthHttpRequest,
 	deadline: Option<Instant>,
 ) -> Result<OAuthHttpResponse, UsageFetchError> {
+	let failed = |error: &dyn std::fmt::Display| {
+		tracing::debug!(%error, "claude usage request failed");
+		UsageFetchError::Unavailable
+	};
 	match deadline {
 		Some(deadline) => time::timeout_at(deadline.into(), http.execute(request))
 			.await
-			.map_err(|_| UsageFetchError::Unavailable)?
-			.map_err(|_| UsageFetchError::Unavailable),
-		None => http
-			.execute(request)
-			.await
-			.map_err(|_| UsageFetchError::Unavailable),
+			.map_err(|error| failed(&error))?
+			.map_err(|error| failed(&error)),
+		None => http.execute(request).await.map_err(|error| failed(&error)),
 	}
 }
 
