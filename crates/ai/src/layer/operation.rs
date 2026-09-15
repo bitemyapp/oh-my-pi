@@ -438,6 +438,16 @@ fn validate_discovery_page(
 			.as_ref()
 			.is_some_and(|cursor| cursor.is_empty())
 	{
+		tracing::warn!(
+			requested_provider = request.provider.as_deref().map_or("-", |provider| provider.as_str()),
+			requested_route = request.route.as_deref().map_or("-", |route| route.as_str()),
+			answered_provider = %meta.provider,
+			answered_route = %meta.route,
+			answered_model = meta.model.as_deref().map_or("-", |model| model.as_str()),
+			rows = page.models.len(),
+			page_size = request.page_size,
+			"discovery page does not match its request"
+		);
 		return Err(operation_media_protocol_error(
 			OperationKind::DiscoverModels,
 			MediaOperationError::InvalidNormalizedDiscoveryPage,
