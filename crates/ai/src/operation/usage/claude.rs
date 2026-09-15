@@ -64,6 +64,12 @@ impl ConsoleUsageFetcher for ClaudeUsageFetcher {
 		UsageCredentialRequirement::Required
 	}
 
+	/// The subscription usage endpoint takes the sign-in's OAuth token only;
+	/// an API key stored for Anthropic is for the API, not for this.
+	fn accepted_auth_kinds(&self) -> Option<&'static [crate::catalog::AuthSpecKind]> {
+		Some(&[crate::catalog::AuthSpecKind::Oauth])
+	}
+
 	fn fetch<'a>(
 		&'a self,
 		credential: Option<&'a SecretString>,

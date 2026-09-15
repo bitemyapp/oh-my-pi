@@ -74,6 +74,14 @@ pub trait ConsoleUsageFetcher: Send + Sync {
 	fn provider(&self) -> &ProviderId<str>;
 	/// Declares whether the manager must acquire a credential lease.
 	fn credential_requirement(&self) -> UsageCredentialRequirement;
+	/// The credential kinds the usage endpoint accepts, or `None` for any
+	/// the route or its provider can lease. A subscription usage service
+	/// that only takes its own OAuth token says so here, so an API key that
+	/// happens to be stored for the same provider is neither sent to it nor
+	/// blamed when it is refused.
+	fn accepted_auth_kinds(&self) -> Option<&'static [crate::catalog::AuthSpecKind]> {
+		None
+	}
 	/// Fetches usage under the supplied deadline.
 	fn fetch<'a>(
 		&'a self,
@@ -280,23 +288,51 @@ impl ConsoleUsageManager {
 		let credential_requirement = fetcher.credential_requirement();
 		let lease = match credential_requirement {
 			UsageCredentialRequirement::Required | UsageCredentialRequirement::Optional => {
-				let acquired = match self
+				// The route names one auth spec, but a provider may accept
+				// several (Anthropic: an API key, or the subscription's OAuth
+				// token), and an account holds whichever it signed in with.
+				// Every spec the fetcher can use is tried in the provider's
+				// preference order, the route's own first.
+				let mut specs = Vec::new();
+				if let Some(route_def) = self
 					.catalog
 					.route(route)
 					.filter(|definition| &definition.provider == provider)
 				{
-					Some(route_def) => self
+					specs.push(route_def.auth.clone());
+				}
+				if let Some(provider_def) = self.catalog.provider(provider) {
+					for spec in provider_def.auth.iter() {
+						if !specs.contains(spec) {
+							specs.push(spec.clone());
+						}
+					}
+				}
+				let accepted = fetcher.accepted_auth_kinds();
+				let mut acquired = None;
+				for spec in specs {
+					if let Some(accepted) = accepted
+						&& !self
+							.catalog
+							.auth_spec(&spec)
+							.is_some_and(|definition| accepted.contains(&definition.kind))
+					{
+						continue;
+					}
+					if let Ok(lease) = self
 						.credentials
 						.lease(CredentialNeed {
-							spec:        route_def.auth.clone(),
-							account:     Some(account.clone()),
-							principal:   Some(principal.clone()),
+							spec,
+							account: Some(account.clone()),
+							principal: Some(principal.clone()),
 							valid_after: SystemTime::now(),
 						})
 						.await
-						.ok(),
-					None => None,
-				};
+					{
+						acquired = Some(lease);
+						break;
+					}
+				}
 				if credential_requirement == UsageCredentialRequirement::Required && acquired.is_none()
 				{
 					return Err(usage_error("console_usage_credential_unavailable"));
