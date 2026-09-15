@@ -119,6 +119,7 @@ impl AccountAuthority {
 		ctx: &omp_con::Ctx,
 		project: &Path,
 		home: &Path,
+		pinned_accounts: &[Str],
 	) -> miette::Result<Arc<Self>> {
 		let store = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
 			.map_err(|error| miette!(error))?;
@@ -133,7 +134,33 @@ impl AccountAuthority {
 		let settings = ModelSettings::from_con(ctx).resolve_path_scopes(project, home);
 		let accounts = stored_accounts(&auth).await.unwrap_or_default();
 		let authenticated = active_providers(&accounts);
-		let discovered = discover_account_models(&registry, data_dir, &authenticated, false).await;
+		// An account the host pins at launch answers discovery for its
+		// provider, and the launch catalog hydrates from that account's
+		// listing: what a subscription is offered (models, the "Fast" tier)
+		// is the account's fact, not the provider's.
+		let pins = AccountPins::default();
+		for pinned in pinned_accounts {
+			let Some(account) = accounts
+				.iter()
+				.find(|account| account.account.as_str() == pinned.as_str())
+			else {
+				eprintln!("warning: pinned account `{pinned}` is not stored; ignoring");
+				continue;
+			};
+			match &account.principal {
+				Some(principal) => pins.set(account.provider.clone(), principal.clone()),
+				None => eprintln!("warning: pinned account `{pinned}` has no principal; ignoring"),
+			}
+		}
+		omp_driver::registry::set_discovery_scopes(
+			pins
+				.snapshot()
+				.into_iter()
+				.map(|(provider, principal)| (provider, Str::new(principal.as_str())))
+				.collect(),
+		);
+		let discovered =
+			discover_account_models(&registry, data_dir, &authenticated, false, &pins).await;
 		let anthropic_models = anthropic_models_for(&authenticated, &discovered);
 		let providers = registry
 			.catalog()
@@ -152,7 +179,7 @@ impl AccountAuthority {
 			registry,
 			data_dir: data_dir.to_path_buf(),
 			settings,
-			pins: AccountPins::default(),
+			pins,
 			inner: Mutex::new(Inner {
 				providers,
 				pinned: BTreeMap::new(),
@@ -217,7 +244,8 @@ impl AccountAuthority {
 		let accounts = self.stored_accounts().await?;
 		let authenticated = active_providers(&accounts);
 		let discovered =
-			discover_account_models(&self.registry, &self.data_dir, &authenticated, true).await;
+			discover_account_models(&self.registry, &self.data_dir, &authenticated, true, &self.pins)
+				.await;
 		let anthropic_models = anthropic_models_for(&authenticated, &discovered);
 		self.inner.lock().anthropic_models = anthropic_models;
 		let mut models = discovered.values().flatten().cloned().collect::<Vec<_>>();
@@ -265,10 +293,27 @@ impl AccountAuthority {
 			.lock()
 			.pinned
 			.insert(account.provider.as_str().to_owned(), account_id.clone());
+		// The launch catalog was hydrated from the account pinned at launch.
+		// A different account may be offered other models and tiers, so its
+		// listing is fetched now (into its own cache scope) and the host is
+		// told a relaunch would show it.
+		let launch_scope = omp_driver::registry::discovery_scope(&account.provider);
+		let restart_required = launch_scope.as_deref() != Some(principal.as_str());
+		if restart_required {
+			let _ = discover_provider_models(
+				&self.registry,
+				&self.data_dir,
+				account.provider.as_str(),
+				false,
+				&self.pins,
+			)
+			.await;
+		}
 		Ok(json!({
 			"accountId": account_id,
 			"providerId": account.provider.as_str(),
 			"principal": principal.as_str(),
+			"restartRequired": restart_required,
 		}))
 	}
 
@@ -571,13 +616,14 @@ async fn discover_account_models(
 	data_dir: &Path,
 	authenticated: &HashSet<String>,
 	force_refresh: bool,
+	pins: &AccountPins,
 ) -> HashMap<String, Vec<String>> {
 	let probes = ACCOUNT_DISCOVERY_PROVIDERS
 		.into_iter()
 		.filter(|provider_id| authenticated.contains(*provider_id))
 		.map(|provider_id| async move {
 			let models =
-				discover_provider_models(registry, data_dir, provider_id, force_refresh).await;
+				discover_provider_models(registry, data_dir, provider_id, force_refresh, pins).await;
 			(provider_id.to_owned(), models)
 		});
 	futures::future::join_all(probes)
@@ -591,22 +637,28 @@ async fn discover_provider_models(
 	data_dir: &Path,
 	provider_id: &str,
 	force_refresh: bool,
+	pins: &AccountPins,
 ) -> Vec<String> {
 	let provider = ProviderId::from(provider_id);
+	let principal = pins
+		.snapshot()
+		.get(&provider)
+		.map(|principal| principal.as_str().to_owned());
 	let cached = if force_refresh {
 		None
 	} else {
-		crate::models_cmd::fresh_provider_models(data_dir, &provider).unwrap_or_else(|error| {
-			eprintln!("warning: {provider_id} model cache is unreadable: {error}");
-			None
-		})
+		crate::models_cmd::fresh_provider_models(data_dir, &provider, principal.as_deref())
+			.unwrap_or_else(|error| {
+				eprintln!("warning: {provider_id} model cache is unreadable: {error}");
+				None
+			})
 	};
 	if let Some(models) = cached {
 		return models;
 	}
 	match time::timeout(
 		ACCOUNT_MODEL_DISCOVERY_TIMEOUT,
-		crate::models_cmd::refresh_provider(registry, data_dir, &provider),
+		crate::models_cmd::refresh_provider(registry, data_dir, &provider, Some(pins)),
 	)
 	.await
 	{

@@ -24,11 +24,25 @@ use crate::cli::{LaunchExtensions, ModelRole, ModelsArgs, ModelsCommand};
 
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// The cache identity a provider's listing is kept under: scoped to the
+/// account the listing was fetched for when one is pinned, since a backend
+/// tailors what it offers (models, processing tiers) to the subscription.
+pub(crate) fn provider_cache_key(
+	provider: &ProviderId<str>,
+	principal: Option<&str>,
+) -> DiscoveryCacheKey {
+	match principal {
+		Some(principal) => DiscoveryCacheKey::credential(provider.to_owned(), principal),
+		None => DiscoveryCacheKey::provider(provider.to_owned()),
+	}
+}
+
 /// Returns a provider's current account-verified model selectors from the
 /// discovery cache. Embedded catalog rows are intentionally excluded.
 pub(crate) fn fresh_provider_models(
 	data_dir: &Path,
 	provider: &ProviderId<str>,
+	principal: Option<&str>,
 ) -> miette::Result<Option<Vec<String>>> {
 	let path = data_dir.join("models.db");
 	if !path.exists() {
@@ -36,7 +50,7 @@ pub(crate) fn fresh_provider_models(
 	}
 	let store = DiscoveryStore::open(&path).into_diagnostic()?;
 	let Some(cached) = store
-		.load_fresh(&DiscoveryCacheKey::provider(provider.to_owned()), discovery_now_ms()?)
+		.load_fresh(&provider_cache_key(provider, principal), discovery_now_ms()?)
 		.into_diagnostic()?
 	else {
 		return Ok(None);
@@ -61,11 +75,20 @@ pub(crate) async fn refresh_provider(
 	registry: &Registry,
 	data_dir: &Path,
 	provider: &ProviderId<str>,
+	pins: Option<&omp_ai::AccountPins>,
 ) -> miette::Result<Vec<String>> {
 	let routes = provider_discovery_routes(registry.catalog(), provider);
 	if routes.is_empty() {
 		return Err(miette!("provider `{provider}` does not expose model discovery"));
 	}
+	// A pinned account answers the listing for itself, and the rows are
+	// cached for that account alone.
+	let principal = pins.and_then(|pins| {
+		pins
+			.snapshot()
+			.get(provider)
+			.map(|principal| Str::new(principal.as_str()))
+	});
 
 	let now_ms = discovery_now_ms()?;
 	let mut rows = Vec::new();
@@ -82,7 +105,11 @@ pub(crate) async fn refresh_provider(
 		};
 		let mut cursor = None;
 		loop {
-			let page = Client::new(registry.service(), planner.clone(), meta.clone())
+			let mut client = Client::new(registry.service(), planner.clone(), meta.clone());
+			if let Some(pins) = pins {
+				client = client.with_account_pins(pins.clone());
+			}
+			let page = client
 				.execute(DiscoveryRequest {
 					provider:  Some(provider.to_owned()),
 					route:     Some(route.clone()),
@@ -112,7 +139,7 @@ pub(crate) async fn refresh_provider(
 	DiscoveryStore::open(&data_dir.join("models.db"))
 		.into_diagnostic()?
 		.publish(
-			&DiscoveryCacheKey::provider(provider.to_owned()),
+			&provider_cache_key(provider, principal.as_deref()),
 			&rows,
 			now_ms,
 			DISCOVERY_CACHE_TTL,

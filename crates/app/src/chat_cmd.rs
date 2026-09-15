@@ -271,6 +271,7 @@ impl Launch {
 			session_dir,
 			thinking,
 			service_tier,
+			account: _,
 			// Folded into `approval` above (`--approval-mode` outranks `--yolo`).
 			approval_mode: _,
 			yolo: _,

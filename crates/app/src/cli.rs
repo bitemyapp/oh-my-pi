@@ -1727,6 +1727,10 @@ pub struct ChatArgs {
 	/// Select the OpenAI-family service tier for this session.
 	#[arg(long, value_parser = parse_service_tier)]
 	pub service_tier:        Option<TierSetting>,
+	/// Stored account id to pin for its provider before model discovery and
+	/// every inference call; repeat for several providers.
+	#[arg(long = "account", value_name = "ACCOUNT_ID")]
+	pub account:             Vec<Str>,
 	/// Tool approval policy.
 	#[arg(long)]
 	pub approval_mode:       Option<ApprovalMode>,
@@ -1860,6 +1864,7 @@ impl ChatArgs {
 			session_dir:         None,
 			thinking:            None,
 			service_tier:        None,
+			account:             Vec::new(),
 			approval_mode:       None,
 			yolo:                false,
 			max_time:            None,

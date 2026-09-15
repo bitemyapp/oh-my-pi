@@ -68,7 +68,16 @@ async fn run_inner(args: ChatArgs, ui_enabled: bool) -> miette::Result<()> {
 	let accounts = if args.gateway.is_none() {
 		let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 		let home = std::env::var_os("HOME").map_or_else(|| project.clone(), PathBuf::from);
-		Some(crate::rpc_accounts::AccountAuthority::compose(&data_dir, &ctx, &project, &home).await?)
+		Some(
+			crate::rpc_accounts::AccountAuthority::compose(
+				&data_dir,
+				&ctx,
+				&project,
+				&home,
+				&args.account,
+			)
+			.await?,
+		)
 	} else {
 		None
 	};

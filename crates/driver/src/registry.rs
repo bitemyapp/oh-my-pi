@@ -325,6 +325,23 @@ pub fn open_credential_store_with_key_source(
 
 /// Returns the immutable production catalog with configured and fresh
 /// runtime-discovery layers materialized in explicit precedence order.
+/// The account each provider's listing was fetched for in this process, set
+/// by whoever pins accounts before the launch catalog is composed. Hydration
+/// prefers that account's cached listing over the provider-wide one, because
+/// what a subscription is offered is the account's fact.
+static DISCOVERY_SCOPES: parking_lot::RwLock<BTreeMap<omp_catalog::ProviderId, Str>> =
+	parking_lot::RwLock::new(BTreeMap::new());
+
+/// Records which account's listing hydrates each provider in this process.
+pub fn set_discovery_scopes(scopes: BTreeMap<omp_catalog::ProviderId, Str>) {
+	*DISCOVERY_SCOPES.write() = scopes;
+}
+
+/// The account whose listing hydrates `provider` in this process, if any.
+pub fn discovery_scope(provider: &omp_catalog::ProviderId<str>) -> Option<Str> {
+	DISCOVERY_SCOPES.read().get(provider).cloned()
+}
+
 pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, RegistryError> {
 	let bundled = snapshot::Catalog::try_embedded()
 		.map_err(RegistryError::Catalog)?
@@ -376,11 +393,32 @@ pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, Reg
 			.insert(omp_ai::discovery::DiscoveryCacheKey::endpoint(probe.provider, &probe.endpoint));
 	}
 	let mut normalized = Vec::new();
+	let scopes = DISCOVERY_SCOPES.read().clone();
 	for key in cache_keys {
-		let Some(cached) = store
-			.load_fresh(&key, now_ms)
-			.map_err(catalog_composition)?
-		else {
+		// The pinned account's own listing wins over the provider-wide one.
+		let scoped = key
+			.credential_scope
+			.is_none()
+			.then(|| scopes.get(&key.provider))
+			.flatten()
+			.map(|principal| {
+				omp_ai::discovery::DiscoveryCacheKey::credential(
+					key.provider.clone(),
+					principal.clone(),
+				)
+			});
+		let mut cached = None;
+		if let Some(scoped) = &scoped {
+			cached = store
+				.load_fresh(scoped, now_ms)
+				.map_err(catalog_composition)?;
+		}
+		if cached.is_none() {
+			cached = store
+				.load_fresh(&key, now_ms)
+				.map_err(catalog_composition)?;
+		}
+		let Some(cached) = cached else {
 			continue;
 		};
 		let Some(provider) = configured.provider(&key.provider) else {
@@ -1443,6 +1481,103 @@ mod tests {
 		assert_eq!(after.thinking, before.thinking, "the bundle keeps its thinking policy");
 		assert_eq!(after.routes, before.routes, "the bundle keeps its routes");
 		assert_eq!(after.wire_ids, before.wire_ids, "the bundle keeps its wire ids");
+	}
+
+	#[test]
+	fn hydration_prefers_the_pinned_accounts_listing_over_the_providers() {
+		use omp_catalog::{
+			Availability, DiscoveredModel, ModelKey, OperationBits, OperationKind, ProviderFamily,
+			ProviderId, RouteId, ServiceTier, WireModelId,
+		};
+		let data_dir = tempfile::tempdir().expect("data dir");
+		let bundled = snapshot::Catalog::embedded();
+		let key = ModelKey::from("openai-codex/gpt-5.6-luna");
+		let before = bundled.model(&key).expect("bundled luna").clone();
+		let fast = ServiceTier::for_family(ProviderFamily::OpenAi, "priority").expect("priority");
+		let row = |tiers: Availability<Box<[ServiceTier]>>| {
+			let mut capabilities = before.capabilities.clone();
+			capabilities.chat.as_mut().expect("chat").service_tiers = tiers;
+			let mut operations = OperationBits::empty();
+			operations.insert_kind(OperationKind::Chat);
+			DiscoveredModel {
+				provider:              ProviderId::from("openai-codex"),
+				route:                 RouteId::from("openai-codex/primary"),
+				wire_model:            WireModelId::from("gpt-5.6-luna"),
+				aliases:               Box::new([]),
+				display_name:          None,
+				declared_class:        Some(before.class.clone()),
+				declared_operations:   operations,
+				declared_capabilities: Some(capabilities),
+				declared_limits:       Some(before.limits.clone()),
+				declared_pricing:      Box::new([]),
+				extended_context_mode: None,
+				availability:          Some(before.availability.clone()),
+				source:                Str::new_static("test"),
+				observed_at_ms:        Some(1),
+				updated_at_ms:         None,
+				deprecated:            None,
+			}
+		};
+		let now_ms = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.expect("clock")
+			.as_millis()
+			.try_into()
+			.expect("ms");
+		let store = omp_ai::discovery::DiscoveryStore::open(&data_dir.path().join("models.db"))
+			.expect("store");
+		let ttl = std::time::Duration::from_secs(3600);
+		// The provider's default account is offered no tier on Luna...
+		store
+			.publish(
+				&omp_ai::discovery::DiscoveryCacheKey::provider(ProviderId::from("openai-codex")),
+				&[row(Availability::Unsupported)],
+				now_ms,
+				ttl,
+			)
+			.expect("provider-wide rows");
+		// ...while the account the host pinned is.
+		store
+			.publish(
+				&omp_ai::discovery::DiscoveryCacheKey::credential(
+					ProviderId::from("openai-codex"),
+					"principal-pro",
+				),
+				&[row(Availability::Native(vec![fast.clone()].into_boxed_slice()))],
+				now_ms,
+				ttl,
+			)
+			.expect("account rows");
+		set_discovery_scopes(BTreeMap::new());
+		let unpinned = production_catalog(data_dir.path()).expect("catalog hydrates");
+		assert!(matches!(
+			unpinned
+				.model(&key)
+				.expect("luna")
+				.capabilities
+				.chat
+				.as_ref()
+				.expect("chat")
+				.service_tiers,
+			Availability::Unsupported
+		));
+		set_discovery_scopes(BTreeMap::from([(
+			omp_catalog::ProviderId::from("openai-codex"),
+			Str::new_static("principal-pro"),
+		)]));
+		let pinned = production_catalog(data_dir.path()).expect("catalog hydrates");
+		assert_eq!(
+			pinned
+				.model(&key)
+				.expect("luna")
+				.capabilities
+				.chat
+				.as_ref()
+				.expect("chat")
+				.service_tiers,
+			Availability::Native(vec![fast].into_boxed_slice())
+		);
+		set_discovery_scopes(BTreeMap::new());
 	}
 
 	#[test]
