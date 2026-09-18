@@ -14,6 +14,7 @@ use std::{
 
 use futures::StreamExt as _;
 use http::{HeaderName, HeaderValue};
+use ring::rand::{SecureRandom as _, SystemRandom};
 use omp_catalog::{
 	NativeToolChoicePenalty, OperationBits, OperationKind, ToolFeatureBits, WireModelId,
 	provider::{AuthSpecKind, CodecProfile, DiscoveryKind, RouteDef, TransportKind},
@@ -97,7 +98,7 @@ use crate::{
 		search_tinyfish::TinyfishSearchCodec,
 	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
-	gate::GateCondition,
+	gate::{GateCondition, SecureGateSpool},
 	id::{AccountId, PrincipalId},
 	layer::{
 		AttemptAction, ExecutionContext,
@@ -2560,6 +2561,56 @@ impl SemanticPolicy<Call> for CanonicalSemantic {
 	fn max_retries(&self, call: &Call) -> u32 {
 		call.budget.max_attempts.saturating_sub(1)
 	}
+
+	fn secure_spool(&self, call: &Call) -> Result<Option<Box<dyn SecureGateSpool>>, Box<Error>> {
+		Ok(gate_spool(
+			&call.budget,
+			call.staging.as_ref().map(|staging| &staging.cancellation),
+		))
+	}
+}
+
+/// The encrypted temporary spool a gated attempt spills into once memory is
+/// full. A gate that must hold a whole response — to scrub a leak or to
+/// validate a structured answer — was memory-only, so the 64 KiB memory
+/// bound decided how long a response could be and killed every long one
+/// with `PolicyBufferExceeded`. The spool the gate was designed with holds
+/// the rest on disk. An attempt is held only until its gate commits or
+/// fails and the file dies with the gate, so an ephemeral key is the right
+/// key. Spool trouble leaves the gate memory-only, as before, rather than
+/// failing the call.
+fn gate_spool(
+	budget: &crate::receipt::ExecutionBudget,
+	cancellation: Option<&crate::staging::StagingCancellation>,
+) -> Option<Box<dyn SecureGateSpool>> {
+	if budget.max_gate_spool_bytes == 0 {
+		return None;
+	}
+	let mut key = [0u8; 32];
+	if SystemRandom::new().fill(&mut key).is_err() {
+		tracing::warn!("gate spool key unavailable; the attempt is held in memory only");
+		return None;
+	}
+	let owned;
+	let cancellation = match cancellation {
+		Some(cancellation) => cancellation,
+		None => {
+			owned = crate::staging::StagingCancellation::default();
+			&owned
+		},
+	};
+	match crate::staging::SecureTemporaryGateSpool::new(
+		budget.max_gate_spool_bytes,
+		crate::staging::StagingKeyProvider::CallerProvided(crate::staging::StagingKey::new(key)),
+		None,
+		cancellation,
+	) {
+		Ok(spool) => Some(Box::new(spool)),
+		Err(error) => {
+			tracing::warn!(?error, "gate spool unavailable; the attempt is held in memory only");
+			None
+		},
+	}
 }
 
 fn unavailable(route: &RouteDef, reason: &'static str) -> RouteUnavailable {
@@ -3501,6 +3552,17 @@ mod tests {
 		);
 		assert_eq!(target.endpoint, effective.endpoint);
 		assert_eq!(target.wire_model.as_str(), "openai.gpt-5.6-sol");
+	}
+
+	#[test]
+	fn a_gated_attempt_gets_a_disk_spool_unless_the_budget_forbids_one() {
+		use crate::receipt::{DEFAULT_GATE_SPOOL_BYTES, ExecutionBudget};
+		let budget = ExecutionBudget::default();
+		assert_eq!(budget.max_gate_spool_bytes, DEFAULT_GATE_SPOOL_BYTES);
+		let spool = super::gate_spool(&budget, None).expect("a spool by default");
+		assert_eq!(spool.capacity_bytes(), DEFAULT_GATE_SPOOL_BYTES);
+		let none = ExecutionBudget { max_gate_spool_bytes: 0, ..ExecutionBudget::default() };
+		assert!(super::gate_spool(&none, None).is_none(), "zero keeps the gate memory-only");
 	}
 
 	#[test]

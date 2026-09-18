@@ -691,6 +691,7 @@ mod tests {
 			max_cost:              Some(Cost::from_micro_usd(7)),
 			max_provisional_bytes: 11,
 			max_staging_bytes:     0,
+			max_gate_spool_bytes:  0,
 		};
 		let context = ExecutionContext::new(budget);
 		assert_eq!(context.reserve_attempt().unwrap(), 0);

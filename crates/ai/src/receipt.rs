@@ -266,11 +266,20 @@ pub struct ExecutionBudget {
 	pub max_provisional_bytes: u64,
 	/// Maximum bytes accepted by explicit secure staging.
 	pub max_staging_bytes:     u64,
+	/// Bytes a gated attempt may hold in its encrypted temporary spool once
+	/// memory (`max_provisional_bytes`) is full, so a whole response can be
+	/// held for validation without the memory bound deciding how long a
+	/// response may be. Zero keeps a gate memory-only.
+	pub max_gate_spool_bytes:  u64,
 }
 
 /// Bounded in-memory capacity available to transactional output gates unless a
 /// caller supplies a tighter explicit budget.
 pub const DEFAULT_PROVISIONAL_BYTES: u64 = 64 * 1024;
+
+/// The same ceiling the host keeps for a complete tool output: a whole
+/// attempt past it is pathological, not merely long.
+pub const DEFAULT_GATE_SPOOL_BYTES: u64 = 8 * 1024 * 1024;
 
 impl Default for ExecutionBudget {
 	fn default() -> Self {
@@ -282,6 +291,7 @@ impl Default for ExecutionBudget {
 			max_cost:              None,
 			max_provisional_bytes: DEFAULT_PROVISIONAL_BYTES,
 			max_staging_bytes:     0,
+			max_gate_spool_bytes:  DEFAULT_GATE_SPOOL_BYTES,
 		}
 	}
 }

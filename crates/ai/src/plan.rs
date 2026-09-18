@@ -735,6 +735,7 @@ mod tests {
 			max_cost:              None::<Cost>,
 			max_provisional_bytes: 0,
 			max_staging_bytes:     staging,
+			max_gate_spool_bytes:  0,
 		}
 	}
 

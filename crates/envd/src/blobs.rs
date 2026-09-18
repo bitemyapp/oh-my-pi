@@ -506,6 +506,27 @@ impl VerdictRetention {
 			.map_err(BlobError::from)
 	}
 
+	/// Whether `hash` is a verdict still pending delivery to exactly this
+	/// invocation — the one that published it.
+	fn pending_for(
+		&self,
+		session_id: Option<&str>,
+		invocation_id: &str,
+		hash: [u8; 32],
+	) -> Result<bool, BlobError> {
+		self
+			.connection
+			.lock()
+			.query_row(
+				"SELECT 1 FROM verdict_lease WHERE delivery_key = ?1 AND hash = ?2 AND downloaded = 0",
+				params![delivery_key(session_id, invocation_id), hash.as_slice()],
+				|row| row.get::<_, i64>(0),
+			)
+			.optional()
+			.map(|row| row.is_some())
+			.map_err(BlobError::from)
+	}
+
 	fn renew(
 		&self,
 		session_id: Option<&str>,
@@ -1060,6 +1081,24 @@ impl BlobHost {
 	/// complete-size provenance with `offset` advanced by bytes already
 	/// persisted. The selected file remains open through streaming, while each
 	/// transport chunk remains bounded independently.
+	/// Whether a get names the verdict this invocation itself published and
+	/// has not yet collected. Reading that back is delivery, not an effect.
+	pub(crate) fn is_pending_verdict(
+		&self,
+		session_id: Option<&str>,
+		invocation_id: &str,
+		request: &blob_pb::GetRequest,
+	) -> bool {
+		let Ok(hash) = parse_hash(&request.hash) else {
+			return false;
+		};
+		self.retention.as_ref().is_some_and(|retention| {
+			retention
+				.pending_for(session_id, invocation_id, hash)
+				.unwrap_or(false)
+		})
+	}
+
 	pub fn get_request(&self, request: &blob_pb::GetRequest) -> Result<BlobRead, BlobError> {
 		let hash = parse_hash(&request.hash)?;
 		let tracked = self

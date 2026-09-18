@@ -4368,6 +4368,19 @@ impl EnvServer {
 			.await;
 			return;
 		}
+		let own_verdict = match &body {
+			client_frame::Body::BlobGet(request) => scope
+				.as_ref()
+				.and_then(verdict_delivery_provenance)
+				.is_some_and(|delivery| {
+					self.blobs.is_pending_verdict(
+						Some(delivery.session_id.as_str()),
+						delivery.invocation_id.as_str(),
+						request,
+					)
+				}),
+			_ => false,
+		};
 		if let Some((operation, capability)) = frame_data_operation(&body)
 			&& !authorize_data_operation(
 				connection,
@@ -4376,6 +4389,7 @@ impl EnvServer {
 				capability,
 				responses,
 				frame.request_id,
+				own_verdict,
 			)
 			.await
 		{
@@ -5276,6 +5290,7 @@ impl EnvServer {
 					"env.worker",
 					responses,
 					request_id,
+					false,
 				)
 				.await
 				{
@@ -5296,6 +5311,7 @@ impl EnvServer {
 					"env.search",
 					responses,
 					request_id,
+					false,
 				)
 				.await
 				{
@@ -5333,6 +5349,7 @@ impl EnvServer {
 					"env.search",
 					responses,
 					request_id,
+					false,
 				)
 				.await
 				{
@@ -5445,6 +5462,7 @@ impl EnvServer {
 					"env.mcp",
 					responses,
 					request_id,
+					false,
 				)
 				.await
 				{
@@ -5462,6 +5480,7 @@ impl EnvServer {
 					"env.search",
 					responses,
 					request_id,
+					false,
 				)
 				.await
 				{
@@ -5495,6 +5514,7 @@ impl EnvServer {
 				};
 				if !authorize_data_operation(
 					connection, scope, operation, "env.exec", responses, request_id,
+					false,
 				)
 				.await
 				{
@@ -5512,6 +5532,7 @@ impl EnvServer {
 					"env.fs.write",
 					responses,
 					request_id,
+					false,
 				)
 				.await
 				{
@@ -5534,6 +5555,7 @@ impl EnvServer {
 					"env.site",
 					responses,
 					request_id,
+					false,
 				)
 				.await
 				{
@@ -5616,6 +5638,7 @@ impl EnvServer {
 					"env.exec",
 					responses,
 					request_id,
+					false,
 				)
 				.await
 				{
@@ -5668,6 +5691,7 @@ impl EnvServer {
 			"env.doc.read",
 			responses,
 			request_id,
+			false,
 		)
 		.await
 		{
@@ -6114,7 +6138,7 @@ impl EnvServer {
 			},
 			_ => unreachable!("DAP dispatch receives only DAP request arms"),
 		};
-		if !authorize_data_operation(connection, scope, operation, capability, responses, request_id)
+		if !authorize_data_operation(connection, scope, operation, capability, responses, request_id, false)
 			.await
 		{
 			return;
@@ -6657,6 +6681,7 @@ impl EnvServer {
 			"env.workspace.snapshot",
 			responses,
 			request_id,
+			false,
 		)
 		.await
 		{
@@ -6756,6 +6781,7 @@ impl EnvServer {
 			"env.worktree",
 			responses,
 			request_id,
+			false,
 		)
 		.await
 		{
@@ -6919,6 +6945,7 @@ impl EnvServer {
 			required,
 			responses,
 			request_id,
+			false,
 		)
 		.await
 		{
@@ -11359,6 +11386,8 @@ async fn authorize_data_operation(
 	capability: &'static str,
 	responses: &flume::Sender<pb::ServerFrame>,
 	request_id: u64,
+	// The request reads back the verdict its own invocation published.
+	own_verdict: bool,
 ) -> bool {
 	let Some(spec) = omp_tool::operation_spec(operation) else {
 		send_error(
@@ -11421,7 +11450,13 @@ async fn authorize_data_operation(
 		host_generation:    scope.host_generation,
 		session_generation: scope.session_generation,
 	};
-	let result = if capability == "env.search" {
+	let result = if own_verdict {
+		// The retention lease — this session, this invocation, this hash, not yet
+		// collected — is the authority. A read-only tool never enters
+		// EFFECTS_AUTHORIZED, so asking for it here made every verdict too big
+		// to inline unfetchable, and the host reported "invalid outcome artifact".
+		Ok(())
+	} else if capability == "env.search" {
 		connection
 			.authority
 			.validate_read(host, connection.connection_owner, credentials)
