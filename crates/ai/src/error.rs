@@ -738,13 +738,15 @@ impl Display for Error {
 		if let Some(status) = self.status {
 			write!(formatter, " [http {status}]")?;
 		}
-		// The account that served the failing attempt, so a host can say which
-		// credential is at fault instead of guessing from a session pin.
-		if let Some(account) = self.account() {
-			write!(formatter, " for account {}", account.as_str())?;
-		}
 		if let Some(detail) = &self.evidence.detail {
 			write!(formatter, ": {detail}")?;
+		}
+		// The account that served the failing attempt, so a host can say which
+		// credential is at fault instead of guessing from a session pin. It closes
+		// the message: an id followed by punctuation would defeat a host's
+		// word-boundary match on it.
+		if let Some(account) = self.account() {
+			write!(formatter, " for account {}", account.as_str())?;
 		}
 		Ok(())
 	}
@@ -913,10 +915,13 @@ mod tests {
 			receipt,
 		)
 		.code(sf!("token_revoked"))
-		.status(Some(401));
+		.status(Some(401))
+		.detail(SuperErrorDetail::Provider { sanitized_message: sf!("invalidated oauth token") });
 		assert_eq!(error.account().map(AccountId::as_str), Some("openai-codex:tres"));
 		let rendered = error.to_string();
-		assert!(rendered.contains("[http 401] for account openai-codex:tres"), "{rendered}");
+		// The account closes the message, after the detail, so a host's
+		// word-boundary match on the id is not defeated by a following colon.
+		assert!(rendered.ends_with("invalidated oauth token for account openai-codex:tres"), "{rendered}");
 		let bare = Error::new(
 			ErrorKind::Authentication,
 			ErrorPhase::Handshake,
