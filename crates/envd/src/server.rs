@@ -4377,8 +4377,7 @@ impl EnvServer {
 				.filter(|scope| !scope.invocation_id.is_empty())
 				.is_some_and(|scope| {
 					let pending = self.blobs.is_pending_verdict(scope.invocation_id.as_str(), request);
-					// TODO(diagnosis): warn-level while the own-verdict path is being proven live.
-					tracing::warn!(
+					tracing::debug!(
 						invocation_id = %scope.invocation_id,
 						session_id = %scope.session_id,
 						host_bound = connection.host.is_some(),
