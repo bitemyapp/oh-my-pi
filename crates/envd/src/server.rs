@@ -4376,11 +4376,15 @@ impl EnvServer {
 				.as_ref()
 				.filter(|scope| !scope.invocation_id.is_empty())
 				.is_some_and(|scope| {
-					self.blobs.is_pending_verdict(
-						(!scope.session_id.is_empty()).then_some(scope.session_id.as_str()),
-						scope.invocation_id.as_str(),
-						request,
-					)
+					let pending = self.blobs.is_pending_verdict(scope.invocation_id.as_str(), request);
+					// TODO(diagnosis): warn-level while the own-verdict path is being proven live.
+					tracing::warn!(
+						invocation_id = %scope.invocation_id,
+						session_id = %scope.session_id,
+						pending,
+						"own-verdict authorization check"
+					);
+					pending
 				}),
 			_ => false,
 		};

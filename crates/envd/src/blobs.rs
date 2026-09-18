@@ -507,24 +507,20 @@ impl VerdictRetention {
 	}
 
 	/// Whether `hash` is a verdict still pending delivery to exactly this
-	/// invocation — the one that published it.
-	fn pending_for(
-		&self,
-		session_id: Option<&str>,
-		invocation_id: &str,
-		hash: [u8; 32],
-	) -> Result<bool, BlobError> {
-		self
-			.connection
-			.lock()
-			.query_row(
-				"SELECT 1 FROM verdict_lease WHERE delivery_key = ?1 AND hash = ?2 AND downloaded = 0",
-				params![delivery_key(session_id, invocation_id), hash.as_slice()],
-				|row| row.get::<_, i64>(0),
-			)
-			.optional()
-			.map(|row| row.is_some())
-			.map_err(BlobError::from)
+	/// invocation — the one that published it. The session is a delivery
+	/// detail: the lease's key is read back rather than rebuilt, since the
+	/// scope asking may name the session differently from the one the
+	/// verdict was retained under, or not at all.
+	fn pending_for_invocation(&self, invocation_id: &str, hash: [u8; 32]) -> Result<bool, BlobError> {
+		let connection = self.connection.lock();
+		let mut statement = connection
+			.prepare("SELECT delivery_key FROM verdict_lease WHERE hash = ?1 AND downloaded = 0")?;
+		let keys = statement
+			.query_map([hash.as_slice()], |row| row.get::<_, String>(0))?
+			.collect::<Result<Vec<_>, _>>()?;
+		Ok(keys
+			.iter()
+			.any(|key| delivery_key_invocation(key) == Some(invocation_id)))
 	}
 
 	fn renew(
@@ -721,6 +717,14 @@ impl VerdictRetention {
 		transaction.commit()?;
 		Ok(deleted)
 	}
+}
+
+/// The invocation a delivery key names, the inverse of `delivery_key`.
+fn delivery_key_invocation(key: &str) -> Option<&str> {
+	let rest = key.strip_prefix("v1:")?;
+	let (len, rest) = rest.split_once(':')?;
+	let len = len.parse::<usize>().ok()?;
+	rest.get(len..)
 }
 
 fn delivery_key(session_id: Option<&str>, invocation_id: &str) -> String {
@@ -1083,25 +1087,14 @@ impl BlobHost {
 	/// transport chunk remains bounded independently.
 	/// Whether a get names the verdict this invocation itself published and
 	/// has not yet collected. Reading that back is delivery, not an effect.
-	pub(crate) fn is_pending_verdict(
-		&self,
-		session_id: Option<&str>,
-		invocation_id: &str,
-		request: &blob_pb::GetRequest,
-	) -> bool {
+	pub(crate) fn is_pending_verdict(&self, invocation_id: &str, request: &blob_pb::GetRequest) -> bool {
 		let Ok(hash) = parse_hash(&request.hash) else {
 			return false;
 		};
-		// The lease is keyed by the session the verdict was retained under, which
-		// a scoped get names when it can; an invocation retained without one is
-		// looked up that way too.
 		self.retention.as_ref().is_some_and(|retention| {
-			let under = |session: Option<&str>| {
-				retention
-					.pending_for(session, invocation_id, hash)
-					.unwrap_or(false)
-			};
-			under(session_id) || (session_id.is_some() && under(None))
+			retention
+				.pending_for_invocation(invocation_id, hash)
+				.unwrap_or(false)
 		})
 	}
 
@@ -1735,6 +1728,23 @@ mod tests {
 			!second.worker_verdict_store().has(&second_id.into()),
 			"unrooted second project CAS is collected"
 		);
+	}
+
+	#[test]
+	fn a_pending_verdict_is_recognised_by_its_invocation_whatever_the_session() {
+		use super::{blob_pb, delivery_key, delivery_key_invocation};
+		let root = tempfile::tempdir().expect("temporary blob root");
+		let host = BlobHost::open_managed(root.path().join("blobs"), root.path().join("sessions"))
+			.expect("managed host");
+		let blob = host
+			.put_verdict_bytes(Some("session-a"), "call-1", br#"{"kind":"ok"}"#)
+			.expect("retain verdict");
+		let request = blob_pb::GetRequest { hash: blob.hash.clone(), ..Default::default() };
+		assert!(host.is_pending_verdict("call-1", &request), "the publishing invocation");
+		assert!(!host.is_pending_verdict("call-2", &request), "another invocation");
+		assert_eq!(delivery_key_invocation(&delivery_key(Some("session-a"), "call-1")), Some("call-1"));
+		assert_eq!(delivery_key_invocation(&delivery_key(None, "call-1")), Some("call-1"));
+		assert_eq!(delivery_key_invocation("garbage"), None);
 	}
 
 	#[test]
