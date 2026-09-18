@@ -4381,6 +4381,7 @@ impl EnvServer {
 					tracing::warn!(
 						invocation_id = %scope.invocation_id,
 						session_id = %scope.session_id,
+						host_bound = connection.host.is_some(),
 						pending,
 						"own-verdict authorization check"
 					);
@@ -11420,6 +11421,16 @@ async fn authorize_data_operation(
 		send_policy_error(responses, request_id, PolicyError::Denied { capability }).await;
 		return false;
 	}
+	if own_verdict {
+		// A get naming the verdict this scope's own invocation published, still
+		// pending delivery to it. The retention lease — this invocation, this
+		// hash, not yet collected — is the authority: not a host binding, which
+		// the kernel invoking native tools does not hold, and not effect
+		// authorization, which a read-only tool never reaches. Requiring either
+		// made every verdict too big to inline unfetchable, reported by the
+		// host as "invalid outcome artifact".
+		return true;
+	}
 	if scope.is_none() {
 		if connection.host.is_some() {
 			send_policy_error(responses, request_id, PolicyError::EffectsNotAuthorized).await;
@@ -11457,13 +11468,7 @@ async fn authorize_data_operation(
 		host_generation:    scope.host_generation,
 		session_generation: scope.session_generation,
 	};
-	let result = if own_verdict {
-		// The retention lease — this session, this invocation, this hash, not yet
-		// collected — is the authority. A read-only tool never enters
-		// EFFECTS_AUTHORIZED, so asking for it here made every verdict too big
-		// to inline unfetchable, and the host reported "invalid outcome artifact".
-		Ok(())
-	} else if capability == "env.search" {
+	let result = if capability == "env.search" {
 		connection
 			.authority
 			.validate_read(host, connection.connection_owner, credentials)
