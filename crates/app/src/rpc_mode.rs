@@ -649,6 +649,17 @@ fn node_text<'a>(dom: &'a Dom, handle: Handle, node: &'a Node) -> Option<&'a str
 		.or_else(|| prop(node, PropId::Text))
 }
 
+/// Appends one reasoning node's text to the turn's thinking. The codec
+/// separates the summary parts *within* an item, but a turn with several
+/// reasoning items holds them as separate nodes, and gluing those ran one
+/// item's closing `**` into the next one's opening `**` ("…icon****Planning…").
+fn push_thinking_node(thinking: &mut String, value: &str) {
+	if !thinking.is_empty() && !value.is_empty() && !thinking.ends_with('\n') && !value.starts_with('\n') {
+		thinking.push_str("\n\n");
+	}
+	thinking.push_str(value);
+}
+
 fn assistant_text(dom: &Dom, assistant: Handle) -> (String, String) {
 	let mut text = String::new();
 	let mut thinking = String::new();
@@ -667,7 +678,7 @@ fn assistant_text(dom: &Dom, assistant: Handle) -> (String, String) {
 		};
 		match prop(node, PropId::Kind) {
 			Some("text") => text.push_str(value),
-			Some("thinking") => thinking.push_str(value),
+			Some("thinking") => push_thinking_node(&mut thinking, value),
 			_ => {},
 		}
 	}
@@ -3127,6 +3138,24 @@ mod tests {
 		spec.capabilities.chat.as_mut().expect("chat").service_tiers = Availability::Unsupported;
 		assert_eq!(offered_service_tiers(&spec), Some(Vec::new()));
 		assert!(!offers_fast_tier(&spec));
+	}
+
+	#[test]
+	fn reasoning_items_are_separated_but_a_single_item_is_untouched() {
+		use super::push_thinking_node;
+		let mut thinking = String::new();
+		push_thinking_node(&mut thinking, "**Planning rasterization for icon**");
+		push_thinking_node(&mut thinking, "**Planning SVG crown generation**");
+		assert_eq!(thinking, "**Planning rasterization for icon**\n\n**Planning SVG crown generation**");
+		// A node that already ends or begins on a line break needs no second one.
+		let mut thinking = String::from("first\n\n");
+		push_thinking_node(&mut thinking, "second");
+		assert_eq!(thinking, "first\n\nsecond");
+		// An empty node adds nothing, so a later node is not preceded by a break.
+		let mut thinking = String::new();
+		push_thinking_node(&mut thinking, "");
+		push_thinking_node(&mut thinking, "only");
+		assert_eq!(thinking, "only");
 	}
 
 	#[test]

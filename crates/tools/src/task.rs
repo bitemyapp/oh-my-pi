@@ -105,19 +105,29 @@ impl<'de> Deserialize<'de> for Params {
 	/// "data did not match any variant of untagged enum Params". Deciding the
 	/// shape first lets the real error, naming the field and value, through.
 	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-		let value = serde_json::Value::deserialize(deserializer)?;
+		let mut value = serde_json::Value::deserialize(deserializer)?;
 		let is_batch = value
 			.as_object()
 			.is_some_and(|object| object.contains_key("tasks"));
 		if is_batch {
-			serde_json::from_value::<BatchRequest>(value)
+			return serde_json::from_value::<BatchRequest>(value)
 				.map(Self::Batch)
-				.map_err(serde::de::Error::custom)
-		} else {
-			serde_json::from_value::<ChildRequest>(value)
-				.map(Self::Single)
-				.map_err(serde::de::Error::custom)
+				.map_err(serde::de::Error::custom);
 		}
+		// The schema offers `context` at the top level, and a model reasonably
+		// pairs it with one `task`. That is a batch of one, not an unknown field
+		// worth losing the whole delegation over.
+		let context = value
+			.as_object_mut()
+			.and_then(|object| object.remove("context"))
+			.map(serde_json::from_value::<Str>)
+			.transpose()
+			.map_err(serde::de::Error::custom)?;
+		let child = serde_json::from_value::<ChildRequest>(value).map_err(serde::de::Error::custom)?;
+		Ok(match context {
+			Some(context) => Self::Batch(BatchRequest { context, tasks: vec![child] }),
+			None => Self::Single(child),
+		})
 	}
 }
 
@@ -635,6 +645,25 @@ mod tests {
 			.into_batch();
 			assert_eq!(single.tasks[0].effort, Some(effort), "{word}");
 		}
+	}
+
+	#[test]
+	fn a_single_task_with_shared_context_is_a_batch_of_one() {
+		// The exact shape a model produced: one child plus a top-level `context`.
+		let batch = serde_json::from_value::<Params>(serde_json::json!({
+			"name": "icon-implement", "task": "Implement the icon", "effort": "high",
+			"isolated": false, "context": "Top-left icon is crown.fill"
+		}))
+		.expect("a single task with context")
+		.into_batch();
+		assert_eq!(batch.context, "Top-left icon is crown.fill");
+		assert_eq!(batch.tasks.len(), 1);
+		assert_eq!(batch.tasks[0].name.as_deref(), Some("icon-implement"));
+		assert_eq!(batch.tasks[0].effort, Some(TaskEffort::Hi));
+		// A non-string context is still refused, by name.
+		let error = serde_json::from_value::<Params>(serde_json::json!({"task": "one", "context": 7}))
+			.expect_err("context must be text");
+		assert!(!error.to_string().contains("did not match any variant"));
 	}
 
 	#[test]
