@@ -36,11 +36,15 @@ pub const STARTED_ADVISORY: &str =
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskEffort {
-	/// Lowest reasoning level supported by the selected model.
+	/// Lowest reasoning level supported by the selected model. Models reach
+	/// for the plain words as readily as the short forms, so both are read.
+	#[serde(alias = "low", alias = "minimal", alias = "min", alias = "off", alias = "none")]
 	Lo,
 	/// Middle reasoning level supported by the selected model.
+	#[serde(alias = "medium", alias = "mid", alias = "normal", alias = "default")]
 	Med,
 	/// Highest reasoning level supported by the selected model.
+	#[serde(alias = "high", alias = "xhigh", alias = "x-high", alias = "max", alias = "maximum")]
 	Hi,
 }
 
@@ -85,13 +89,36 @@ pub struct BatchRequest {
 ///
 /// The flat form preserves the established single-child contract. The batch
 /// form adds shared context without forcing simple callers to wrap one item.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Params {
 	/// One child request.
 	Single(ChildRequest),
 	/// Concurrent child requests.
 	Batch(BatchRequest),
+}
+
+impl<'de> Deserialize<'de> for Params {
+	/// The wire shape is told apart by the `tasks` key rather than by trying
+	/// each variant in turn. An untagged enum reports only that no variant
+	/// matched, which hid one bad field — an `effort` spelled `high` — behind
+	/// "data did not match any variant of untagged enum Params". Deciding the
+	/// shape first lets the real error, naming the field and value, through.
+	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		let value = serde_json::Value::deserialize(deserializer)?;
+		let is_batch = value
+			.as_object()
+			.is_some_and(|object| object.contains_key("tasks"));
+		if is_batch {
+			serde_json::from_value::<BatchRequest>(value)
+				.map(Self::Batch)
+				.map_err(serde::de::Error::custom)
+		} else {
+			serde_json::from_value::<ChildRequest>(value)
+				.map(Self::Single)
+				.map_err(serde::de::Error::custom)
+		}
+	}
 }
 
 impl JsonSchema for Params {
@@ -110,7 +137,7 @@ impl JsonSchema for Params {
 				"name": {"type": "string"},
 				"agent": {"type": "string"},
 				"task": {"type": "string"},
-				"effort": {"type": "string", "enum": ["lo", "med", "hi"]},
+				"effort": {"type": "string", "enum": ["lo", "med", "hi", "low", "medium", "high"]},
 				"outputSchema": {
 					"oneOf": [
 						{"type": "object"},
@@ -130,7 +157,7 @@ impl JsonSchema for Params {
 							"name": {"type": "string"},
 							"agent": {"type": "string"},
 							"task": {"type": "string"},
-							"effort": {"type": "string", "enum": ["lo", "med", "hi"]},
+							"effort": {"type": "string", "enum": ["lo", "med", "hi", "low", "medium", "high"]},
 							"outputSchema": {
 								"oneOf": [
 									{"type": "object"},
@@ -579,6 +606,49 @@ mod tests {
 		assert_eq!(bare.tasks[0].name.as_deref(), Some("alpha"));
 		assert_eq!(batch.tasks.len(), 2);
 		assert_eq!(batch.tasks[1].effort, Some(TaskEffort::Lo));
+	}
+
+	#[test]
+	fn task_reads_effort_by_its_plain_words_too() {
+		// The exact shape a model produced: a batch with `effort: "high"`.
+		let batch = serde_json::from_value::<Params>(serde_json::json!({
+			"tasks": [
+				{"name": "inspect-icon", "task": "first", "effort": "high"},
+				{"name": "inspect-build", "task": "second", "effort": "high"}
+			]
+		}))
+		.expect("`high` reads as the highest effort")
+		.into_batch();
+		assert_eq!(batch.tasks[0].effort, Some(TaskEffort::Hi));
+		for (word, effort) in [
+			("low", TaskEffort::Lo),
+			("minimal", TaskEffort::Lo),
+			("medium", TaskEffort::Med),
+			("xhigh", TaskEffort::Hi),
+			("max", TaskEffort::Hi),
+			("hi", TaskEffort::Hi),
+		] {
+			let single = serde_json::from_value::<Params>(serde_json::json!({
+				"task": "one", "effort": word
+			}))
+			.unwrap_or_else(|error| panic!("{word}: {error}"))
+			.into_batch();
+			assert_eq!(single.tasks[0].effort, Some(effort), "{word}");
+		}
+	}
+
+	#[test]
+	fn task_names_the_bad_field_instead_of_no_variant_matched() {
+		let error = serde_json::from_value::<Params>(serde_json::json!({
+			"tasks": [{"task": "one", "effort": "extreme"}]
+		}))
+		.expect_err("an unknown effort is still refused");
+		let message = error.to_string();
+		assert!(message.contains("extreme"), "names the value: {message}");
+		assert!(
+			!message.contains("did not match any variant"),
+			"the untagged wording is gone: {message}"
+		);
 	}
 
 	#[test]
