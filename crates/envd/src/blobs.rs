@@ -1092,10 +1092,16 @@ impl BlobHost {
 		let Ok(hash) = parse_hash(&request.hash) else {
 			return false;
 		};
+		// The lease is keyed by the session the verdict was retained under, which
+		// a scoped get names when it can; an invocation retained without one is
+		// looked up that way too.
 		self.retention.as_ref().is_some_and(|retention| {
-			retention
-				.pending_for(session_id, invocation_id, hash)
-				.unwrap_or(false)
+			let under = |session: Option<&str>| {
+				retention
+					.pending_for(session, invocation_id, hash)
+					.unwrap_or(false)
+			};
+			under(session_id) || (session_id.is_some() && under(None))
 		})
 	}
 

@@ -4368,14 +4368,17 @@ impl EnvServer {
 			.await;
 			return;
 		}
+		// A get that names the verdict this scope's own invocation published. The
+		// scope need not carry an agent id for this, unlike delivery provenance:
+		// the invocation and the retention lease are the authority.
 		let own_verdict = match &body {
 			client_frame::Body::BlobGet(request) => scope
 				.as_ref()
-				.and_then(verdict_delivery_provenance)
-				.is_some_and(|delivery| {
+				.filter(|scope| !scope.invocation_id.is_empty())
+				.is_some_and(|scope| {
 					self.blobs.is_pending_verdict(
-						Some(delivery.session_id.as_str()),
-						delivery.invocation_id.as_str(),
+						(!scope.session_id.is_empty()).then_some(scope.session_id.as_str()),
+						scope.invocation_id.as_str(),
 						request,
 					)
 				}),
