@@ -1141,7 +1141,11 @@ async fn production_assembly_with_catalog(
 		oauth_custom,
 		refresh_coordinator,
 	));
-	let refreshing = Arc::new(RefreshingCredentialSource::new(stored.clone(), refresh.clone()));
+	// Rejections reported through the broker demote the credential in the one
+	// shared pool, so selection stops offering a revoked account.
+	let refreshing = Arc::new(
+		RefreshingCredentialSource::new(stored.clone(), refresh.clone()).with_pool(accounts.clone()),
+	);
 	let aws = AwsCredentialSource::system();
 	let invocation_supplies_aws_bearer = invocation_key.as_ref().is_some_and(|(provider, _)| {
 		catalog.provider(provider).is_some_and(|provider| {

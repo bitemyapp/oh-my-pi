@@ -13,7 +13,7 @@ use crate::{
 	answer::{AnswerKind, SearchFailureKind, SearchProviderFailure},
 	auth::AwsCredentialError,
 	catalog::{OperationKind, ProviderId, RouteId},
-	id::RequestId,
+	id::{AccountId, RequestId},
 	operation::{MediaOperationError, discovery::CatalogDiscoveryProjectorError},
 	receipt::{ExecutionReceipt, ReasonId},
 };
@@ -600,6 +600,16 @@ impl Error {
 		&self.evidence.receipt
 	}
 
+	/// The account that served the failing attempt, when one did: the last
+	/// attempt in the receipt is the one whose failure this is.
+	pub fn account(&self) -> Option<&AccountId> {
+		self
+			.receipt()
+			.attempts
+			.last()
+			.and_then(|attempt| attempt.account.as_ref())
+	}
+
 	/// Mutably borrows partial accounting through the failure point.
 	pub fn receipt_mut(&mut self) -> &mut ExecutionReceipt {
 		&mut self.evidence.receipt
@@ -727,6 +737,11 @@ impl Display for Error {
 		}
 		if let Some(status) = self.status {
 			write!(formatter, " [http {status}]")?;
+		}
+		// The account that served the failing attempt, so a host can say which
+		// credential is at fault instead of guessing from a session pin.
+		if let Some(account) = self.account() {
+			write!(formatter, " for account {}", account.as_str())?;
 		}
 		if let Some(detail) = &self.evidence.detail {
 			write!(formatter, ": {detail}")?;
@@ -861,6 +876,55 @@ mod tests {
 		assert!(rendered.contains("(model_archived)"));
 		assert!(rendered.contains("[http 404]"));
 		assert!(rendered.contains("model does not exist"));
+	}
+
+	#[test]
+	fn display_names_the_account_that_served_the_failing_attempt() {
+		use crate::{
+			body::{AttemptBodyEvidence, Replayability, RetryDecision, RetryDecisionReason},
+			id::AccountId,
+			receipt::{AttemptOutcome, AttemptReceipt, Cost, ProviderEvidence, Usage},
+		};
+		let mut receipt = ExecutionReceipt::default();
+		receipt.record_attempt(AttemptReceipt {
+			index:             0,
+			hidden:            false,
+			provider:          None,
+			route:             None,
+			account:           Some(AccountId::from("openai-codex:tres")),
+			principal:         None,
+			body:              AttemptBodyEvidence {
+				opened:         true,
+				consumed:       false,
+				replayability:  Replayability::Replayable,
+				retry_decision: RetryDecision::Allow,
+				reason:         RetryDecisionReason::ReplayableSource,
+			},
+			outcome:           AttemptOutcome::FailedPreCommit,
+			usage:             Usage::default(),
+			cost:              Cost::default(),
+			provider_evidence: ProviderEvidence::default(),
+			elapsed:           Duration::ZERO,
+		});
+		let error = Error::new(
+			ErrorKind::Authentication,
+			ErrorPhase::Handshake,
+			RetryAction::Never,
+			receipt,
+		)
+		.code(sf!("token_revoked"))
+		.status(Some(401));
+		assert_eq!(error.account().map(AccountId::as_str), Some("openai-codex:tres"));
+		let rendered = error.to_string();
+		assert!(rendered.contains("[http 401] for account openai-codex:tres"), "{rendered}");
+		let bare = Error::new(
+			ErrorKind::Authentication,
+			ErrorPhase::Handshake,
+			RetryAction::Never,
+			ExecutionReceipt::default(),
+		);
+		assert!(bare.account().is_none());
+		assert!(!bare.to_string().contains("for account"));
 	}
 
 	#[test]

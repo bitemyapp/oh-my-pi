@@ -521,6 +521,18 @@ impl AccountPool {
 		self.state.read().accounts.get(account).cloned()
 	}
 
+	/// Whether the account's current credential has been reported rejected —
+	/// the same test `select` applies as `Eligibility::CredentialRejected`, so
+	/// a listing can show what the balancer will refuse. A re-authentication
+	/// mints a newer generation and clears it.
+	pub fn credential_rejected(&self, account: &AccountId<str>) -> bool {
+		let state = self.state.read();
+		match (state.accounts.get(account), state.rejections.get(account)) {
+			(Some(record), Some(rejection)) => record.credential_generation <= rejection.generation,
+			_ => false,
+		}
+	}
+
 	/// Returns every account metadata snapshot in stable account-ID order.
 	pub fn accounts(&self) -> Vec<AccountRecord> {
 		self.state.read().accounts.values().cloned().collect()
@@ -1148,6 +1160,31 @@ mod tests {
 		assert_eq!(record.routes, expected);
 		assert_eq!(pool.rebind_routes(catalog).expect("rebind again"), 0);
 	}
+	#[test]
+	fn a_rejected_credential_is_reported_until_a_newer_one_is_minted() {
+		let pool = AccountPool::new();
+		let account = AccountId::from("openai-codex:tres");
+		let record = |generation| AccountRecord {
+			account:               account.clone(),
+			principal:             PrincipalId::from("tres"),
+			provider:              ProviderId::from("openai-codex"),
+			routes:                BTreeSet::new(),
+			enabled:               true,
+			credential_generation: generation,
+			routing:               AccountRoutingContext::default(),
+		};
+		pool.upsert(record(3)).expect("register");
+		assert!(!pool.credential_rejected(&account), "nothing reported yet");
+		pool
+			.reject_credential(account.clone(), 3, SystemTime::now())
+			.expect("reject");
+		assert!(pool.credential_rejected(&account), "the rejected generation is refused");
+		// A newer credential — a re-authentication — re-admits the account.
+		pool.upsert(record(4)).expect("re-authenticate");
+		assert!(!pool.credential_rejected(&account));
+		assert!(!pool.credential_rejected(&AccountId::from("openai-codex:unknown")));
+	}
+
 	#[test]
 	fn forget_removes_the_account_durably_so_it_does_not_resurrect() {
 		let directory = tempfile::tempdir().expect("temporary directory");

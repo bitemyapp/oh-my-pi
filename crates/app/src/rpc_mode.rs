@@ -2959,6 +2959,9 @@ fn inference_error_fields(error: &omp_ai::Error) -> Map<String, Value> {
 	if let Some(code) = &error.code {
 		fields.insert("errorCode".into(), json!(code.as_str()));
 	}
+	if let Some(account) = error.account() {
+		fields.insert("errorAccount".into(), json!(account.as_str()));
+	}
 	if let Some(detail) = error.detail_ref() {
 		fields.insert("errorDetail".into(), json!(detail.to_string()));
 	}
@@ -3124,6 +3127,52 @@ mod tests {
 		spec.capabilities.chat.as_mut().expect("chat").service_tiers = Availability::Unsupported;
 		assert_eq!(offered_service_tiers(&spec), Some(Vec::new()));
 		assert!(!offers_fast_tier(&spec));
+	}
+
+	#[test]
+	fn agent_end_error_fields_name_the_account_that_served_the_failing_attempt() {
+		use omp_ai::{
+			body::{AttemptBodyEvidence, Replayability, RetryDecision, RetryDecisionReason},
+			id::AccountId,
+			receipt::{AttemptOutcome, AttemptReceipt, Cost, ProviderEvidence, Usage},
+		};
+		let mut receipt = ExecutionReceipt::default();
+		receipt.record_attempt(AttemptReceipt {
+			index:             0,
+			hidden:            false,
+			provider:          None,
+			route:             None,
+			account:           Some(AccountId::from("openai-codex:tres")),
+			principal:         None,
+			body:              AttemptBodyEvidence {
+				opened:         true,
+				consumed:       false,
+				replayability:  Replayability::Replayable,
+				retry_decision: RetryDecision::Allow,
+				reason:         RetryDecisionReason::ReplayableSource,
+			},
+			outcome:           AttemptOutcome::FailedPreCommit,
+			usage:             Usage::default(),
+			cost:              Cost::default(),
+			provider_evidence: ProviderEvidence::default(),
+			elapsed:           std::time::Duration::ZERO,
+		});
+		let error = omp_ai::Error::new(
+			ErrorKind::Authentication,
+			ErrorPhase::Handshake,
+			RetryAction::Never,
+			receipt,
+		)
+		.status(Some(401))
+		.code(Str::new("token_revoked"));
+		assert_eq!(inference_error_fields(&error)["errorAccount"], json!("openai-codex:tres"));
+		let bare = omp_ai::Error::new(
+			ErrorKind::Authentication,
+			ErrorPhase::Handshake,
+			RetryAction::Never,
+			ExecutionReceipt::default(),
+		);
+		assert!(inference_error_fields(&bare).get("errorAccount").is_none());
 	}
 
 	#[test]

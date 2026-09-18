@@ -961,15 +961,27 @@ enum OAuthRefreshRuntime {
 /// coordinator, then acquisition is replayed exactly once.
 #[derive(Clone)]
 pub struct RefreshingCredentialSource {
-	stored:  Arc<dyn CredentialSource>,
-	refresh: Arc<dyn AuthRefreshEngine>,
-	skew:    time::Duration,
+	stored:   Arc<dyn CredentialSource>,
+	refresh:  Arc<dyn AuthRefreshEngine>,
+	skew:     time::Duration,
+	/// The shared account pool a reported rejection demotes the credential in;
+	/// without one a rejection is acknowledged and nothing else.
+	accounts: Option<AccountPool>,
 }
 
 impl RefreshingCredentialSource {
 	/// Wraps a stored credential source with routine OAuth refresh.
 	pub fn new(stored: Arc<dyn CredentialSource>, refresh: Arc<dyn AuthRefreshEngine>) -> Self {
-		Self { stored, refresh, skew: time::Duration::from_secs(60) }
+		Self { stored, refresh, skew: time::Duration::from_secs(60), accounts: None }
+	}
+
+	/// Lets a rejection reported through this source demote the credential in
+	/// the shared account pool, so selection stops offering the account until a
+	/// newer credential is minted for it.
+	#[must_use]
+	pub fn with_pool(mut self, accounts: AccountPool) -> Self {
+		self.accounts = Some(accounts);
+		self
 	}
 
 	#[cfg(test)]
@@ -978,7 +990,7 @@ impl RefreshingCredentialSource {
 		refresh: Arc<dyn AuthRefreshEngine>,
 		skew: time::Duration,
 	) -> Self {
-		Self { stored, refresh, skew }
+		Self { stored, refresh, skew, accounts: None }
 	}
 
 	fn apply_skew(&self, need: &mut CredentialNeed) {
@@ -1076,6 +1088,22 @@ impl CredentialSource for RefreshingCredentialSource {
 		lease: &'a CredentialLease,
 		evidence: AuthRejection,
 	) -> CredentialFuture<'a, Result<(), CredentialError>> {
+		// A credential the provider will not accept is demoted in the pool by its
+		// generation: a refresh that mints a newer one re-admits the account on its
+		// own, one that cannot leaves it excluded. A 403 is a route or entitlement
+		// matter, not the credential, so it is left alone.
+		if let Some(accounts) = &self.accounts
+			&& matches!(
+				evidence.kind,
+				super::AuthRejectionKind::Invalid
+					| super::AuthRejectionKind::Expired
+					| super::AuthRejectionKind::RefreshRejected
+					| super::AuthRejectionKind::Disabled
+			)
+		{
+			let meta = lease.meta();
+			let _ = accounts.reject_credential(meta.account.clone(), meta.generation, SystemTime::now());
+		}
 		self.stored.reject(lease, evidence)
 	}
 }
@@ -1528,6 +1556,10 @@ impl AuthManager {
 							AccountState::Disabled
 						} else if credential_missing(&self.catalog, &self.store, &record) {
 							AccountState::LoggedOut
+						} else if self.accounts.credential_rejected(&record.account) {
+							// A provider rejected this credential and no newer one has been
+							// minted since: the balancer refuses it, so the listing says so.
+							AccountState::RefreshRequired
 						} else {
 							AccountState::Active
 						};
