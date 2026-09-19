@@ -14,13 +14,13 @@ use std::{
 
 use futures::StreamExt as _;
 use http::{HeaderName, HeaderValue};
-use ring::rand::{SecureRandom as _, SystemRandom};
 use omp_catalog::{
 	NativeToolChoicePenalty, OperationBits, OperationKind, ToolFeatureBits, WireModelId,
 	provider::{AuthSpecKind, CodecProfile, DiscoveryKind, RouteDef, TransportKind},
 	snapshot::Catalog,
 };
 use omp_core::{ExposeSecret as _, Str, sf};
+use ring::rand::{SecureRandom as _, SystemRandom};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use tower::{Service, ServiceExt as _, util::BoxCloneSyncService};
 use url::Url;
@@ -1735,16 +1735,31 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 			"request.pre_dispatch",
 			&capture_payload,
 		);
-		let mut timeout = self.transport_timeout;
-		if let Some(hook_timeout) = mutation.timeout {
-			timeout = timeout.min(hook_timeout);
+		// The transport's own timeout bounds only a wait for the provider to
+		// start — the headers and the first frame — never how long the model
+		// may think: a reasoning model is silent for as long as it reasons,
+		// and a total bound applied to the body killed long turns as "timed
+		// out waiting for stream.body". A hook's timeout, a call deadline, and
+		// the elapsed budget are the caller's bounds on the whole attempt;
+		// they cap the start as well.
+		let mut elapsed_limit: Option<Duration> = None;
+		for bound in [
+			mutation.timeout,
+			call
+				.deadline
+				.map(|deadline| deadline.saturating_duration_since(Instant::now())),
+			call
+				.budget
+				.max_elapsed
+				.map(|maximum| maximum.saturating_sub(execution.elapsed())),
+		]
+		.into_iter()
+		.flatten()
+		{
+			elapsed_limit = Some(elapsed_limit.map_or(bound, |current| current.min(bound)));
 		}
-		if let Some(deadline) = call.deadline {
-			timeout = timeout.min(deadline.saturating_duration_since(Instant::now()));
-		}
-		if let Some(max_elapsed) = call.budget.max_elapsed {
-			timeout = timeout.min(max_elapsed.saturating_sub(execution.elapsed()));
-		}
+		let timeout =
+			elapsed_limit.map_or(self.transport_timeout, |limit| self.transport_timeout.min(limit));
 		if timeout.is_zero() {
 			return Err(Error::new(
 				ErrorKind::DeadlineExceeded,
@@ -1810,6 +1825,12 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 					.streaming
 					.watchdog
 					.and_then(omp_catalog::StreamWatchdog::first_event_timeout),
+				idle_timeout: plan
+					.wire_policy
+					.streaming
+					.watchdog
+					.and_then(omp_catalog::StreamWatchdog::idle_timeout),
+				elapsed_limit,
 			},
 		})
 	}
@@ -2563,10 +2584,7 @@ impl SemanticPolicy<Call> for CanonicalSemantic {
 	}
 
 	fn secure_spool(&self, call: &Call) -> Result<Option<Box<dyn SecureGateSpool>>, Box<Error>> {
-		Ok(gate_spool(
-			&call.budget,
-			call.staging.as_ref().map(|staging| &staging.cancellation),
-		))
+		Ok(gate_spool(&call.budget, call.staging.as_ref().map(|staging| &staging.cancellation)))
 	}
 }
 

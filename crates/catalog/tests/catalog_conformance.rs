@@ -2040,3 +2040,38 @@ fn catalog_references_and_advertised_capabilities_are_internally_complete() {
 		}
 	}
 }
+
+#[test]
+fn responses_routes_bound_silence_between_frames_not_the_whole_response() {
+	// The transport's attempt timeout covers a response's start alone; what
+	// bounds a started response is the route's idle watchdog, so the models
+	// whose stream is silent while they reason must carry one. The value is
+	// the Codex CLI's own `stream_idle_timeout_ms` default. (A provider's
+	// default policy comes from the oracle alone, not the cascade, so the
+	// fact is asserted on the census models.)
+	let embedded = Catalog::embedded();
+	for provider_id in ["openai-codex", "openai"] {
+		let prefix = format!("{provider_id}/");
+		let mut seen = 0;
+		for model in embedded
+			.models()
+			.iter()
+			.filter(|model| model.key.as_str().starts_with(&prefix))
+		{
+			let policy = embedded
+				.wire_policy(&model.wire_policy)
+				.expect("model wire policy");
+			assert_eq!(
+				policy
+					.streaming
+					.watchdog
+					.and_then(omp_catalog::policy::StreamWatchdog::idle_timeout),
+				Some(std::time::Duration::from_secs(300)),
+				"{}",
+				model.key
+			);
+			seen += 1;
+		}
+		assert!(seen > 0, "{provider_id} has census models");
+	}
+}

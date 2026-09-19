@@ -50,8 +50,10 @@ use crate::{
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	receipt::{ExecutionReceipt, ReasonId},
 	transport::{
-		Frame, FramingError, SseDecoder, WebSocketMessage, capture::CaptureSnapshot,
+		Frame, FramingError, SseDecoder, WebSocketMessage,
+		capture::CaptureSnapshot,
 		http::record_failure,
+		lifetime::{started_bound, wait_until},
 	},
 };
 
@@ -628,7 +630,6 @@ async fn run_attempt(
 		attempt.status,
 		attempt.provider_request_id.clone(),
 		stall_after_commit,
-		deadline,
 		started,
 	));
 	Ok(HandshakenResponse {
@@ -841,7 +842,9 @@ async fn run_realtime_attempt(
 					Err(_) => break,
 				},
 				() = poll_fn(|context| cancel.poll_cancelled(context)) => break,
-				() = time::sleep_until(deadline.0) => {
+				// The session is established: the start bound is spent, and only
+				// the route's idle bound and the caller's limit remain.
+				() = wait_until(started_bound(&transport_attempt, started).map(|(at, _)| at)) => {
 					cancel.cancel();
 					let error = record_failure(deadline_exceeded(true), &transport_attempt, &pump_evidence, status, provider_request_id.as_ref(), started, true);
 					let _ = inbound_tx.send_async(Err(error)).await;
@@ -1132,14 +1135,25 @@ struct CassetteEventStream {
 	status:              Option<u16>,
 	provider_request_id: Option<Str>,
 	stall_after_commit:  bool,
-	deadline:            Pin<Box<Sleep>>,
+	stall:               Stall,
 	started:             Instant,
 	emitted:             bool,
 	finished:            bool,
 }
 
+/// The bound on a committed stall — silence from a provider that has
+/// started, which the start deadline no longer touches.
+enum Stall {
+	/// The stream has not run dry yet.
+	Unarmed,
+	/// Ends at the route's idle bound or the caller's limit.
+	Bounded(Pin<Box<Sleep>>),
+	/// Ends only through cancellation.
+	Unbounded,
+}
+
 impl CassetteEventStream {
-	fn new(
+	const fn new(
 		items: VecDeque<RawEvent>,
 		cancel: Cancellation,
 		attempt: TransportAttempt,
@@ -1147,7 +1161,6 @@ impl CassetteEventStream {
 		status: Option<u16>,
 		provider_request_id: Option<Str>,
 		stall_after_commit: bool,
-		deadline: AttemptDeadline,
 		started: Instant,
 	) -> Self {
 		Self {
@@ -1158,7 +1171,7 @@ impl CassetteEventStream {
 			status,
 			provider_request_id,
 			stall_after_commit,
-			deadline: Box::pin(time::sleep_until(deadline.0)),
+			stall: Stall::Unarmed,
 			started,
 			emitted: false,
 			finished: false,
@@ -1207,7 +1220,31 @@ impl Stream for CassetteEventStream {
 				Poll::Ready(Some(Ok(event)))
 			},
 			None if self.stall_after_commit => {
-				if self.deadline.as_mut().poll(context).is_pending() {
+				if self.cancel.poll_cancelled(context).is_ready() {
+					self.finished = true;
+					let error = record_failure(
+						cancelled(true),
+						&self.attempt,
+						&self.evidence,
+						self.status,
+						self.provider_request_id.as_ref(),
+						self.started,
+						true,
+					);
+					return Poll::Ready(Some(Err(error)));
+				}
+				if matches!(self.stall, Stall::Unarmed) {
+					self.stall = match started_bound(&self.attempt, self.started) {
+						Some((at, _)) => Stall::Bounded(Box::pin(time::sleep_until(at))),
+						None => Stall::Unbounded,
+					};
+				}
+				let pending = match &mut self.stall {
+					Stall::Bounded(deadline) => deadline.as_mut().poll(context).is_pending(),
+					Stall::Unbounded => true,
+					Stall::Unarmed => unreachable!("armed above"),
+				};
+				if pending {
 					return Poll::Pending;
 				}
 				self.finished = true;

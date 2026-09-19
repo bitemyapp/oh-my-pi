@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "source_digest": "d4e84b5fa49e2094da41789d507ae638834754977a8e3fe69213c3c553fbc2bb",
+  "source_digest": "758a8851d99e574a80136f0f41663f11db3d5af8654d083286f49d1aa206e6e7",
   "inputs": [
     {
       "id": "catalog.models.compressed.v1",
@@ -479,13 +479,13 @@
     {
       "id": "compat.cascade.providers.openai-codex.v1",
       "path": "crates/catalog/compat/providers/openai-codex.kdl",
-      "sha256": "56b7d3a9ee8b1ca1c387063499728e49bb5680b6abcf7ab06910055992f98381",
+      "sha256": "e61e10d71db761673d8b8f305a2002f0c70f50035f308ab237f13bf2c6bffaf2",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
       "id": "compat.cascade.providers.openai.v1",
       "path": "crates/catalog/compat/providers/openai.kdl",
-      "sha256": "60e1c230afce2877df30e10cd8264a657f990cff499ca4e5978efe557fea0f11",
+      "sha256": "7e9975bf1c0bf7a539293cab84a5d8d63c5c20c5a9f38d3561f7fab9b8896757",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {

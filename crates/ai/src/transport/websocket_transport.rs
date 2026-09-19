@@ -37,6 +37,7 @@ use crate::{
 		Frame, FramingProtocol, WebSocketMessage,
 		cassette::{CapturedFrame, capture_frame, is_commit_candidate},
 		http::{emit_provider_response, record_failure, request_id, sanitize_headers},
+		lifetime::{FirstEventBound, StartedBound, first_event_bound, started_bound, wait_until},
 	},
 };
 
@@ -350,7 +351,20 @@ async fn execute(
 		let pump_provider_request_id = provider_request_id.clone();
 		tokio::spawn(async move {
 			let mut emitted = false;
+			// Until the first message the socket is waiting for the provider
+			// to start and the start bound applies; from then on only the
+			// route's idle bound and the caller's limit may end a wait.
+			let mut framed = false;
 			loop {
+				let (bound, name) = if framed {
+					match started_bound(&pump_attempt, started) {
+						Some((at, StartedBound::Idle)) => (Some(at), "websocket-idle-timeout"),
+						Some((at, StartedBound::Elapsed)) => (Some(at), "websocket-timeout"),
+						None => (None, "websocket-timeout"),
+					}
+				} else {
+					(Some(deadline), "websocket-first-frame-timeout")
+				};
 				tokio::select! {
 					input = async {
 						match control_rx.as_ref() {
@@ -416,7 +430,7 @@ async fn execute(
 							},
 						}
 					},
-					message = socket.next() => match message {
+					message = socket.next() => { framed = true; match message {
 						Some(Ok(Message::Ping(data))) => {
 							if socket.send(Message::Pong(data)).await.is_err() {
 								let error = pump_error(
@@ -511,12 +525,12 @@ async fn execute(
 							let _ = event_tx.send_async(Err(error)).await;
 							break;
 						},
-					},
+					} },
 					() = poll_fn(|context| cancel.poll_cancelled(context)) => break,
-					() = tokio::time::sleep_until(deadline) => {
+					() = wait_until(bound) => {
 						cancel.cancel();
 						let error = pump_error(
-							simple_error(ErrorKind::DeadlineExceeded, ErrorPhase::Streaming, emitted, "websocket-timeout"),
+							simple_error(ErrorKind::DeadlineExceeded, ErrorPhase::Streaming, emitted, name),
 							&pump_attempt,
 							&pump_evidence,
 							status,
@@ -534,12 +548,19 @@ async fn execute(
 		// arrives. A failed attempt drops this preamble before retry, so downstream
 		// never receives an orphaned open block that would need a synthetic end.
 		let mut preamble = Vec::new();
+		// The pump bounds silence between messages; what bounds the first
+		// *visible* event is the route's watchdog and the caller's limit.
+		let first_event_deadline = first_event_bound(&attempt, started);
 		loop {
 			let first = tokio::select! {
 				first = event_rx.recv_async() => first.map_err(|_| failure(simple_error(ErrorKind::Connectivity, ErrorPhase::Handshake, false, "websocket-close-before-first-frame"), &request, &evidence, started, false))?,
-				() = tokio::time::sleep_until(deadline) => {
+				() = wait_until(first_event_deadline.map(|(at, _)| at)) => {
 					request.cancel.cancel();
-					return Err(failure(simple_error(ErrorKind::DeadlineExceeded, ErrorPhase::Handshake, false, "websocket-first-frame-timeout"), &request, &evidence, started, false));
+					let name = match first_event_deadline {
+						Some((_, FirstEventBound::Watchdog)) => "websocket-first-event-timeout",
+						_ => "websocket-timeout",
+					};
+					return Err(failure(simple_error(ErrorKind::DeadlineExceeded, ErrorPhase::Handshake, false, name), &request, &evidence, started, false));
 				},
 			};
 			match first {
@@ -840,7 +861,9 @@ async fn execute(
 					let _ = inbound_tx.send_async(Err(error)).await;
 					break;
 				},
-				() = tokio::time::sleep_until(deadline) => {
+				// The session is established: the start bound is spent, and only
+				// the route's idle bound and the caller's limit remain.
+				() = wait_until(started_bound(&pump_attempt, started).map(|(at, _)| at)) => {
 					cancel.cancel();
 					let _ = socket.send(Message::Close(None)).await;
 					let error = pump_error(simple_error(ErrorKind::DeadlineExceeded, ErrorPhase::Streaming, true, "websocket-timeout"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, true);

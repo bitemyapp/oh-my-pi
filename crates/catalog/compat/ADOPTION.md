@@ -2,7 +2,7 @@
 
 Every newly synced wire/thinking compatibility axis is parsed into a typed catalog policy. A `consumed` row names the inference consumer and the test reproducing pi's observable shape. A `stored-only` row is an honest gap: the fact is compiled and typed, but the named boundary cannot consume it yet. Stored-only axes are not silently treated as unsupported.
 
-Primary ledger: **70 axes — 52 consumed, 18 stored-only.**
+Primary ledger: **71 axes — 53 consumed, 18 stored-only.**
 
 | axis | set | WirePolicy field | codec file | test name | status |
 |---|---|---|---|---|---|
@@ -44,6 +44,7 @@ Primary ledger: **70 axes — 52 consumed, 18 stored-only.**
 | `requires-tool-result-name` | wire | `policy.tool.requires_result_name` | `crates/inference/src/codec/openai_chat.rs` | `requires_tool_result_name_matches_pi_request_shape` | consumed |
 | `retry-without-strict-on-grammar-error` | wire | `policy.tool.retry_without_strict_on_grammar_error` | `crates/inference/src/layer/recover.rs` | — | stored-only: requires attempt-level mutation after a typed prebody provider rejection; stream recovery cannot perform it |
 | `stream-first-event-timeout-ms` | wire | `policy.streaming.watchdog.first_event_ms` | `crates/inference/src/transport/http.rs` | `stream_first_event_timeout_ms_matches_pi_behavior` | consumed |
+| `stream-idle-timeout-ms` | wire | `policy.streaming.watchdog.idle_ms` | `crates/inference/src/transport/http.rs`; `crates/inference/src/transport/websocket_transport.rs` | `the_route_idle_bound_caps_silence_between_frames`; `a_started_response_may_be_silent_longer_than_the_start_bound` | consumed |
 | `stream-markup-healing-pattern` | wire | `policy.streaming.markup_healing_pattern` | `crates/inference/src/recovery/projection.rs`; `crates/inference/src/layer/recover.rs` | `configured_dialect_pipeline_projects_canonical_tool_events`; `live_dialect_projection_suppresses_source_text_blocks_and_avoids_index_collisions` | consumed |
 | `strict-responses-pairing` | wire | `policy.tool.strict_responses_pairing` | `crates/inference/src/codec/openai_responses.rs` | `strict_responses_pairing_matches_pi_request_shape` | consumed |
 | `strip-deepseek-special-tokens` | wire | `policy.streaming.strip_deepseek_special_tokens` | `crates/inference/src/codec/openai_chat.rs` | `strip_deepseek_special_tokens_matches_pi_request_shape` | consumed |

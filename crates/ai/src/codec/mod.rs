@@ -1023,11 +1023,21 @@ pub struct TransportAttempt {
 	pub index:               u32,
 	/// Whether events remain provisional behind an output gate.
 	pub provisional:         bool,
-	/// Attempt-local timeout after composing the call deadline, remaining
-	/// execution budget, and transport bound.
+	/// How long a wait for the provider to *start* may last: opening the
+	/// request body, the response headers, and the first body frame. Once a
+	/// response has begun it no longer applies — a reasoning model is silent
+	/// for as long as it reasons — and how long the provider may then take is
+	/// the route's `idle_timeout` and the caller's `elapsed_limit`.
 	pub timeout:             Duration,
 	/// Maximum wait after response headers for the first decoded commit event.
 	pub first_event_timeout: Option<Duration>,
+	/// The route's bound on silence between body frames, re-armed on every
+	/// frame; `None` leaves a started response to the caller's bound.
+	pub idle_timeout:        Option<Duration>,
+	/// The caller's bound on the whole attempt from its start — a call
+	/// deadline, a hook's timeout, or the elapsed budget; `None` means the
+	/// caller owns the lifetime through cancellation.
+	pub elapsed_limit:       Option<Duration>,
 	/// Maximum sanitized capture bytes for observability or cassettes.
 	pub capture_limit:       u64,
 }

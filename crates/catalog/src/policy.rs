@@ -459,12 +459,18 @@ policy_enum!(/// A typed fixed reasoning-body toggle.
 );
 
 /// First-event and inter-event stream timeout guidance.
+///
+/// These are the only bounds the transport applies once a response has
+/// started: a reasoning model is silent for as long as it reasons, and the
+/// attempt timeout covers the start alone.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamWatchdog {
 	/// Maximum wait for the first decoded event in milliseconds.
 	pub first_event_ms: Option<u64>,
-	/// Maximum idle interval between decoded events in milliseconds.
+	/// Maximum silence between body frames in milliseconds, re-armed on
+	/// every frame; absent leaves a started response to the caller's own
+	/// limit or cancellation.
 	pub idle_ms:        Option<u64>,
 }
 

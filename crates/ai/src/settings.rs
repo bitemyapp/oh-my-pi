@@ -415,7 +415,11 @@ pub struct ProviderRuntimeSettings {
 	pub max_in_flight:            BTreeMap<Str, usize>,
 	/// Maximum queued callers per provider before backpressure fails fast.
 	pub max_queued:               usize,
-	/// Per-transport-attempt timeout in seconds.
+	/// Bound in seconds on a transport attempt's *start*: connecting, the
+	/// request body, the response headers, and the first frame. A response
+	/// that has started is bounded by the route's stream watchdog and by
+	/// `call_timeout_seconds`, never by this — a reasoning model is silent
+	/// for as long as it reasons.
 	pub timeout_seconds:          u64,
 	/// Overall logical-call timeout in seconds; zero leaves caller deadlines
 	/// authoritative.

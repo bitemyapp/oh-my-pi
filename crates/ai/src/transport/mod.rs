@@ -9,6 +9,7 @@ pub mod encoding;
 pub mod eventstream;
 pub mod frame;
 pub mod http;
+mod lifetime;
 pub mod ndjson;
 pub mod proxy;
 pub mod sse;

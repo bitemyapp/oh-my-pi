@@ -37,6 +37,9 @@ use tower::{Service, ServiceExt as _};
 use url::Url;
 use zeroize::Zeroizing;
 
+use super::lifetime::{
+	FirstEventBound, StartedBound, first_event_bound, started_bound, wait_until,
+};
 use crate::{
 	account::{RetryAfterInput, parse_retry_after},
 	body::{
@@ -883,20 +886,21 @@ async fn execute(
 		content,
 	);
 	let mut event_stream: RawEventStream = Box::pin(event_stream);
-	let watchdog_deadline = attempt
-		.first_event_timeout
-		.map(|timeout| Instant::now() + timeout);
-	let first_event_deadline = watchdog_deadline.map_or(deadline, |watchdog| watchdog.min(deadline));
+	// The provider has started by the time this waits, and the body's own
+	// wait bounds silence between frames. What bounds the first *visible*
+	// event is the route's watchdog, when it has one, and the caller's limit
+	// on the whole attempt — not the start bound: a reasoning model is
+	// silent for as long as it reasons.
+	let first_event_deadline = first_event_bound(&attempt, started);
 	let mut preamble = VecDeque::new();
 	let first_visible = loop {
 		let next = tokio::select! {
 			event = event_stream.next() => event,
-			() = sleep_until(first_event_deadline) => {
+			() = wait_until(first_event_deadline.map(|(at, _)| at)) => {
 				transport.cancel.cancel();
-				let scope = if watchdog_deadline.is_some_and(|watchdog| watchdog <= deadline) {
-					"stream.first-event-timeout"
-				} else {
-					"stream.first-event"
+				let scope = match first_event_deadline {
+					Some((_, FirstEventBound::Watchdog)) => "stream.first-event-timeout",
+					_ => "stream.first-event",
 				};
 				let error = deadline_exceeded(false, started, scope);
 				return Err(record_failure(
@@ -1683,7 +1687,7 @@ fn decode_stream(
 	evidence: AttemptEvidenceHandle,
 	status: u16,
 	provider_request_id: Option<Str>,
-	deadline: Instant,
+	start_deadline: Instant,
 	started: Instant,
 	browser_retry: Option<(Arc<dyn BrowserFetch>, BrowserFetchRequest)>,
 	mut content: ContentDecoder,
@@ -1695,19 +1699,37 @@ fn decode_stream(
 		let mut capture_remaining = capture_limit;
 		let mut ordinal = 0_u64;
 		let mut emitted = false;
+		// Until the first frame the wait is for the provider to start and the
+		// start bound applies. From then on the provider is working, and only
+		// the route's idle bound between frames and the caller's limit on the
+		// whole attempt may end a wait: a reasoning model is silent for as
+		// long as it reasons.
+		let mut framed = false;
 		'response: loop {
+			let (bound, scope) = if framed {
+				match started_bound(&attempt, started) {
+					Some((at, StartedBound::Idle)) => (Some(at), "stream.idle"),
+					Some((at, StartedBound::Elapsed)) => (Some(at), "stream.body"),
+					None => (None, "stream.body"),
+				}
+			} else {
+				(Some(start_deadline), "stream.first-frame")
+			};
 			let next = tokio::select! {
 				next = incoming.frame() => next,
 				() = poll_fn(|context| cancel.poll_cancelled(context)) => {
 					yield Err(record_failure(cancelled(emitted), &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
 					break;
 				},
-				() = sleep_until(deadline) => {
+				() = wait_until(bound) => {
 					cancel.cancel();
-					yield Err(record_failure(deadline_exceeded(emitted, started, "stream.body"), &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+					yield Err(record_failure(deadline_exceeded(emitted, started, scope), &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
 					break;
 				},
 			};
+			if matches!(next, Some(Ok(_))) {
+				framed = true;
+			}
 			let mut ended = false;
 			let chunk = match next {
 				None => {

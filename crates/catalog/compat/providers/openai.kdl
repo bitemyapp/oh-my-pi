@@ -6,6 +6,10 @@ provider "openai" {
 	// Replaces both OpenAI tool-call id-limit baselines.
 	uses-openai-tool-call-id-limit #true
 	thinking-mode "effort"
+	// The Responses stream is silent while the model reasons and answers in
+	// one flush, so silence is bounded per frame, not per response; the
+	// Codex CLI's own client bounds it at 300 s (`stream_idle_timeout_ms`).
+	stream-idle-timeout-ms 300000
 	class "unknown" {
 		revision ">=5.6 <5.7" {
 			reasoning-disable-mode "none-effort"

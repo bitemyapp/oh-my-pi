@@ -219,6 +219,8 @@ fn request(
 			provisional:         false,
 			timeout:             time::Duration::from_secs(5),
 			first_event_timeout: None,
+			idle_timeout:        None,
+			elapsed_limit:       None,
 			capture_limit:       10,
 		},
 	}
@@ -973,7 +975,10 @@ async fn postcommit_stall_times_out_as_partial() {
 	)]));
 	service.ready().await.expect("cassette ready");
 	let mut call = request(BodySource::Bytes(Bytes::new()), EmitDecoder, Cancellation::default());
-	call.attempt.timeout = time::Duration::from_millis(5);
+	// The stall comes after a visible event: the start bound is spent, and
+	// the route's idle bound is what ends it.
+	call.attempt.timeout = time::Duration::from_secs(5);
+	call.attempt.idle_timeout = Some(time::Duration::from_millis(5));
 	let response = service.call(call).await.expect("visible event commits");
 	let mut events = response.events.expect("ordinary event stream");
 	assert!(matches!(events.next().await, Some(Ok(RawEvent::Chat(_)))));
@@ -981,6 +986,60 @@ async fn postcommit_stall_times_out_as_partial() {
 		panic!("stalled committed stream must time out");
 	};
 	assert_eq!(error.kind, ErrorKind::DeadlineExceeded);
+	assert!(error.committed);
+}
+
+#[tokio::test]
+async fn postcommit_stall_outlives_the_start_bound() {
+	let mut service = CassetteTransport::new(Arc::from([attempt(
+		CassetteBodyAction::Unopened,
+		CassetteTerminal::Stall,
+		1,
+	)]));
+	service.ready().await.expect("cassette ready");
+	let mut call = request(BodySource::Bytes(Bytes::new()), EmitDecoder, Cancellation::default());
+	call.attempt.timeout = time::Duration::from_millis(5);
+	call.attempt.idle_timeout = Some(time::Duration::from_millis(60));
+	let response = service.call(call).await.expect("visible event commits");
+	let mut events = response.events.expect("ordinary event stream");
+	assert!(matches!(events.next().await, Some(Ok(RawEvent::Chat(_)))));
+	let silent_since = time::Instant::now();
+	let Err(error) = events.next().await.expect("idle error") else {
+		panic!("stalled committed stream must time out at the idle bound");
+	};
+	assert_eq!(error.kind, ErrorKind::DeadlineExceeded);
+	assert!(error.committed);
+	assert!(
+		silent_since.elapsed() >= time::Duration::from_millis(60),
+		"the 5 ms start bound must not end a started response"
+	);
+}
+
+#[tokio::test]
+async fn postcommit_stall_without_a_bound_waits_for_cancellation() {
+	let mut service = CassetteTransport::new(Arc::from([attempt(
+		CassetteBodyAction::Unopened,
+		CassetteTerminal::Stall,
+		1,
+	)]));
+	service.ready().await.expect("cassette ready");
+	let cancel = Cancellation::default();
+	let mut call = request(BodySource::Bytes(Bytes::new()), EmitDecoder, cancel.clone());
+	call.attempt.timeout = time::Duration::from_millis(5);
+	let response = service.call(call).await.expect("visible event commits");
+	let mut events = response.events.expect("ordinary event stream");
+	assert!(matches!(events.next().await, Some(Ok(RawEvent::Chat(_)))));
+	assert!(
+		time::timeout(time::Duration::from_millis(50), events.next())
+			.await
+			.is_err(),
+		"with no idle bound and no caller limit, only cancellation ends the wait"
+	);
+	cancel.cancel();
+	let Err(error) = events.next().await.expect("cancellation error") else {
+		panic!("cancellation must end the stalled stream");
+	};
+	assert_eq!(error.kind, ErrorKind::Cancelled);
 	assert!(error.committed);
 }
 
@@ -1194,6 +1253,165 @@ async fn websocket_upgrade_sends_initial_frame_before_first_decodable_event() {
 	assert_eq!(captures.len(), 1);
 	assert_eq!(captures[0].frames.len(), 1);
 	assert_eq!(captures[0].frames[0].redaction, Bytes::from_static(b"<redacted>"));
+}
+
+/// One chunked-encoding chunk carrying one SSE event.
+const EVENT: &[u8] = b"9\r\ndata: x\n\n\r\n";
+/// The chunked-encoding terminator.
+const END: &[u8] = b"0\r\n\r\n";
+
+/// A fixture that answers with streaming headers, then writes `chunks` with
+/// the given pauses before each, then waits forever (aborted by the test).
+fn stalling_stream(
+	chunks: Vec<(time::Duration, &'static [u8])>,
+) -> (String, tokio::task::JoinHandle<()>) {
+	let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+	listener.set_nonblocking(true).expect("nonblocking fixture");
+	let address = listener.local_addr().expect("fixture address").to_string();
+	let server = tokio::spawn(async move {
+		let listener = TcpListener::from_std(listener).expect("tokio listener");
+		let (mut socket, _) = listener.accept().await.expect("accept fixture");
+		let mut request = [0_u8; 1024];
+		let _ = socket.read(&mut request).await.expect("read request");
+		socket
+			.write_all(
+				b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+			)
+			.await
+			.expect("write headers");
+		for (pause, chunk) in chunks {
+			tokio::time::sleep(pause).await;
+			socket.write_all(chunk).await.expect("write chunk");
+		}
+		future::pending::<()>().await;
+	});
+	(address, server)
+}
+
+fn timeout_scope(error: &Error) -> &str {
+	let Some(ErrorDetail::Timeout { scope, .. }) = error.detail_ref() else {
+		panic!("expected a typed timeout, got {:?}", error.detail_ref());
+	};
+	scope.0.as_str()
+}
+
+#[tokio::test]
+async fn a_started_response_may_be_silent_longer_than_the_start_bound() {
+	// The provider answers at once and then says nothing for four times the
+	// start bound — a reasoning model thinking — before it goes on.
+	let (address, server) = stalling_stream(vec![
+		(time::Duration::ZERO, EVENT),
+		(time::Duration::from_millis(400), EVENT),
+		(time::Duration::ZERO, END),
+	]);
+	let mut service = HttpTransport::new();
+	service.ready().await.expect("http ready");
+	let mut call = request(
+		BodySource::Bytes(Bytes::from_static(b"request")),
+		EmitDecoder,
+		Cancellation::default(),
+	);
+	call.encoded.uri = sf!("http://{address}/think");
+	call.encoded.framing = FramingProtocol::Sse;
+	call.attempt.timeout = time::Duration::from_millis(100);
+	let response = service
+		.call(call)
+		.await
+		.expect("the response started within the bound");
+	let mut events = response.events.expect("ordinary event stream");
+	let mut seen = 0;
+	while let Some(event) = events.next().await {
+		event.expect("silence after the start is not a timeout");
+		seen += 1;
+	}
+	assert_eq!(seen, 2, "both frames arrived");
+	server.abort();
+}
+
+#[tokio::test]
+async fn silence_before_the_first_frame_is_the_start_bound() {
+	let (address, server) = stalling_stream(Vec::new());
+	let mut service = HttpTransport::new();
+	service.ready().await.expect("http ready");
+	let mut call = request(
+		BodySource::Bytes(Bytes::from_static(b"request")),
+		EmitDecoder,
+		Cancellation::default(),
+	);
+	call.encoded.uri = sf!("http://{address}/stall");
+	call.encoded.framing = FramingProtocol::Sse;
+	call.attempt.timeout = time::Duration::from_millis(100);
+	let error = service
+		.call(call)
+		.await
+		.err()
+		.expect("no first frame within the bound");
+	assert_eq!(error.kind, ErrorKind::DeadlineExceeded);
+	assert_eq!(error.phase, ErrorPhase::Handshake);
+	assert!(!error.committed);
+	assert_eq!(timeout_scope(&error), "stream.first-frame");
+	server.abort();
+}
+
+#[tokio::test]
+async fn the_route_idle_bound_caps_silence_between_frames() {
+	let (address, server) = stalling_stream(vec![(time::Duration::ZERO, EVENT)]);
+	let mut service = HttpTransport::new();
+	service.ready().await.expect("http ready");
+	let mut call = request(
+		BodySource::Bytes(Bytes::from_static(b"request")),
+		EmitDecoder,
+		Cancellation::default(),
+	);
+	call.encoded.uri = sf!("http://{address}/idle");
+	call.encoded.framing = FramingProtocol::Sse;
+	call.attempt.timeout = time::Duration::from_secs(5);
+	call.attempt.idle_timeout = Some(time::Duration::from_millis(100));
+	let response = service.call(call).await.expect("the response started");
+	let mut events = response.events.expect("ordinary event stream");
+	assert!(events.next().await.expect("first event").is_ok());
+	let Err(error) = events.next().await.expect("idle timeout") else {
+		panic!("silence past the route's idle bound must surface as an error");
+	};
+	assert_eq!(error.kind, ErrorKind::DeadlineExceeded);
+	assert!(error.committed, "a frame had been delivered");
+	assert_eq!(timeout_scope(&error), "stream.idle");
+	server.abort();
+}
+
+#[tokio::test]
+async fn the_callers_limit_caps_the_whole_attempt_however_lively() {
+	// A trickle every 50 ms never trips an idle bound; the caller's limit
+	// on the whole attempt still ends it.
+	let mut chunks: Vec<(time::Duration, &'static [u8])> = vec![(time::Duration::ZERO, EVENT)];
+	chunks.extend((0..40).map(|_| (time::Duration::from_millis(50), EVENT)));
+	let (address, server) = stalling_stream(chunks);
+	let mut service = HttpTransport::new();
+	service.ready().await.expect("http ready");
+	let mut call = request(
+		BodySource::Bytes(Bytes::from_static(b"request")),
+		EmitDecoder,
+		Cancellation::default(),
+	);
+	call.encoded.uri = sf!("http://{address}/trickle");
+	call.encoded.framing = FramingProtocol::Sse;
+	call.attempt.timeout = time::Duration::from_secs(5);
+	call.attempt.idle_timeout = Some(time::Duration::from_secs(5));
+	call.attempt.elapsed_limit = Some(time::Duration::from_millis(300));
+	let response = service.call(call).await.expect("the response started");
+	let mut events = response.events.expect("ordinary event stream");
+	let mut error = None;
+	while let Some(event) = events.next().await {
+		if let Err(failure) = event {
+			error = Some(failure);
+			break;
+		}
+	}
+	let error = error.expect("the caller's limit ends the attempt");
+	assert_eq!(error.kind, ErrorKind::DeadlineExceeded);
+	assert!(error.committed);
+	assert_eq!(timeout_scope(&error), "stream.body");
+	server.abort();
 }
 
 #[tokio::test]
