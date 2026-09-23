@@ -654,7 +654,11 @@ fn node_text<'a>(dom: &'a Dom, handle: Handle, node: &'a Node) -> Option<&'a str
 /// reasoning items holds them as separate nodes, and gluing those ran one
 /// item's closing `**` into the next one's opening `**` ("…icon****Planning…").
 fn push_thinking_node(thinking: &mut String, value: &str) {
-	if !thinking.is_empty() && !value.is_empty() && !thinking.ends_with('\n') && !value.starts_with('\n') {
+	if !thinking.is_empty()
+		&& !value.is_empty()
+		&& !thinking.ends_with('\n')
+		&& !value.starts_with('\n')
+	{
 		thinking.push_str("\n\n");
 	}
 	thinking.push_str(value);
@@ -1387,19 +1391,19 @@ where
 {
 	let (mut kernel, mut session) = current.take().expect("idle RPC owns kernel and session");
 	let turn_tx = turn_tx.clone();
+	let budget = omp_driver::efficiency::enabled()
+		.then(|| Arc::new(omp_agent::TreeBudget::new(160, 1_000_000)));
+	let control = RunControl::default().with_tree_budget(budget.clone());
 	drop(tokio::spawn(async move {
+		let _tree_lifetime = budget.as_ref().map(|budget| budget.cancel_on_drop());
 		let result = match input {
-			RpcTurnInput::Plain(input) => {
-				kernel
-					.run_turn(&mut session, input, RunControl::default())
-					.await
-			},
-			RpcTurnInput::Skill(prompt) => {
-				kernel
-					.run_skill_turn(&mut session, prompt, RunControl::default())
-					.await
-			},
+			RpcTurnInput::Plain(input) => kernel.run_turn(&mut session, input, control.clone()).await,
+			RpcTurnInput::Skill(prompt) => kernel.run_skill_turn(&mut session, prompt, control).await,
 		};
+		// Finished or interrupted parents cannot leave unobserved workers spending.
+		if let Some(budget) = budget {
+			budget.stop();
+		}
 		let _ = turn_tx.send_async((kernel, session, result)).await;
 	}));
 	outgoing_tx
@@ -3146,7 +3150,10 @@ mod tests {
 		let mut thinking = String::new();
 		push_thinking_node(&mut thinking, "**Planning rasterization for icon**");
 		push_thinking_node(&mut thinking, "**Planning SVG crown generation**");
-		assert_eq!(thinking, "**Planning rasterization for icon**\n\n**Planning SVG crown generation**");
+		assert_eq!(
+			thinking,
+			"**Planning rasterization for icon**\n\n**Planning SVG crown generation**"
+		);
 		// A node that already ends or begins on a line break needs no second one.
 		let mut thinking = String::from("first\n\n");
 		push_thinking_node(&mut thinking, "second");

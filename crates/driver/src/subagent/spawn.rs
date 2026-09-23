@@ -223,6 +223,7 @@ pub struct TaskSessionTool {
 	owner:        Str,
 	model:        Str,
 	spec:         ToolSpec,
+	account_pins: Option<omp_ai::AccountPins>,
 }
 
 impl TaskSessionTool {
@@ -250,7 +251,16 @@ impl TaskSessionTool {
 			owner,
 			model,
 			spec: omp_tools::task::spec(),
+			account_pins: None,
 		}
+	}
+}
+
+impl TaskSessionTool {
+	/// Keeps every descendant on the account selected by the host.
+	pub fn with_account_pins(mut self, pins: Option<omp_ai::AccountPins>) -> Self {
+		self.account_pins = pins;
+		self
 	}
 }
 
@@ -291,7 +301,7 @@ impl SessionTool for TaskSessionTool {
 					},
 				};
 				let cancel = cx.cancel.token().child_token();
-				let prepared = match prepare_child(cx.session, SpawnRequest {
+				let mut prepared = match prepare_child(cx.session, SpawnRequest {
 					data_dir: &self.data_dir,
 					project_root: &self.project_root,
 					sessions_dir: &self.sessions_dir,
@@ -314,6 +324,8 @@ impl SessionTool for TaskSessionTool {
 						return Ok(CallOutcome::Faulted(fault));
 					},
 				};
+				prepared.tree_budget = cx.control.and_then(omp_agent::CallControl::tree_budget);
+				prepared.account_pins = self.account_pins.clone();
 				let handle = prepared.handle;
 				let id = prepared.id.clone();
 				let agent = prepared.agent.clone();
@@ -684,6 +696,8 @@ struct PreparedChild {
 	handle:       omp_dom::Handle,
 	/// Parent-derived initial runtime gate; the child journals its own copy.
 	paused:       bool,
+	tree_budget:  Option<Arc<omp_agent::TreeBudget>>,
+	account_pins: Option<omp_ai::AccountPins>,
 }
 
 struct ChildExecution {
@@ -817,6 +831,8 @@ fn prepare_child(
 		context: Str::new(request.context),
 		child: request.child,
 		parent: Str::new(request.owner),
+		tree_budget: None,
+		account_pins: None,
 		id,
 		agent,
 		session_path,
@@ -858,6 +874,7 @@ async fn run_child(prepared: PreparedChild) -> Result<ChildExecution, SpawnError
 		.map_or_else(|| prepared.project_root.clone(), |isolation| isolation.root.clone());
 	let run = async {
 		let options = KernelOptions {
+			account_pins: prepared.account_pins.clone(),
 			session: Some(prepared.session_path.clone()),
 			sessions_dir: Some(prepared.sessions_dir.clone()),
 			sessions: Some(Arc::clone(&prepared.sessions)),
@@ -901,6 +918,7 @@ async fn run_child(prepared: PreparedChild) -> Result<ChildExecution, SpawnError
 				&mut child_session,
 				TurnInput { text: Str::new(prompt), attachments: Vec::new() },
 				RunControl::new(prepared.cancel.token(), deadline)
+					.with_tree_budget(prepared.tree_budget.clone())
 					.with_request_budget(prepared.settings.soft_request_budget)
 					.with_request_budget_notice(prepared.settings.soft_request_budget_notice),
 			)

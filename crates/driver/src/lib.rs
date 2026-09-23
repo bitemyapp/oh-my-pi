@@ -11,6 +11,8 @@ pub mod collab;
 pub mod commit;
 pub mod compress;
 pub mod discovery;
+/// Opt-in native-host inference limits and context policy.
+pub mod efficiency;
 pub mod ext_updates;
 pub mod headless;
 pub mod prompt_input;

@@ -322,6 +322,15 @@ pub fn project_thread_through(dom: &Dom, through: EntryId) -> Vec<Item> {
 	items
 }
 
+/// Projects the kept tail after a proposed compaction boundary, without a
+/// summary. User instructions in a partially retained turn remain verbatim.
+#[must_use]
+pub fn project_thread_after(dom: &Dom, boundary: EntryId) -> Vec<Item> {
+	let mut items = Vec::new();
+	project_window(dom, Window { after: Some(boundary), through: None }, &mut items);
+	items
+}
+
 /// Journal-entry window a projection admits: elements after `after` (the
 /// newest compaction boundary) and, when set, at or before `through`.
 #[derive(Clone, Copy)]
@@ -340,6 +349,22 @@ fn project_window(dom: &Dom, window: Window, items: &mut Vec<Item>) {
 		// sees what ran as a user message.
 		let mut local = true;
 		let children = dom.children(*turn);
+		// A cut inside a turn must not erase its user's goal or steering.
+		// Whole hidden turns still disappear. The summarizer's `through`
+		// window never re-inserts these messages.
+		let split_turn = window.through.is_none()
+			&& window.after.is_some()
+			&& dom
+				.get(*turn)
+				.is_some_and(|node| !element_in_window(node, window))
+			&& children.iter().any(|child| {
+				dom.get(*child)
+					.is_some_and(|node| element_in_window(node, window))
+			});
+		let visible = |node: &Node| {
+			element_in_window(node, window)
+				|| (split_turn && matches!(node.tag, Tag::Known(KnownTag::User | KnownTag::Developer)))
+		};
 		let mut receipts = BTreeMap::new();
 		let mut awaiting_receipt = None;
 		// Assistants that issued at least one tool call stay in the projection
@@ -351,7 +376,7 @@ fn project_window(dom: &Dom, window: Window, items: &mut Vec<Item>) {
 			let Some(node) = dom.get(*child) else {
 				continue;
 			};
-			if !element_in_window(node, window) {
+			if !visible(node) {
 				continue;
 			}
 			match &node.tag {
@@ -385,7 +410,7 @@ fn project_window(dom: &Dom, window: Window, items: &mut Vec<Item>) {
 			) {
 				local = false;
 			}
-			if !element_in_window(node, window) {
+			if !visible(node) {
 				continue;
 			}
 			match &node.tag {

@@ -56,6 +56,23 @@ impl ChatStream {
 		Self { events, control: None }
 	}
 
+	/// Observes events without replacing or discarding the response control
+	/// channel.
+	pub fn inspect(
+		mut self,
+		mut observer: impl FnMut(&Result<ChatEvent, Error>) + Send + 'static,
+	) -> Self {
+		let events = std::mem::replace(&mut self.events, Box::pin(futures::stream::empty()));
+		let control = self.control.take();
+		Self {
+			events: Box::pin(events.map(move |event| {
+				observer(&event);
+				event
+			})),
+			control,
+		}
+	}
+
 	/// Creates a bidirectional chat stream over the provider's live response
 	/// channel.
 	pub(crate) fn duplex(
@@ -1393,7 +1410,7 @@ mod tests {
 			assert_eq!(response.invocation().as_str(), "invoke-1");
 			yield Ok(ChatEvent::TextDelta { index: 0, text: sf!("resumed") });
 		});
-		let mut stream = ChatStream::duplex(events, responses);
+		let mut stream = ChatStream::duplex(events, responses).inspect(|_| {});
 		let control = stream.control().expect("duplex control");
 		assert!(matches!(
 			stream.next().await,

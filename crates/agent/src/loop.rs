@@ -100,6 +100,11 @@ impl PromptSource for StaticPrompt {
 
 /// Minimal inference capability required by the agent kernel.
 pub trait Inference: Send {
+	/// Binds the shared allowance for ordinary and auxiliary calls in this run.
+	fn set_tree_budget(&mut self, budget: Option<Arc<crate::TreeBudget>>) {
+		let _ = budget;
+	}
+
 	/// Starts one canonical streaming chat operation.
 	fn chat(
 		&mut self,
@@ -217,13 +222,33 @@ pub struct RunControl {
 	deadline:              Option<Instant>,
 	max_requests:          Option<u32>,
 	request_budget_notice: bool,
+	tree_budget:           Option<Arc<crate::TreeBudget>>,
 }
 
 impl RunControl {
 	/// Creates turn control from an external cancellation token and deadline.
 	#[must_use]
 	pub const fn new(cancellation: CancellationToken, deadline: Option<Instant>) -> Self {
-		Self { cancellation, deadline, max_requests: None, request_budget_notice: true }
+		Self {
+			cancellation,
+			deadline,
+			max_requests: None,
+			request_budget_notice: true,
+			tree_budget: None,
+		}
+	}
+
+	/// Shares one finite allowance across all descendants of an explicit
+	/// request.
+	#[must_use]
+	pub fn with_tree_budget(mut self, budget: Option<Arc<crate::TreeBudget>>) -> Self {
+		self.tree_budget = budget;
+		self
+	}
+
+	/// Clones the allowance without creating another budget.
+	pub fn tree_budget(&self) -> Option<Arc<crate::TreeBudget>> {
+		self.tree_budget.clone()
 	}
 
 	/// Limits the number of provider requests this turn may start.
@@ -260,11 +285,22 @@ impl RunControl {
 	pub fn is_expired(&self) -> bool {
 		self.cancellation.is_cancelled()
 			|| self
+				.tree_budget
+				.as_ref()
+				.is_some_and(|budget| budget.is_stopped())
+			|| self
 				.deadline
 				.is_some_and(|deadline| Instant::now() >= deadline)
 	}
 
 	pub(crate) async fn cancelled(&self) {
+		tokio::select! {
+			 () = self.cancelled_locally() => {},
+			 () = async { match &self.tree_budget { Some(budget) => budget.cancelled().await, None => std::future::pending().await } } => {},
+		}
+	}
+
+	async fn cancelled_locally(&self) {
 		if let Some(deadline) = self.deadline {
 			tokio::select! {
 				() = self.cancellation.cancelled() => {},
@@ -956,6 +992,19 @@ impl<C: Inference> Kernel<C> {
 		self
 			.settle_reply_obligations(session, &turn_cancel, &control)
 			.await?;
+		let result = match result {
+			Ok(outcome) if outcome.stop == TurnStop::Cancelled => {
+				match control
+					.tree_budget
+					.as_ref()
+					.and_then(|budget| budget.failure())
+				{
+					Some(error) => Err(KernelError::Inference(error)),
+					None => Ok(outcome),
+				}
+			},
+			result => result,
+		};
 		self.finish_turn(session, turn, &submission_id, result)
 	}
 
@@ -1102,6 +1151,19 @@ impl<C: Inference> Kernel<C> {
 		let result = self
 			.run_turn_body(session, turn, &turn_cancel, &control, Some(calls))
 			.await;
+		let result = match result {
+			Ok(outcome) if outcome.stop == TurnStop::Cancelled => {
+				match control
+					.tree_budget
+					.as_ref()
+					.and_then(|budget| budget.failure())
+				{
+					Some(error) => Err(KernelError::Inference(error)),
+					None => Ok(outcome),
+				}
+			},
+			result => result,
+		};
 		self.finish_turn(session, turn, &submission_id, result)
 	}
 
@@ -1150,6 +1212,7 @@ impl<C: Inference> Kernel<C> {
 		control: &RunControl,
 		mut replay: Option<Vec<PreparedCall>>,
 	) -> Result<TurnOutcome, KernelError> {
+		self.client.set_tree_budget(control.tree_budget());
 		let mut directors = DirectorStack::from_dom(session.dom(), &self.director_registry);
 		if !self.runtime_flags.goal_enabled
 			&& let Some((goal, _)) = crate::find_director(session.dom(), "goal")
@@ -2556,7 +2619,9 @@ impl<C: Inference> Kernel<C> {
 						);
 						session.receipt(receipt.clone())?;
 						self.apply_live_components(session)?;
-						self.events.publish(KernelEvent::InferenceReceipt(Box::new(receipt)));
+						self
+							.events
+							.publish(KernelEvent::InferenceReceipt(Box::new(receipt)));
 						completed = true;
 						break Ok(Fold::Ended);
 					},

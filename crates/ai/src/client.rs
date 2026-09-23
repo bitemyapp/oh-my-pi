@@ -164,6 +164,11 @@ where
 		self
 	}
 
+	/// Rebinds cache/session identity when the host selects a durable journal.
+	pub fn set_affinity(&mut self, affinity: crate::call::CallAffinity) {
+		self.affinity = affinity;
+	}
+
 	/// Borrows the affinity attached to subsequent calls.
 	pub const fn affinity(&self) -> &crate::call::CallAffinity {
 		&self.affinity

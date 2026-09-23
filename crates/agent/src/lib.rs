@@ -19,6 +19,7 @@ pub mod pause;
 pub mod prompt;
 pub mod registry;
 pub mod steering;
+pub mod tree_budget;
 pub mod vars;
 /// Image-input policy (`ai_vision`).
 pub mod vision;
@@ -39,4 +40,5 @@ pub use pause::*;
 pub use prompt::*;
 pub use registry::*;
 pub use steering::*;
+pub use tree_budget::TreeBudget;
 pub use vars::*;

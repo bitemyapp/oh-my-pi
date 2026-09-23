@@ -54,6 +54,11 @@ enum AutoreplyClient {
 
 impl AutoreplyClient {
 	fn from_composed(inference: &ComposedInference) -> Option<Self> {
+		// Ordinary peer messages still reach the live turn. Avoid spawning
+		// extra full-context completions merely to acknowledge them.
+		if crate::efficiency::enabled() {
+			return None;
+		}
 		if let Some(stack) = inference.production_stack() {
 			return Some(Self::Production {
 				registry: stack.registry.clone(),

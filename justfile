@@ -279,3 +279,12 @@ clean:
 # Reproduce the CI "format" + "rust" jobs locally before pushing (skips macOS/Linux-only Python-toolchain verification steps).
 [group('housekeeping')]
 ci: fmt-check-rust clippy test e2e
+
+# Offline Omperor regressions; model traffic is scripted or in-process only.
+[group('test')]
+test-omperor-efficiency:
+    cargo nextest run -p omp-agent --locked -E 'binary(compaction) | test(tree_budget::)'
+    cargo nextest run -p omp-driver --locked
+    cargo nextest run -p omp-session --test projection --locked
+    cargo nextest run -p omp-ai --lib --locked -E 'test(workflow_action_uses_the_live_response_sink_and_resumes_the_same_stream)'
+    cargo test --doc -p omp-agent -p omp-driver -p omp-session -p omp-ai --locked

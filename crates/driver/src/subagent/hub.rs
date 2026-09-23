@@ -437,7 +437,10 @@ fn inbox(
 	peek: bool,
 ) -> Result<Response, omp_agent::SessionToolError> {
 	let steering = steering_queue(session)?;
-	let peers = peer_messages(session, steering);
+	let peers = peer_messages(session, steering)
+		.into_iter()
+		.take(32)
+		.collect::<Vec<_>>();
 	let messages = peers
 		.iter()
 		.map(|(_, text)| text.as_str())
@@ -509,11 +512,9 @@ async fn wait_peer(
 	let deadline =
 		(timeout != 0).then(|| tokio::time::Instant::now() + Duration::from_millis(timeout));
 	loop {
-		if let Some(message) = pop_inbox_message(session)? {
-			return Ok(Response {
-				text:    Str::new(serde_json::json!({ "messages": [message] }).to_string()),
-				useless: false,
-			});
+		let batch = inbox(session, false)?;
+		if !batch.useless {
+			return Ok(batch);
 		}
 		let sleep = async {
 			match deadline {
@@ -563,20 +564,21 @@ async fn wait(
 				.map(|job| job.id)
 				.collect()
 		});
-	let timeout = params.timeout_ms.unwrap_or(if selected.is_empty() {
-		message_timeout_ms
-	} else {
-		120_000
-	});
+	let timeout = efficient_wait_timeout(
+		params.timeout_ms.unwrap_or(if selected.is_empty() {
+			message_timeout_ms
+		} else {
+			120_000
+		}),
+		crate::efficiency::enabled(),
+	);
 	let deadline =
 		(timeout != 0).then(|| tokio::time::Instant::now() + Duration::from_millis(timeout));
 	loop {
 		jobs.poll(session)?;
-		if let Some(message) = pop_inbox_message(session)? {
-			return Ok(Response {
-				text:    Str::new(serde_json::json!({ "messages": [message] }).to_string()),
-				useless: false,
-			});
+		let batch = inbox(session, false)?;
+		if !batch.useless {
+			return Ok(batch);
 		}
 		if !selected.is_empty()
 			&& let Some(job) = selected_settled_job(jobs, Some(&selected))
@@ -627,31 +629,20 @@ async fn wait(
 	}
 }
 
+/// Zero remains an indefinite wait; finite polling waits get an idle floor.
+fn efficient_wait_timeout(requested: u64, efficient: bool) -> u64 {
+	if efficient && requested != 0 {
+		requested.max(30_000)
+	} else {
+		requested
+	}
+}
+
 fn selected_settled_job(jobs: &JobBoard, ids: Option<&[Str]>) -> Option<omp_agent::JobRecord> {
 	jobs.list().into_iter().find(|job| {
 		ids.is_none_or(|ids| ids.is_empty() || ids.contains(&job.id))
 			&& !matches!(job.status.as_str(), "running" | "starting")
 	})
-}
-
-fn pop_inbox_message(
-	session: &mut omp_session::Session,
-) -> Result<Option<Str>, omp_agent::SessionToolError> {
-	let steering = steering_queue(session)?;
-	let Some((handle, message)) = peer_messages(session, steering).into_iter().next() else {
-		return Ok(None);
-	};
-	let cause = session
-		.head()
-		.ok_or_else(|| omp_agent::SessionToolError::Rejected {
-			message: Str::new_static("session has no journal head"),
-		})?;
-	session.patch(Txn {
-		cause,
-		label: Some(Str::new_static("hub.wait.message")),
-		ops: vec![Op::Rm(handle)],
-	})?;
-	Ok(Some(message))
 }
 
 async fn process_start(
@@ -1434,11 +1425,9 @@ async fn process_wait(
 					Ok(_) | Err(_) => return Err(replaced_process_wait(name, process.generation)),
 				}
 			}
-			if let Some(message) = pop_inbox_message(session)? {
-				return Ok(Response {
-					text:    Str::new(serde_json::json!({ "messages": [message] }).to_string()),
-					useless: false,
-				});
+			let batch = inbox(session, false)?;
+			if !batch.useless {
+				return Ok(batch);
 			}
 			continue;
 		};
@@ -1722,6 +1711,13 @@ fn control_key(key: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn efficient_waits_keep_idle_polling_local_and_preserve_unlimited_waits() {
+		assert_eq!(efficient_wait_timeout(1_000, true), 30_000);
+		assert_eq!(efficient_wait_timeout(120_000, true), 120_000);
+		assert_eq!(efficient_wait_timeout(0, true), 0);
+		assert_eq!(efficient_wait_timeout(1_000, false), 1_000);
+	}
 
 	#[test]
 	fn protocol_fields_are_removed_before_hub_validation() {

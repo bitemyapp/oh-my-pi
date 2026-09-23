@@ -385,6 +385,11 @@ impl CallControl {
 		Self { mailbox, turn, session, run, approvals }
 	}
 
+	/// Allowance inherited by tools that compose child inference.
+	pub fn tree_budget(&self) -> Option<Arc<crate::TreeBudget>> {
+		self.run.as_ref().and_then(crate::RunControl::tree_budget)
+	}
+
 	/// Receives the next mailbox message; pending forever once the kernel is
 	/// gone.
 	pub async fn recv(&self) -> Up {

@@ -423,7 +423,7 @@ fn todo_and_jobs_are_journal_derived_meta_components() {
 }
 
 #[test]
-fn projection_excludes_pre_compaction_turns_and_prepends_summary() {
+fn projection_keeps_user_instructions_when_compaction_splits_a_turn() {
 	let directory = tempfile::tempdir().expect("temporary session directory");
 	let path = directory.path().join("compact.oms");
 	let store = BlobStore::open(directory.path()).expect("blob store opens");
@@ -456,7 +456,7 @@ fn projection_excludes_pre_compaction_turns_and_prepends_summary() {
 	session.user("new", Vec::new()).expect("new user appends");
 
 	let items = project_thread(session.dom());
-	assert_eq!(items.len(), 3);
+	assert_eq!(items.len(), 4);
 	let texts: Vec<_> = items
 		.iter()
 		.filter_map(|item| match item.kind.as_ref()? {
@@ -467,7 +467,9 @@ fn projection_excludes_pre_compaction_turns_and_prepends_summary() {
 			_ => None,
 		})
 		.collect();
-	assert_eq!(texts, ["summary of earlier turns", "after-boundary", "new"]);
+	// The cut splits the old turn. Retain its instructions alongside its
+	// assistant continuation; later user turns still follow in order.
+	assert_eq!(texts, ["summary of earlier turns", "old", "after-boundary", "new"]);
 }
 
 #[test]

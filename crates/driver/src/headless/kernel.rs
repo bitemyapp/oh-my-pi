@@ -214,6 +214,7 @@ impl Drop for EphemeralJournal {
 /// environment and authentication stack alive.
 pub struct ProductionInference {
 	client:             Client<ProviderService, Router>,
+	tree_budget:        Option<Arc<omp_agent::TreeBudget>>,
 	/// Call metadata as composed at launch; `ai_model` re-targets a copy.
 	meta:               CallMeta,
 	/// Model the client is currently targeted at.
@@ -1014,7 +1015,15 @@ impl ExternalToolExecutor for EnvToolExecutor {
 							},
 						};
 						if parts.is_empty() {
-							parts = structured_parts(&outcome);
+									 // Native envd verdicts contain the typed payload but
+									 // no rendered parts. Materialize useful content and
+									 // send it through the normal bounded-output gate.
+									 parts = structured_parts(&outcome);
+									 yield ExternalDispatchEvent::Done {
+										  outcome, parts, is_error: verdict.is_error,
+										  source_artifact: Some(source_artifact),
+									 };
+									 return;
 						}
 						yield ExternalDispatchEvent::DoneProjected {
 							outcome,
@@ -1057,7 +1066,7 @@ fn structured_parts(outcome: &CallOutcome<serde_json::Value, serde_json::Value>)
 			return vec![ToolPart::Text { text: abort.render() }];
 		},
 	};
-	value
+	let parts: Vec<_> = value
 		.get("parts")
 		.and_then(serde_json::Value::as_array)
 		.into_iter()
@@ -1072,7 +1081,12 @@ fn structured_parts(outcome: &CallOutcome<serde_json::Value, serde_json::Value>)
 				.map(|json| ToolPart::Json { json: Bytes::from(json.to_string()) }),
 			_ => None,
 		})
-		.collect()
+		.collect();
+	if parts.is_empty() {
+		vec![ToolPart::Text { text: Str::new(value.to_string()) }]
+	} else {
+		parts
+	}
 }
 
 fn tool_output_projection(
@@ -1367,6 +1381,8 @@ pub enum ComposedInference {
 	Production(ProductionInference),
 	/// Remote inference gateway plus its local project-tool authority.
 	Gateway {
+		/// Task-tree inference allowance.
+		tree_budget:        Option<Arc<omp_agent::TreeBudget>>,
 		/// Raw gateway turn adapter.
 		inference:          GatewayInference,
 		/// Environment owner retained for local tool execution.
@@ -1496,14 +1512,43 @@ impl ComposedInference {
 }
 
 impl omp_agent::Inference for ComposedInference {
+	fn set_tree_budget(&mut self, budget: Option<Arc<omp_agent::TreeBudget>>) {
+		match self {
+			Self::Production(p) => p.tree_budget = budget,
+			Self::Gateway { tree_budget, .. } => *tree_budget = budget,
+		}
+	}
+
 	fn chat(
 		&mut self,
 		request: ChatRequest,
 	) -> impl Future<Output = Result<ChatStream, omp_ai::Error>> + Send {
 		async move {
-			match self {
+			let budget = match self {
+				Self::Production(p) => p.tree_budget.clone(),
+				Self::Gateway { tree_budget, .. } => tree_budget.clone(),
+			};
+			if let Some(budget) = &budget {
+				budget.admit()?;
+			}
+			let result = match self {
 				Self::Production(inference) => inference.chat(request).await,
 				Self::Gateway { inference, .. } => inference.chat(request).await,
+			};
+			match (result, budget) {
+				(Ok(stream), Some(budget)) => Ok(budget.observe(stream)),
+				(Err(error), Some(budget)) => {
+					if matches!(
+						error.kind,
+						omp_ai::ErrorKind::RateLimited
+							| omp_ai::ErrorKind::Authentication
+							| omp_ai::ErrorKind::BudgetExhausted
+					) {
+						budget.fail(&error);
+					}
+					Err(error)
+				},
+				(result, None) => result,
 			}
 		}
 	}
@@ -1514,15 +1559,42 @@ impl omp_agent::Inference for ComposedInference {
 		request: ChatRequest,
 	) -> impl Future<Output = Result<ChatStream, omp_ai::Error>> + Send {
 		async move {
-			match self {
+			let budget = match self {
+				Self::Production(p) => p.tree_budget.clone(),
+				Self::Gateway { tree_budget, .. } => tree_budget.clone(),
+			};
+			if let Some(budget) = &budget {
+				budget.admit()?;
+			}
+			let result = match self {
 				Self::Production(inference) => inference.chat_on(selector, request).await,
 				Self::Gateway { inference, .. } => inference.chat_on(selector, request).await,
+			};
+			match (result, budget) {
+				(Ok(stream), Some(budget)) => Ok(budget.observe(stream)),
+				(Err(error), Some(budget)) => {
+					if matches!(
+						error.kind,
+						omp_ai::ErrorKind::RateLimited
+							| omp_ai::ErrorKind::Authentication
+							| omp_ai::ErrorKind::BudgetExhausted
+					) {
+						budget.fail(&error);
+					}
+					Err(error)
+				},
+				(result, None) => result,
 			}
 		}
 	}
 
 	fn set_debug_session(&mut self, session: Option<Str>) {
 		if let Self::Production(inference) = self {
+			inference.client.set_affinity(session_affinity(
+				inference.client.affinity().clone(),
+				inference.meta.debug_session.as_ref(),
+				session.clone(),
+			));
 			inference.meta.debug_session = session;
 			inference.client.set_call_meta(inference.meta.clone());
 		}
@@ -1649,7 +1721,7 @@ pub async fn compose_kernel(
 	project_root: &Path,
 	model_selector: &str,
 	ctx: Arc<omp_con::Ctx>,
-	options: KernelOptions,
+	mut options: KernelOptions,
 ) -> Result<(Kernel<ComposedInference>, Session, PromptSource), HeadlessError> {
 	let project_root = fs::canonicalize(project_root)?;
 	let state_dir = omp_env::project_state::directory(data_dir, &project_root)?;
@@ -1881,6 +1953,7 @@ pub async fn compose_kernel(
 			bridge.bind_remote(channel.clone())?;
 		}
 		ComposedInference::Gateway {
+			tree_budget:        None,
 			inference:          GatewayInference::new(channel, model.as_str()),
 			_environment:       environment,
 			_agent_control:     Mutex::new(None),
@@ -1925,6 +1998,7 @@ pub async fn compose_kernel(
 			})
 			.with_account_pins(options.account_pins.clone().unwrap_or_default());
 		ComposedInference::Production(ProductionInference {
+			tree_budget: None,
 			client,
 			meta,
 			model: omp_catalog::ModelKey::from(model.as_str()),
@@ -1953,6 +2027,11 @@ pub async fn compose_kernel(
 		.and_then(|name| name.to_str())
 		.map(Str::new);
 	if let ComposedInference::Production(production) = &mut inference {
+		production.client.set_affinity(session_affinity(
+			production.client.affinity().clone(),
+			None,
+			debug_session.clone(),
+		));
 		production.meta.debug_session = debug_session;
 		production.client.set_call_meta(production.meta.clone());
 	}
@@ -1974,6 +2053,9 @@ pub async fn compose_kernel(
 	};
 	let con_journal = Arc::new(con_journal::ConJournal::attach(Arc::clone(&ctx), session.dom()));
 	apply_model_override(&ctx, model.as_str(), options.model_override)?;
+	if crate::efficiency::enabled() {
+		crate::efficiency::apply(&ctx, &mut options.prompt).map_err(HeadlessError::Con)?;
+	}
 	install_prompt_facts(
 		&mut session,
 		&project_root,
@@ -2179,17 +2261,20 @@ pub async fn compose_kernel(
 		// A child at the recursion ceiling never sees `task`,
 		// so it cannot plan a delegation the spawner would refuse.
 		if !crate::subagent::settings::task_withheld(&ctx) {
-			kernel = kernel.with_session_tool(Arc::new(crate::subagent::spawn::TaskSessionTool::new(
-				data_dir.to_path_buf(),
-				project_root.clone(),
-				sessions_dir.clone(),
-				Arc::clone(&live_sessions),
-				Arc::clone(&ctx),
-				Arc::clone(&cfg),
-				hub_environment.clone(),
-				name.clone(),
-				model,
-			)));
+			kernel = kernel.with_session_tool(Arc::new(
+				crate::subagent::spawn::TaskSessionTool::new(
+					data_dir.to_path_buf(),
+					project_root.clone(),
+					sessions_dir.clone(),
+					Arc::clone(&live_sessions),
+					Arc::clone(&ctx),
+					Arc::clone(&cfg),
+					hub_environment.clone(),
+					name.clone(),
+					model,
+				)
+				.with_account_pins(options.account_pins.clone()),
+			));
 		}
 		kernel = kernel.with_session_tool(Arc::new(crate::subagent::hub::HubSessionTool::new(
 			hub_environment,
@@ -3667,4 +3752,56 @@ mod tests {
 		};
 		assert_eq!(options.approval_mode, Some(omp_envd::tool_settings::ApprovalMode::AlwaysAsk));
 	}
+}
+
+#[cfg(test)]
+mod native_output_regression {
+	use super::*;
+	#[test]
+	fn cache_affinity_survives_resume_and_changes_on_session_switch() {
+		let first =
+			session_affinity(omp_ai::CallAffinity::default(), None, Some(Str::new_static("first")));
+		let resumed = session_affinity(
+			first.clone(),
+			Some(&Str::new_static("first")),
+			Some(Str::new_static("first")),
+		);
+		assert_eq!(first.prompt_cache, resumed.prompt_cache);
+		let switched =
+			session_affinity(first, Some(&Str::new_static("first")), Some(Str::new_static("second")));
+		assert_eq!(switched.prompt_cache.as_deref(), Some("second"));
+		let explicit = omp_ai::CallAffinity {
+			prompt_cache:     Some(Str::new_static("explicit")),
+			provider_session: None,
+		};
+		assert_eq!(
+			session_affinity(explicit, None, Some(Str::new_static("first")))
+				.prompt_cache
+				.as_deref(),
+			Some("explicit")
+		);
+	}
+
+	#[test]
+	fn native_payloads_without_parts_are_visible_to_the_model() {
+		let outcome = CallOutcome::Ok(serde_json::json!({"stdout":"build passed", "exit_code":0}));
+		let parts = structured_parts(&outcome);
+		assert!(matches!(&parts[..], [ToolPart::Text { text }] if text.contains("build passed")));
+	}
+}
+
+/// Stable per-journal affinity survives resume; switching journals gets a new
+/// identity. Explicit caller overrides remain intact.
+fn session_affinity(
+	mut affinity: omp_ai::CallAffinity,
+	previous: Option<&Str>,
+	session: Option<Str>,
+) -> omp_ai::CallAffinity {
+	if affinity.prompt_cache.is_none() || affinity.prompt_cache.as_ref() == previous {
+		affinity.prompt_cache = session.clone();
+	}
+	if affinity.provider_session.is_none() || affinity.provider_session.as_ref() == previous {
+		affinity.provider_session = session;
+	}
+	affinity
 }

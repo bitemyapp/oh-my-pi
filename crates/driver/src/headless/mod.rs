@@ -14,6 +14,9 @@ use omp_core::Str;
 /// Typed failure while composing a journal-first headless session.
 #[derive(Debug, thiserror::Error)]
 pub enum HeadlessError {
+	/// Host inference policy could not be applied.
+	#[error("host inference policy failed")]
+	Con(#[from] omp_con::ConError),
 	/// Filesystem state could not be prepared or inspected.
 	#[error("headless session filesystem operation failed")]
 	Io(#[from] std::io::Error),

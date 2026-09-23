@@ -16,7 +16,7 @@ use omp_core::{Str, StrMut};
 use omp_dom::{Dom, Handle, KnownTag, Node, PropId, PropKey, Tag, Value};
 use omp_journal::{EntryId, data::Compaction};
 use omp_proto::toolhost::v1::HookEventId;
-use omp_session::{project_thread, project_thread_through};
+use omp_session::{project_thread, project_thread_through, projection::project_thread_after};
 
 use crate::{
 	AI_COMPACT_THRESHOLD, KernelEvent, LifecycleHookError, LifecycleHooks,
@@ -206,14 +206,10 @@ impl CompactionDirector {
 		}
 		// Thread items map one-to-one onto request messages, so whatever the
 		// request holds before the projected thread is the live system prompt;
-		// the projected items past the previous summary and the hidden run are
-		// the tail kept verbatim.
+		// the kept tail includes verbatim instructions from a partially kept turn.
 		let thread = project_thread(dom);
 		let system_prefix = request.messages.len().saturating_sub(thread.len());
-		let kept_from = usize::from(previous.is_some())
-			.saturating_add(hidden.len())
-			.min(thread.len());
-		let kept = Message::from_thread_items(&thread[kept_from..])?;
+		let kept = Message::from_thread_items(&project_thread_after(dom, cut.boundary))?;
 		let plan = Plan { cut, epoch: compaction_count(dom), context_tokens, target_tokens };
 		let (summary, warning) = match cx.hooks {
 			Some(hooks) => {
@@ -313,7 +309,7 @@ impl CompactionDirector {
 			"suggested_first_kept": first_kept_id(dom, plan.cut.first_kept),
 			"to_summarize": refs(hidden, 0),
 			"to_retain": refs(kept, hidden.len()),
-			"split_turn": false,
+			"split_turn": plan.cut.first_kept.and_then(|h| dom.get(h)).is_some_and(|n| n.tag != Tag::Known(KnownTag::Turn)),
 			"previous_summary": previous_summary,
 			"previous_preserve": serde_json::Value::Null,
 			"custom_instructions": self.focus.as_deref(),
@@ -603,6 +599,11 @@ fn cut_point(
 	keep_recent_tokens: u64,
 	keep_current: bool,
 ) -> Option<Cut> {
+	if keep_current
+		&& let Some(cut) = cut_within_turn(dom, current, previous_boundary, keep_recent_tokens)
+	{
+		return Some(cut);
+	}
 	let mut accumulated = 0_u64;
 	let mut first_kept = None;
 	for turn in dom.children(dom.body()).iter().rev() {
@@ -629,6 +630,61 @@ fn cut_point(
 		None => head,
 	};
 	Some(Cut { boundary, first_kept })
+}
+
+/// Cuts only between complete assistant/tool rounds. Keeps at least the last
+/// two rounds and the recent-token tail; user instructions are retained by
+/// projection. This prevents a single long tool loop defeating compaction.
+fn cut_within_turn(
+	dom: &Dom,
+	current: Handle,
+	previous: Option<EntryId>,
+	keep: u64,
+) -> Option<Cut> {
+	let children = dom.children(current);
+	let starts: Vec<usize> = children
+		.iter()
+		.enumerate()
+		.filter_map(|(index, child)| {
+			dom.get(*child)
+				.filter(|node| {
+					node.tag == Tag::Known(KnownTag::Assistant) && after_boundary(node, previous)
+				})
+				.map(|_| index)
+		})
+		.collect();
+	if starts.len() < 3 {
+		return None;
+	}
+	let mut tokens = 0_u64;
+	let mut first = children.len();
+	for (rounds, start) in starts.iter().rev().enumerate() {
+		for child in &children[*start..first] {
+			tokens = tokens
+				.saturating_add(
+					dom.get(*child)
+						.map_or(0, |node| node_bytes(node).div_ceil(BYTES_PER_TOKEN)),
+				)
+				.saturating_add(turn_estimate_tokens(dom, *child))
+				.saturating_add(MESSAGE_OVERHEAD_TOKENS);
+		}
+		first = *start;
+		if rounds >= 1 && tokens >= keep {
+			break;
+		}
+	}
+	if first <= starts[0] {
+		return None;
+	}
+	let node = dom.get(children[first.checked_sub(1)?])?;
+	let boundary = prop_text(node, PropId::Order)
+		.or_else(|| prop_text(node, PropId::Id))
+		.or_else(|| prop_text(node, PropId::Cause))
+		.and_then(|id| EntryId::from_str(id).ok())?;
+	if previous.is_some_and(|previous| boundary <= previous) {
+		return None;
+	}
+	Some(Cut { boundary, first_kept: Some(children[first]) })
 }
 
 /// Whether the turn already ran inference (an assistant message exists), the

@@ -695,3 +695,115 @@ async fn manual_compaction_carries_focus_and_ignores_threshold() {
 		["small history", "later"]
 	);
 }
+
+/// Regression for Omperor's 180k-token single turn. No model/network involved.
+#[tokio::test]
+async fn long_single_turn_compacts_complete_rounds_and_replays_the_user_goal() {
+	let directory = tempfile::tempdir().unwrap();
+	let (mut session, blobs) = open(directory.path());
+	session.begin_turn().unwrap();
+	session
+		.user("Implement the requested change; preserve my local edits.", Vec::new())
+		.unwrap();
+	let con = Ctx::new();
+	AI_COMPACTION_KEEP_RECENT_TOKENS.set(&con, 8_000).unwrap();
+	AI_COMPACTION_THRESHOLD_TOKENS.set(&con, 48_000).unwrap();
+	omp_ai::settings::AI_COMPACTION_MID_TURN_ENABLED
+		.set(&con, true)
+		.unwrap();
+	let append_round = |session: &mut Session, index: usize| {
+		session.assistant_start("mock", "mock", "mock").unwrap();
+		let call = session
+			.call(
+				"read",
+				1,
+				format!("call-{index}"),
+				None,
+				Some(serde_json::value::to_raw_value(&serde_json::json!({"path":"fixture"})).unwrap()),
+				None,
+			)
+			.unwrap();
+		session.assistant_end("tool_use").unwrap();
+		session
+			.settle(
+				call,
+				serde_json::value::to_raw_value(
+					&serde_json::json!({"text": "bounded fixture output ".repeat(1000)}),
+				)
+				.unwrap(),
+			)
+			.unwrap();
+	};
+	for round in 0..30 {
+		append_round(&mut session, round);
+	}
+	let mut inference =
+		FakeInference::with_reply("Files inspected; continue implementing and verify offline.");
+	inference
+		.replies
+		.push_back(Str::new_static("Implementation underway; run remaining checks."));
+	let route = route(200_000);
+	for epoch in 0..2 {
+		let mut input = request("unused");
+		input.messages = Message::from_thread_items(&project_thread(session.dom()))
+			.unwrap()
+			.into();
+		let before: usize = input.messages.iter().map(|m| format!("{m:?}").len()).sum();
+		let turn = turn_handle(&session);
+		let prepared = CompactionDirector::new()
+			.before_inference(
+				&mut MutDirectorCx {
+					session: &mut session,
+					inference: &mut inference,
+					blobs: &blobs,
+					route: &route,
+					turn,
+					director: None,
+					events: None,
+					con: Some(&con),
+					hooks: None,
+				},
+				&input,
+			)
+			.await
+			.unwrap();
+		assert_eq!(prepared, Prepared::Rebuild);
+		let projected = project_thread(session.dom());
+		let messages = Message::from_thread_items(&projected).unwrap();
+		let after: usize = messages.iter().map(|m| format!("{m:?}").len()).sum();
+		assert!(after * 4 < before, "context must fall by at least 75%: {before} -> {after}");
+		assert_eq!(
+			projected_texts(&session)
+				.iter()
+				.filter(|s| s.as_str() == "Implement the requested change; preserve my local edits.")
+				.count(),
+			1
+		);
+		let calls: Vec<_> = projected
+			.iter()
+			.filter_map(|i| match &i.kind {
+				Some(thread::item::Kind::ToolCall(c)) => Some(&c.id),
+				_ => None,
+			})
+			.collect();
+		let results: Vec<_> = projected
+			.iter()
+			.filter_map(|i| match &i.kind {
+				Some(thread::item::Kind::ToolResult(r)) => Some(&r.call_id),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(calls, results, "no orphaned calls/results");
+		assert_eq!(calls.len(), 2, "retain two complete latest rounds");
+		let path = session.journal_path().to_path_buf();
+		drop(session);
+		session = Session::open(&path, ComponentRegistry::standard()).unwrap();
+		assert_eq!(project_thread(session.dom()), projected, "crash/reopen preserves projection");
+		if epoch == 0 {
+			for round in 30..60 {
+				append_round(&mut session, round);
+			}
+		}
+	}
+	assert_eq!(inference.requests.len(), 2);
+}
