@@ -80,7 +80,11 @@ pub fn managed_job_terminal<P, F>(
 
 /// Formats the model-facing notice for a newly detached job.
 pub fn format_background_notice(job_id: &str) -> Str {
-	sf!("Backgrounded as job {job_id}; result will be delivered automatically.")
+	sf!(
+		"Backgrounded as job {job_id}; its output is injected into the conversation as a follow-up \
+		 when it finishes. Do NOT poll for it (no `sleep`, `ps`, `pgrep`, `top`, `pidwait`, or log \
+		 tailing). Do other work, or end your reply; completion will wake you with the output."
+	)
 }
 
 /// Allocates the next stable managed-job name for one tool instance.
@@ -197,9 +201,10 @@ mod tests {
 
 	#[test]
 	fn notice_names_automatic_delivery() {
-		assert_eq!(
-			format_background_notice("eval-bg-7"),
-			"Backgrounded as job eval-bg-7; result will be delivered automatically.",
-		);
+		let notice = format_background_notice("eval-bg-7");
+		assert!(notice.contains("Backgrounded as job eval-bg-7"));
+		assert!(notice.contains("follow-up"));
+		assert!(notice.contains("Do NOT poll"));
+		assert!(notice.contains("end your reply"));
 	}
 }

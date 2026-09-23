@@ -2159,7 +2159,7 @@ impl Dispatcher {
 	fn detach(&self, session: &mut Session, call: &mut PreparedCall) -> Result<(), DispatchError> {
 		let job = timeout_job(&call.identity);
 		let outcome = detached_outcome(&job)?;
-		let prompt = vec![Part::Text { text: sf!("detached job {}", job.id) }];
+		let prompt = vec![Part::Text { text: background_notice(&job.id) }];
 		let mut output = std::mem::take(call.output(&self.committer.policy));
 		// The stream keeps flowing into the element after detachment; the
 		// terminal below closes nothing that is still open.
@@ -2602,7 +2602,7 @@ impl Committer {
 					session,
 					call,
 					raw,
-					vec![Part::Text { text: sf!("detached job {}", job.id) }],
+					vec![Part::Text { text: background_notice(&job.id) }],
 					false,
 					false,
 					None,
@@ -3024,6 +3024,16 @@ pub(crate) fn call_target(call: &PreparedCall) -> serde_json::Value {
 			.and_then(|args| serde_json::from_str::<serde_json::Value>(args.get()).ok())
 			.unwrap_or_else(|| serde_json::json!({})),
 	})
+}
+
+// Native dispatch owns foreground detachment, including shell calls. Put the
+// completion guidance here so it reaches the model on either detachment path.
+fn background_notice(job_id: &str) -> Str {
+	sf!(
+		"Backgrounded as job {job_id}; its output is injected into the conversation as a follow-up \
+		 when it finishes. Do NOT poll for it (no `sleep`, `ps`, `pgrep`, `top`, `pidwait`, or log \
+		 tailing). Do other work, or end your reply; completion will wake you with the output."
+	)
 }
 
 fn detached_outcome(job: &JobRef) -> Result<Box<RawValue>, serde_json::Error> {

@@ -424,8 +424,11 @@ impl ShellPromptSnapshot {
 		let mut description = String::from(
 			"Execute a shell script in a persistent session, or allocate an asynchronous managed \
 			 job. Eligible long-running calls may auto-background at the configured foreground \
-			 threshold and deliver later. `timeout: 0` disables the command deadline; otherwise \
-			 `timeout` is measured in seconds and does not extend foreground waiting.",
+			 threshold; its result arrives automatically as a follow-up when it finishes. NEVER poll \
+			 a backgrounded job with `sleep`, `ps`, `pgrep`, `top`, `pidwait`, or log tailing. Do \
+			 other work or end your reply; completion will wake you with the output. `timeout: 0` \
+			 disables the command deadline; otherwise `timeout` is measured in seconds and does not \
+			 extend foreground waiting.",
 		);
 		let _ = write!(
 			description,
@@ -527,8 +530,11 @@ pub fn shell<E: ShellExec>(exec: E) -> ShellTool<E> {
 		spec_described(sf!(
 			"Execute a shell script in a persistent session, or allocate an asynchronous managed \
 			 job. Eligible long-running calls may auto-background at the configured foreground \
-			 threshold and deliver later. `timeout: 0` disables the command deadline; otherwise \
-			 `timeout` is measured in seconds and does not extend foreground waiting.",
+			 threshold; its result arrives automatically as a follow-up when it finishes. NEVER poll \
+			 a backgrounded job with `sleep`, `ps`, `pgrep`, `top`, `pidwait`, or log tailing. Do \
+			 other work or end your reply; completion will wake you with the output. `timeout: 0` \
+			 disables the command deadline; otherwise `timeout` is measured in seconds and does not \
+			 extend foreground waiting.",
 		)),
 	)
 }

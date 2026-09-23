@@ -23,10 +23,12 @@ pub fn apply(ctx: &Ctx, prompt: &mut PromptOverrides) -> Result<(), omp_con::Con
 		 across all agents; each worker has 40 calls plus a final handoff. Batch independent reads \
 		 and shell work. Keep tool output and coordination concise. Delegate only concrete \
 		 independent work; avoid overlapping assignments. Workers cannot delegate further. Read the \
-		 actual working directory before editing. Use hub wait with timeoutMs 30000 or longer; \
-		 completion messages wake it early. Consolidate peer messages and drain the inbox in \
-		 batches. Do not repeatedly read unchanged files or poll statuses. Respect the shared task \
-		 allowance; give a concise handoff when work cannot fit.";
+		 actual working directory before editing. Owned background jobs and workers deliver results \
+		 automatically: do other work or end your reply and completion will wake you. Do not poll \
+		 with sleep, process checks, or repeated log reads. Use hub wait only for explicit \
+		 coordination, with timeoutMs 30000 or longer. Consolidate peer messages and drain the \
+		 inbox in batches. Do not repeatedly read unchanged files or poll statuses. Respect the \
+		 shared task allowance; give a concise handoff when work cannot fit.";
 	let existing = prompt.append_prompt.take().unwrap_or_default();
 	prompt.append_prompt = Some(omp_core::sf!("{existing}\n\n{GUIDANCE}"));
 	Ok(())

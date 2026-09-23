@@ -846,6 +846,11 @@ async fn dispatch_timed_out_call_remains_observable_as_an_adopted_job() {
 	.expect("blocking limit detaches promptly")
 	.expect("detachment journals a terminal");
 	let detached = report.detached.expect("call returns a job reference");
+	let notice = result_text(&session, "detached-1").join("");
+	assert!(notice.contains(detached.id.as_str()));
+	assert!(notice.contains("Do NOT poll"));
+	assert!(notice.contains("end your reply"));
+	assert!(notice.contains("completion will wake you"));
 	let jobs = dispatcher.jobs().list();
 	assert_eq!(jobs.len(), 1);
 	assert_eq!(jobs[0].id, detached.id);

@@ -288,3 +288,11 @@ test-omperor-efficiency:
     cargo nextest run -p omp-session --test projection --locked
     cargo nextest run -p omp-ai --lib --locked -E 'test(workflow_action_uses_the_live_response_sink_and_resumes_the_same_stream)'
     cargo test --doc -p omp-agent -p omp-driver -p omp-session -p omp-ai --locked
+
+# Upstream anti-poll guidance and native automatic-delivery regressions; no live inference.
+[group('test')]
+test-omperor-background:
+    cargo nextest run -p omp-tools --lib --locked -E 'test(auto_background::) | test(shell::tests::)'
+    cargo nextest run -p omp-agent --test dispatch --test turn --test jobs --locked -E 'test(dispatch_timed_out_call) | test(an_adopted_job_survives) | test(settled_background_job) | binary(jobs)'
+    cargo nextest run -p omp-driver --lib --locked -E 'test(efficiency::)'
+    cargo test --doc -p omp-tools -p omp-agent -p omp-driver --locked
