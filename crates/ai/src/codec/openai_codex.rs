@@ -302,7 +302,9 @@ pub fn apply_codex_client_metadata(
 	let mut metadata = turn_metadata.clone();
 	metadata.insert(sf!("session_id"), ResponsesMetadataValue::String(identity.session_id.clone()));
 	metadata.insert(sf!("turn_id"), ResponsesMetadataValue::String(identity.turn_id.clone()));
-	metadata.insert(sf!("responses_lite"), ResponsesMetadataValue::Bool(responses_lite));
+	// The server's client_metadata contract requires string values, including
+	// flags.
+	metadata.insert(sf!("responses_lite"), ResponsesMetadataValue::String(sf!("{responses_lite}")));
 	if let Some(account) = &identity.account_id {
 		metadata.insert(sf!("account_id"), ResponsesMetadataValue::String(account.clone()));
 	}
@@ -1274,6 +1276,40 @@ mod tests {
 			!omp_catalog::model_operation_overrides("openai-codex", "codex-mini-latest")
 				.contains_kind(omp_catalog::OperationKind::GenerateImage)
 		);
+	}
+
+	#[test]
+	fn codex_client_metadata_serializes_protocol_strings() {
+		let identity = super::CodexRequestIdentity {
+			session_id: Str::new_static("session-1"),
+			turn_id:    Str::new_static("turn-1"),
+			account_id: Some(Str::new_static("account-1")),
+			originator: Some(Str::new_static("omperor")),
+		};
+		for transport in [super::CodexWireTransport::Http, super::CodexWireTransport::WebSocket] {
+			for responses_lite in [false, true] {
+				let mut request: ResponsesRequest = serde_json::from_str(include_str!(
+					"../../../../fixtures/llm-oracle/openai/codex/request.responses_lite.json"
+				))
+				.expect("typed request fixture");
+				super::apply_codex_client_metadata(
+					&mut request,
+					&identity,
+					transport,
+					responses_lite,
+					Some("state-1"),
+					&super::ResponsesMetadata::new(),
+				);
+				let wire = serde_json::to_value(&request).expect("wire request");
+				let metadata = wire["client_metadata"]
+					.as_object()
+					.expect("metadata object");
+				assert!(metadata.values().all(serde_json::Value::is_string));
+				assert_eq!(metadata["responses_lite"], responses_lite.to_string());
+				assert_eq!(metadata["session_id"], "session-1");
+				assert_eq!(metadata["turn_id"], "turn-1");
+			}
+		}
 	}
 
 	#[test]

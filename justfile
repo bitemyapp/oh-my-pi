@@ -296,3 +296,9 @@ test-omperor-background:
     cargo nextest run -p omp-agent --test dispatch --test turn --test jobs --locked -E 'test(dispatch_timed_out_call) | test(an_adopted_job_survives) | test(settled_background_job) | binary(jobs)'
     cargo nextest run -p omp-driver --lib --locked -E 'test(efficiency::)'
     cargo test --doc -p omp-tools -p omp-agent -p omp-driver --locked
+
+# Wire-format regression discovered by the live Luna background-job check.
+[group('test')]
+test-omperor-codex-metadata:
+    cargo nextest run -p omp-ai --lib --locked -E 'test(codec::openai_codex::tests::)'
+    cargo test --doc -p omp-ai --locked
