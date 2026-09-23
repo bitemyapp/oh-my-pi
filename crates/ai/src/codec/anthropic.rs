@@ -3062,11 +3062,14 @@ const fn merge_usage(target: &mut Usage, incoming: IncomingUsage) {
 	}
 	if let Some(value) = incoming.cache_read_input_tokens {
 		target.cache_read_tokens = value;
+		target.cache_read_reported = true;
 	}
 	if let Some(value) = incoming.cache_creation_input_tokens {
 		target.cache_write_tokens = value;
+		target.cache_write_reported = true;
 	}
 	if let Some(breakdown) = incoming.cache_creation {
+		target.cache_write_1h_reported = breakdown.ephemeral_1h_input_tokens.is_some();
 		// An explicit breakdown replaces any earlier snapshot; the one-hour
 		// component is a subset of `cache_write_tokens`, so an all-zero
 		// object clears it.
@@ -4629,6 +4632,9 @@ mod tests {
 			cache_read_tokens: 4,
 			cache_write_tokens: 800,
 			cache_write_1h_tokens: 500,
+			cache_read_reported: true,
+			cache_write_reported: true,
+			cache_write_1h_reported: true,
 			source: UsageSource::Provider,
 			..Usage::default()
 		});
@@ -4648,6 +4654,7 @@ mod tests {
 			.unwrap();
 		assert_eq!(decoder.outcome().usage.cache_write_1h_tokens, 0);
 		assert_eq!(decoder.outcome().usage.cache_write_tokens, 800);
+		assert!(decoder.outcome().usage.cache_write_1h_reported);
 	}
 
 	#[test]
@@ -4680,6 +4687,8 @@ mod tests {
 			output_tokens: 18,
 			cache_read_tokens: 7,
 			cache_write_tokens: 3,
+			cache_read_reported: true,
+			cache_write_reported: true,
 			source: UsageSource::Provider,
 			..Usage::default()
 		});
@@ -4705,6 +4714,8 @@ mod tests {
 			output_tokens: 9,
 			cache_read_tokens: 4,
 			cache_write_tokens: 3,
+			cache_read_reported: true,
+			cache_write_reported: true,
 			search_calls: 2,
 			source: UsageSource::Provider,
 			..Usage::default()

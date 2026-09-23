@@ -957,7 +957,11 @@ pub struct ResponsesUsage {
 pub struct ResponsesInputTokenDetails {
 	/// Cached input tokens.
 	#[serde(default)]
-	pub cached_tokens: u64,
+	pub cached_tokens:      Option<u64>,
+	/// Input tokens written to the prompt cache; omitted by older Responses
+	/// routes.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cache_write_tokens: Option<u64>,
 }
 
 /// Responses output-token details.
@@ -973,10 +977,14 @@ impl From<&ResponsesUsage> for Usage {
 		Self {
 			input_tokens: value
 				.input_tokens
-				.saturating_sub(value.input_tokens_details.cached_tokens),
+				.saturating_sub(value.input_tokens_details.cached_tokens.unwrap_or(0))
+				.saturating_sub(value.input_tokens_details.cache_write_tokens.unwrap_or(0)),
 			output_tokens: value.output_tokens,
 			reasoning_tokens: value.output_tokens_details.reasoning_tokens,
-			cache_read_tokens: value.input_tokens_details.cached_tokens,
+			cache_read_tokens: value.input_tokens_details.cached_tokens.unwrap_or(0),
+			cache_write_tokens: value.input_tokens_details.cache_write_tokens.unwrap_or(0),
+			cache_read_reported: value.input_tokens_details.cached_tokens.is_some(),
+			cache_write_reported: value.input_tokens_details.cache_write_tokens.is_some(),
 			source: UsageSource::Provider,
 			..Self::default()
 		}
@@ -5321,7 +5329,10 @@ mod tests {
 		let usage = Usage::from(&super::ResponsesUsage {
 			input_tokens: 100,
 			output_tokens: 30,
-			input_tokens_details: super::ResponsesInputTokenDetails { cached_tokens: 40 },
+			input_tokens_details: super::ResponsesInputTokenDetails {
+				cached_tokens: Some(40),
+				..Default::default()
+			},
 			output_tokens_details: super::ResponsesOutputTokenDetails { reasoning_tokens: 20 },
 			..Default::default()
 		});
@@ -5329,6 +5340,37 @@ mod tests {
 		assert_eq!(usage.cache_read_tokens, 40);
 		assert_eq!(usage.output_tokens, 30);
 		assert_eq!(usage.reasoning_tokens, 20);
+	}
+
+	#[test]
+	fn responses_cache_write_usage_golden_is_disjoint_and_preserves_absence() {
+		let wire: super::ResponsesUsage = serde_json::from_str(
+			r#"{"input_tokens":1000,"output_tokens":80,"total_tokens":1080,"input_tokens_details":{"cached_tokens":600,"cache_write_tokens":300},"output_tokens_details":{"reasoning_tokens":20}}"#,
+		).expect("provider usage fixture");
+		let usage = Usage::from(&wire);
+		assert_eq!(usage.input_tokens, 100);
+		assert_eq!(usage.cache_read_tokens, 600);
+		assert_eq!(usage.cache_write_tokens, 300);
+		assert_eq!(usage.output_tokens, 80);
+		assert_eq!(usage.reasoning_tokens, 20);
+		assert_eq!(usage.total_tokens(), wire.total_tokens);
+		assert!(usage.cache_read_reported && usage.cache_write_reported);
+		assert!(!usage.cache_write_1h_reported);
+		let omitted: super::ResponsesUsage = serde_json::from_str(
+			r#"{"input_tokens":1000,"input_tokens_details":{"cached_tokens":600}}"#,
+		)
+		.expect("legacy provider usage");
+		let omitted = Usage::from(&omitted);
+		assert_eq!(omitted.input_tokens, 400);
+		assert_eq!(omitted.cache_write_tokens, 0);
+		assert!(!omitted.cache_write_reported);
+		let zero: super::ResponsesUsage = serde_json::from_str(
+			r#"{"input_tokens":1000,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}"#,
+		)
+		.expect("explicit provider zero");
+		let zero = Usage::from(&zero);
+		assert!(zero.cache_read_reported && zero.cache_write_reported);
+		assert_eq!(zero.cache_write_tokens, omitted.cache_write_tokens);
 	}
 
 	/// First-party xAI `/v1/responses` wire policy: no summary, no penalties,

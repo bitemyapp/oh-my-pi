@@ -819,6 +819,7 @@ fn advisor_receipt(completion: &Completion) -> Option<TurnReceipt> {
 			.iter()
 			.map(crate::loop_::journal_recovery)
 			.collect(),
+		..crate::loop_::usage_receipt(&usage)
 	})
 }
 

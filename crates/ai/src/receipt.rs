@@ -136,7 +136,7 @@ pub enum UsageSource {
 /// Dimensioned resource usage for any inference operation.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Usage {
-	/// Input tokens consumed.
+	/// Uncached input tokens consumed; excludes cache reads and cache writes.
 	pub input_tokens: u64,
 	/// Output tokens consumed, including any reasoning tokens.
 	pub output_tokens: u64,
@@ -152,6 +152,18 @@ pub struct Usage {
 	/// input rate instead of the five-minute cache-write rate.
 	#[serde(default)]
 	pub cache_write_1h_tokens: u64,
+	/// Whether a provider explicitly supplied the cache-read counter, including
+	/// zero.
+	#[serde(default)]
+	pub cache_read_reported: bool,
+	/// Whether a provider explicitly supplied the cache-write counter, including
+	/// zero.
+	#[serde(default)]
+	pub cache_write_reported: bool,
+	/// Whether a provider explicitly supplied the one-hour write counter,
+	/// including zero.
+	#[serde(default)]
+	pub cache_write_1h_reported: bool,
 	/// Images processed or generated.
 	pub images: u32,
 	/// Input audio duration in milliseconds.
@@ -190,6 +202,14 @@ impl Usage {
 		self.cache_write_1h_tokens = self
 			.cache_write_1h_tokens
 			.saturating_add(other.cache_write_1h_tokens);
+		// A combined counter is fully reported only if every observed component was.
+		let initially_unknown = self.source == UsageSource::Unknown;
+		self.cache_read_reported =
+			(initially_unknown || self.cache_read_reported) && other.cache_read_reported;
+		self.cache_write_reported =
+			(initially_unknown || self.cache_write_reported) && other.cache_write_reported;
+		self.cache_write_1h_reported =
+			(initially_unknown || self.cache_write_1h_reported) && other.cache_write_1h_reported;
 		self.images = self.images.saturating_add(other.images);
 		self.audio_input_ms = self.audio_input_ms.saturating_add(other.audio_input_ms);
 		self.audio_output_ms = self.audio_output_ms.saturating_add(other.audio_output_ms);
@@ -645,6 +665,9 @@ mod tests {
 			cache_read_tokens: 4,
 			cache_write_tokens: 5,
 			cache_write_1h_tokens: 2,
+			cache_read_reported: false,
+			cache_write_reported: false,
+			cache_write_1h_reported: false,
 			images: 1,
 			audio_input_ms: 6,
 			audio_output_ms: 7,
@@ -660,6 +683,9 @@ mod tests {
 			cache_read_tokens: 40,
 			cache_write_tokens: 50,
 			cache_write_1h_tokens: 20,
+			cache_read_reported: false,
+			cache_write_reported: false,
+			cache_write_1h_reported: false,
 			images: 2,
 			audio_input_ms: 60,
 			audio_output_ms: 70,

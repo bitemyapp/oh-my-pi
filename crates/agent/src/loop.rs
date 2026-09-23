@@ -4119,6 +4119,33 @@ fn receipt_facts(
 		premium_requests_millionths: usage.premium_requests_millionths,
 		identity,
 		recoveries: recoveries.iter().map(journal_recovery).collect(),
+		..usage_receipt(usage)
+	}
+}
+
+/// Durable accounting metadata shared by primary and auxiliary inference.
+pub(crate) fn usage_receipt(usage: &Usage) -> TurnReceipt {
+	use omp_ai::receipt::UsageSource;
+	use omp_journal::data::{ReceiptCostSource, ReceiptUsageSource};
+	let id = omp_core::Ulid::generate();
+	TurnReceipt {
+		receipt_id: Some(Str::new(id.to_string())),
+		recorded_at_ms: Some(id.timestamp_ms()),
+		usage_source: Some(match usage.source {
+			UsageSource::Unknown => ReceiptUsageSource::Unknown,
+			UsageSource::Provider => ReceiptUsageSource::Provider,
+			UsageSource::Measured => ReceiptUsageSource::Measured,
+			UsageSource::Estimated => ReceiptUsageSource::Estimated,
+			UsageSource::Mixed => ReceiptUsageSource::Mixed,
+		}),
+		cost_source: Some(ReceiptCostSource::CatalogEstimate),
+		cache_write_1h: usage
+			.cache_write_1h_reported
+			.then_some(usage.cache_write_1h_tokens),
+		cache_read_reported: Some(usage.cache_read_reported),
+		cache_write_reported: Some(usage.cache_write_reported),
+		cache_write_1h_reported: Some(usage.cache_write_1h_reported),
+		..TurnReceipt::default()
 	}
 }
 
@@ -4176,6 +4203,34 @@ mod streaming_edit_tests {
 	use super::{
 		should_schedule_autolearn, streamed_edit_must_abort, turn_has_terminal_incremental_yield,
 	};
+
+	#[test]
+	fn receipt_observation_has_stable_identity_time_and_provenance() {
+		let usage = omp_ai::Usage {
+			cache_write_tokens: 400,
+			cache_write_1h_tokens: 300,
+			cache_write_reported: true,
+			cache_write_1h_reported: true,
+			source: omp_ai::receipt::UsageSource::Provider,
+			..Default::default()
+		};
+		let receipt = super::usage_receipt(&usage);
+		let id: omp_core::Ulid = receipt
+			.receipt_id
+			.as_ref()
+			.expect("receipt ID")
+			.parse()
+			.expect("ULID");
+		assert_eq!(receipt.recorded_at_ms, Some(id.timestamp_ms()));
+		assert_eq!(receipt.cache_write_1h, Some(300));
+		assert_eq!(receipt.cache_write_1h_reported, Some(true));
+		assert_eq!(receipt.usage_source, Some(omp_journal::data::ReceiptUsageSource::Provider));
+		let replay: omp_journal::data::TurnReceipt =
+			serde_json::from_str(&serde_json::to_string(&receipt).expect("journal receipt"))
+				.expect("replay receipt");
+		assert_eq!(replay, receipt);
+		assert_ne!(super::usage_receipt(&usage).receipt_id, receipt.receipt_id);
+	}
 
 	fn context(enabled: bool) -> Ctx {
 		let ctx = Ctx::new();

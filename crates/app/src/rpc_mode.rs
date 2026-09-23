@@ -2999,6 +2999,14 @@ fn kernel_event_value(event: KernelEvent) -> Option<Value> {
 		// is `tokensOut` over `lastTokenMs - ttftMs`.
 		KernelEvent::InferenceReceipt(receipt) => Some(json!({
 			"type": "inference_receipt",
+			"receiptId": receipt.receipt_id,
+			"recordedAtMs": receipt.recorded_at_ms,
+			"usageSource": receipt.usage_source,
+			"costSource": receipt.cost_source,
+			"cacheWrite1h": receipt.cache_write_1h,
+			"cacheReadReported": receipt.cache_read_reported,
+			"cacheWriteReported": receipt.cache_write_reported,
+			"cacheWrite1hReported": receipt.cache_write_1h_reported,
 			"provider": receipt.identity.as_ref().map(|identity| identity.provider.as_str()),
 			"model": receipt.identity.as_ref().map(|identity| identity.model.as_str()),
 			"tokensIn": receipt.tokens_in,
@@ -3118,6 +3126,32 @@ mod tests {
 	use serde_json::json;
 
 	use super::{inference_error_fields, offered_service_tiers, offers_fast_tier};
+
+	#[test]
+	fn receipt_rpc_preserves_journal_identity_and_accounting_provenance() {
+		use omp_journal::data::{ReceiptCostSource, ReceiptUsageSource, TurnReceipt};
+		let receipt = TurnReceipt {
+			receipt_id: Some(Str::new_static("01RECEIPT")),
+			recorded_at_ms: Some(1750000000123),
+			usage_source: Some(ReceiptUsageSource::Provider),
+			cost_source: Some(ReceiptCostSource::CatalogEstimate),
+			cache_write_reported: Some(true),
+			cache_write_1h_reported: Some(false),
+			..TurnReceipt::tokens(100, 80, 12000)
+		};
+		let value =
+			super::kernel_event_value(omp_agent::KernelEvent::InferenceReceipt(Box::new(receipt)))
+				.expect("RPC receipt");
+		assert_eq!(value["receiptId"], "01RECEIPT");
+		assert_eq!(value["recordedAtMs"], 1750000000123_u64);
+		assert_eq!(value["usageSource"], "provider");
+		assert_eq!(value["costSource"], "catalog_estimate");
+		assert_eq!(value["costNanoUsd"], 12000);
+		assert_eq!(value["cacheWrite"], 0);
+		assert_eq!(value["cacheWriteReported"], true);
+		assert!(value["cacheWrite1h"].is_null());
+		assert_eq!(value["cacheWrite1hReported"], false);
+	}
 
 	#[test]
 	fn a_model_offers_fast_only_when_its_listing_advertises_the_priority_tier() {

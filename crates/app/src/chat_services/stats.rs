@@ -304,6 +304,7 @@ mod tests {
 				premium_requests_millionths: 0,
 				identity:                    None,
 				recoveries:                  Vec::new(),
+				..TurnReceipt::default()
 			})
 			.unwrap();
 		session
@@ -337,6 +338,7 @@ mod tests {
 				premium_requests_millionths: 0,
 				identity:                    None,
 				recoveries:                  Vec::new(),
+				..TurnReceipt::default()
 			})
 			.unwrap();
 		path

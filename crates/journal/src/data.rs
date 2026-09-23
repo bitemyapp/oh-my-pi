@@ -676,10 +676,62 @@ pub struct InferenceRecovery {
 	pub steps:       u32,
 }
 
+/// Origin of a receipt's token accounting; absence in older journals means
+/// unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptUsageSource {
+	/// No usage observation was available.
+	Unknown,
+	/// Provider-reported token accounting.
+	Provider,
+	/// Deterministic local measurements.
+	Measured,
+	/// Locally estimated token accounting.
+	Estimated,
+	/// Accounting combines different origins.
+	Mixed,
+}
+
+/// Origin of the monetary amount; catalog estimates are not billing receipts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptCostSource {
+	/// Token counts priced using the model catalog.
+	CatalogEstimate,
+}
+
 /// `turn.receipt@1` payload.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnReceipt {
-	/// Input token count.
+	/// Stable identity generated once before journaling and reused by live
+	/// delivery.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub receipt_id:                  Option<Str>,
+	/// Unix milliseconds at receipt creation, not replay or GUI arrival time.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub recorded_at_ms:              Option<u64>,
+	/// Source of token accounting, kept separate from monetary provenance.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub usage_source:                Option<ReceiptUsageSource>,
+	/// Source of the monetary estimate; older journals do not establish it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cost_source:                 Option<ReceiptCostSource>,
+	/// One-hour subset of cache writes; absent when the provider omitted its
+	/// breakdown.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cache_write_1h:              Option<u64>,
+	/// Whether the cache-read counter was explicitly reported (zero is
+	/// meaningful).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cache_read_reported:         Option<bool>,
+	/// Whether the cache-write counter was explicitly reported.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cache_write_reported:        Option<bool>,
+	/// Whether the one-hour write counter was explicitly reported.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cache_write_1h_reported:     Option<bool>,
+	/// Uncached input token count; excludes `cache_read` and `cache_write`.
 	pub tokens_in:                   u64,
 	/// Output token count.
 	pub tokens_out:                  u64,
@@ -729,6 +781,14 @@ impl TurnReceipt {
 	#[must_use]
 	pub const fn tokens(tokens_in: u64, tokens_out: u64, cost_nano_usd: u64) -> Self {
 		Self {
+			receipt_id: None,
+			recorded_at_ms: None,
+			usage_source: None,
+			cost_source: None,
+			cache_write_1h: None,
+			cache_read_reported: None,
+			cache_write_reported: None,
+			cache_write_1h_reported: None,
 			tokens_in,
 			tokens_out,
 			cost_nano_usd,
@@ -921,6 +981,32 @@ mod tests {
 			serde_json::from_str::<AdvisorMessage>(&json).expect("advisor message decodes"),
 			payload
 		);
+	}
+
+	#[test]
+	fn receipt_observation_round_trip_preserves_unknown_and_reported_zero() {
+		let legacy: TurnReceipt =
+			serde_json::from_str(r#"{"tokens_in":0,"tokens_out":0,"cost_nano_usd":0}"#)
+				.expect("old journal receipt");
+		assert_eq!(legacy.usage_source, None);
+		assert_eq!(legacy.cache_write_reported, None);
+		assert_eq!(legacy.cache_write_1h, None);
+		assert_eq!(legacy.cost_source, None);
+		let recorded = TurnReceipt {
+			receipt_id: Some(Str::new_static("01RECEIPT")),
+			recorded_at_ms: Some(1750000000123),
+			usage_source: Some(super::ReceiptUsageSource::Provider),
+			cost_source: Some(super::ReceiptCostSource::CatalogEstimate),
+			cache_write_reported: Some(true),
+			cache_write_1h_reported: Some(true),
+			cache_write_1h: Some(0),
+			..legacy
+		};
+		let json = serde_json::to_string(&recorded).expect("serialize receipt");
+		let replay: TurnReceipt = serde_json::from_str(&json).expect("replay receipt");
+		assert_eq!(recorded, replay);
+		assert!(json.contains(r#""cache_write_1h":0"#));
+		assert!(json.contains(r#""cost_source":"catalog_estimate""#));
 	}
 
 	#[test]

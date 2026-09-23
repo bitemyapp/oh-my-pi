@@ -1437,6 +1437,28 @@ mod tests {
 	}
 
 	#[test]
+	fn secure_gate_usage_round_trip_preserves_reported_cache_zero() {
+		let usage = crate::receipt::Usage {
+			input_tokens: 100,
+			cache_read_tokens: 600,
+			cache_read_reported: true,
+			cache_write_reported: true,
+			cache_write_1h_reported: false,
+			source: crate::receipt::UsageSource::Provider,
+			..Default::default()
+		};
+		let event = ChatEvent::Usage(crate::event::UsageUpdate { usage, final_update: true });
+		let mut encoded = Vec::new();
+		super::encode_chat_event(&event, &mut encoded).expect("stage usage");
+		let ChatEvent::Usage(restored) = super::decode_chat_event(&encoded).expect("unstage usage")
+		else {
+			panic!("expected usage");
+		};
+		assert_eq!(restored.usage, usage);
+		assert!(restored.final_update);
+	}
+
+	#[test]
 	fn secure_gate_spool_round_trips_order_and_deletes_on_drop() {
 		let directory = tempfile::tempdir().unwrap();
 		let cancellation = StagingCancellation::new();
@@ -2044,6 +2066,9 @@ fn encode_usage(usage: Usage, out: &mut Vec<u8>) {
 	] {
 		put_u64(out, value);
 	}
+	put_bool(out, usage.cache_read_reported);
+	put_bool(out, usage.cache_write_reported);
+	put_bool(out, usage.cache_write_1h_reported);
 	put_u32(out, usage.images);
 	put_u32(out, usage.search_calls);
 	put_u8(out, match usage.source {
@@ -2193,6 +2218,9 @@ impl<'a> GateCursor<'a> {
 			audio_output_ms: self.u64()?,
 			video_ms: self.u64()?,
 			premium_requests_millionths: self.u64()?,
+			cache_read_reported: self.bool()?,
+			cache_write_reported: self.bool()?,
+			cache_write_1h_reported: self.bool()?,
 			images: self.u32()?,
 			search_calls: self.u32()?,
 			source: match self.u8()? {
