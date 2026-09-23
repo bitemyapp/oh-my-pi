@@ -265,11 +265,7 @@ impl SessionTool for TaskSessionTool {
 		args: Box<serde_json::value::RawValue>,
 	) -> SessionToolFuture<'a> {
 		Box::pin(async move {
-			let mut value: serde_json::Value = serde_json::from_str(args.get())?;
-			if let Some(object) = value.as_object_mut() {
-				object.remove("i");
-			}
-			let request: TaskParams = serde_json::from_value(value)?;
+			let request = decode_call_params(args.get())?;
 			let request = request.into_batch();
 			if request.tasks.is_empty() {
 				let fault = serde_json::value::to_raw_value(&TaskFault {
@@ -343,6 +339,10 @@ impl SessionTool for TaskSessionTool {
 			Ok(CallOutcome::Ok(payload))
 		})
 	}
+}
+
+fn decode_call_params(args: &str) -> Result<TaskParams, serde_json::Error> {
+	omp_tool::decode_params(args)
 }
 
 /// Failure to configure, journal, compose, or run one child kernel.
@@ -1384,6 +1384,15 @@ pub(crate) fn child_session_path(sessions_dir: &Path, id: &Str) -> PathBuf {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn protocol_fields_are_removed_before_task_validation() {
+		let params = decode_call_params(
+			r#"{"task":"inspect the change","i":"Delegating review","notrunc":true}"#,
+		)
+		.expect("protocol fields must not reach strict task params");
+		assert_eq!(params.into_batch().tasks[0].task.as_str(), "inspect the change");
+	}
 
 	fn request_with_schema(mode: SchemaMode) -> ChildRequest {
 		ChildRequest {

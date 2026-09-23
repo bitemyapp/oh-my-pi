@@ -127,11 +127,7 @@ impl SessionTool for HubSessionTool {
 		args: Box<serde_json::value::RawValue>,
 	) -> SessionToolFuture<'a> {
 		Box::pin(async move {
-			let mut value: serde_json::Value = serde_json::from_str(args.get())?;
-			if let Some(object) = value.as_object_mut() {
-				object.remove("i");
-			}
-			let params: Params = serde_json::from_value(value)?;
+			let params = decode_call_params(args.get())?;
 			let params = match omp_tools::hub::validate(params, self.caller_id.as_str()) {
 				Ok(request) => request.params,
 				Err(fault) => {
@@ -209,6 +205,10 @@ impl SessionTool for HubSessionTool {
 			}
 		})
 	}
+}
+
+fn decode_call_params(args: &str) -> Result<Params, serde_json::Error> {
+	omp_tool::decode_params(args)
 }
 
 fn fault_text(error: impl std::fmt::Display) -> Fault {
@@ -1722,6 +1722,15 @@ fn control_key(key: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn protocol_fields_are_removed_before_hub_validation() {
+		let params =
+			decode_call_params(r#"{"op":"inbox","peek":true,"i":"Checking messages","notrunc":true}"#)
+				.expect("protocol fields must not reach strict hub params");
+		assert_eq!(params.op, HubOp::Inbox);
+		assert!(params.peek);
+	}
 
 	fn params(value: serde_json::Value) -> Params {
 		let params: Params = serde_json::from_value(value).expect("hub params");
