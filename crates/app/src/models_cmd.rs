@@ -56,13 +56,23 @@ pub(crate) fn fresh_provider_models(
 		return Ok(None);
 	};
 	// Cached rows outlive the binary that decoded them. Older Anthropic
-	// bootstrap decoders preserved the model identity but did not record the
-	// endpoint's implicit Chat capability. Treat those rows as stale so the
-	// current decoder can replace them before a caller exposes the selector.
-	if provider.as_str() == "anthropic"
-		&& cached.rows.iter().any(|row| {
+	// bootstrap decoders omitted the endpoint's implicit Chat capability, and
+	// older Codex decoders left the route's tool support unknown. Treat those
+	// rows as stale so the current decoder replaces them before a caller
+	// exposes a selector that planning cannot use.
+	let stale = match provider.as_str() {
+		"anthropic" => cached.rows.iter().any(|row| {
 			!discovered_model_supports_chat(row) || row.wire_model.as_str().ends_with("[1m]")
-		}) {
+		}),
+		"openai-codex" => cached.rows.iter().any(|row| {
+			row.declared_capabilities
+				.as_ref()
+				.and_then(|capabilities| capabilities.chat.as_ref())
+				.is_none_or(|chat| chat.tools.is_unknown())
+		}),
+		_ => false,
+	};
+	if stale {
 		return Ok(None);
 	}
 	Ok(Some(discovered_selectors(&cached.rows)))
@@ -523,6 +533,58 @@ mod tests {
 		model.capabilities = omp_catalog::unknown_capabilities();
 		let row = discovered(&model, &provider, &route, 1).expect("primary route wire id");
 		assert!(discovered_model_supports_chat(&row));
+	}
+
+	#[test]
+	fn codex_cache_without_route_tool_evidence_is_refreshed() {
+		let data_dir = tempfile::tempdir().expect("data dir");
+		let catalog = Catalog::embedded();
+		let provider = ProviderId::from("openai-codex");
+		let route = omp_catalog::RouteId::from("openai-codex/primary");
+		let mut model = catalog
+			.model(omp_catalog::ModelKey::from_ref("openai-codex/gpt-5.6-sol"))
+			.expect("bundled Codex model")
+			.clone();
+		model.capabilities.chat.as_mut().expect("chat").tools = omp_catalog::Availability::Unknown;
+		let mut row = discovered(&model, &provider, &route, 1).expect("primary route wire id");
+		let now_ms = discovery_now_ms().expect("clock");
+		DiscoveryStore::open(&data_dir.path().join("models.db"))
+			.expect("store")
+			.publish(
+				&DiscoveryCacheKey::provider(provider.clone()),
+				std::slice::from_ref(&row),
+				now_ms,
+				DISCOVERY_CACHE_TTL,
+			)
+			.expect("publish");
+
+		assert_eq!(
+			fresh_provider_models(data_dir.path(), &provider, None).expect("cache read"),
+			None
+		);
+
+		row.declared_capabilities
+			.as_mut()
+			.and_then(|capabilities| capabilities.chat.as_mut())
+			.expect("chat")
+			.tools = omp_catalog::Availability::Native(omp_catalog::ToolCapabilities {
+			features:      omp_catalog::ToolFeatureBits::empty(),
+			maximum_tools: None,
+		});
+		DiscoveryStore::open(&data_dir.path().join("models.db"))
+			.expect("store")
+			.publish(
+				&DiscoveryCacheKey::provider(provider.clone()),
+				std::slice::from_ref(&row),
+				now_ms,
+				DISCOVERY_CACHE_TTL,
+			)
+			.expect("publish");
+		assert!(
+			fresh_provider_models(data_dir.path(), &provider, None)
+				.expect("cache read")
+				.is_some()
+		);
 	}
 
 	#[test]

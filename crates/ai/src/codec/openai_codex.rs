@@ -772,7 +772,7 @@ impl CodexModelsDecoder {
 		use crate::catalog::{
 			Availability, ChatCapabilities, ModalityBits, ModelCapabilities, OperationBits,
 			OperationKind, ProviderFamily, ReasoningCapabilities, ReasoningEffort,
-			ReasoningFeatureBits, ServiceTier,
+			ReasoningFeatureBits, ServiceTier, ToolCapabilities, ToolFeatureBits,
 		};
 		let service_tiers = match &row.service_tiers {
 			None => Availability::Unknown,
@@ -834,7 +834,14 @@ impl CodexModelsDecoder {
 			chat:          Some(ChatCapabilities {
 				roles: Availability::Unknown,
 				mid_session_roles: Availability::Unknown,
-				tools: Availability::Unknown,
+				// The authenticated Codex Responses route accepts caller-provided
+				// tools for every model it lists. The models payload has no per-model
+				// tools field, so this support comes from the route contract rather
+				// than from an absent response property.
+				tools: Availability::Native(ToolCapabilities {
+					features:      ToolFeatureBits::empty(),
+					maximum_tools: None,
+				}),
 				structured_output: Availability::Unknown,
 				grammar: Availability::Unknown,
 				text_verbosity: Availability::Unknown,
@@ -1628,6 +1635,7 @@ mod tests {
 			.as_ref()
 			.and_then(|capabilities| capabilities.chat.as_ref())
 			.expect("chat capabilities");
+		assert!(matches!(chat.tools, Availability::Native(_)));
 		let Availability::Native(reasoning) = &chat.reasoning else {
 			panic!("reasoning presets should be recorded as native reasoning");
 		};
