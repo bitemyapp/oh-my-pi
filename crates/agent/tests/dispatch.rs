@@ -865,6 +865,73 @@ async fn dispatch_timed_out_call_remains_observable_as_an_adopted_job() {
 }
 
 #[tokio::test]
+async fn explicit_async_shell_detaches_into_a_kernel_owned_job_immediately() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let mut tools = omp_tool::Registry::new();
+	let mut shell_spec = tool_spec("bash", 1);
+	shell_spec.schema = bytes::Bytes::from_static(
+		br#"{"type":"object","properties":{"async":{"type":"boolean"}},"additionalProperties":false}"#,
+	);
+	tools
+		.register_worker(shell_spec, Presentation::Slot, Claims {
+			precedence: Precedence::CORE,
+			claimant:   Str::new_static("omp-agent/tests"),
+			replaces:   None,
+		})
+		.expect("shell registers");
+	let tools = Arc::new(tools);
+	let identity = tools.resolved_identity("bash").expect("worker identity");
+	let started = Arc::new(tokio::sync::Notify::new());
+	let dispatcher = Dispatcher::new(
+		Arc::clone(&tools),
+		DispatchPolicy::new(BlobStore::open(directory.path()).expect("blob store")).with_limits(
+			64 * 1024,
+			512,
+			Duration::from_secs(30),
+		),
+	)
+	.with_external_executor(Arc::new(StuckExternal { honors_cancel: true, started }));
+	let mut session = session(&directory.path().join("detached.oms"));
+	let args = serde_json::value::to_raw_value(&serde_json::json!({"async": true})).unwrap();
+	let entry = session
+		.call(identity.name.clone(), u32::from(identity.rev.n), "detached-1", None, Some(args.clone()), None)
+		.unwrap();
+	let report = tokio::time::timeout(
+		Duration::from_secs(1),
+		dispatcher.dispatch(
+			&mut session,
+			request(
+				entry,
+				identity,
+				args,
+				ToolCancellation::ReadOnly(CancelTree::new().begin_turn().read_only_tool()),
+				false,
+			),
+		),
+	)
+	.await
+	.expect("blocking limit detaches promptly")
+	.expect("detachment journals a terminal");
+	let detached = report.detached.expect("call returns a job reference");
+	let notice = result_text(&session, "detached-1").join("");
+	assert!(notice.contains(detached.id.as_str()));
+	assert!(notice.contains("Do NOT poll"));
+	assert!(notice.contains("end your reply"));
+	assert!(notice.contains("completion will wake you"));
+	let jobs = dispatcher.jobs().list();
+	assert_eq!(jobs.len(), 1);
+	assert_eq!(jobs[0].id, detached.id);
+	assert!(
+		dispatcher
+			.jobs()
+			.terminate(&mut session, jobs[0].handle)
+			.await
+			.expect("cancel journals")
+	);
+	assert_eq!(dispatcher.jobs().list()[0].status, "cancelled");
+}
+
+#[tokio::test]
 async fn an_adopted_job_survives_the_board_rebuild_a_later_tool_call_runs() {
 	// The next session tool the model calls (`hub jobs`, say) rebuilds the
 	// board from the DOM. A detached call adopted moments earlier must come

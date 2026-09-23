@@ -646,6 +646,28 @@ async fn a_client_that_owns_the_lifetime_keeps_the_command_in_the_foreground() {
 	assert!(exec.state.lock().detaches.is_empty());
 }
 
+#[tokio::test]
+async fn explicit_async_keeps_the_stream_when_the_client_owns_its_lifetime() {
+	// The kernel detaches a long call into a job at its own blocking limit
+	// and keeps the invocation running; the shell must not end that
+	// invocation on its own threshold, or the kernel's job dies with it.
+	let exec = FakeExec::default();
+	let tool = shell::shell(exec.clone()).with_auto_background(true, Duration::ZERO);
+	let (feed, params) = IncomingParams::channel();
+	feed
+		.args_committed(sf!(r#"{{"command":"wait","async":true}}"#))
+		.expect("shell invocation remains live");
+	let next = omp_tools::auto_background::with_client_owned_lifetime(true, async {
+		let mut events = Box::pin(tool.call(params));
+		let started = events.next().await.expect("the command starts");
+		assert!(matches!(started, Ev::Update(Update { started: true, .. })), "{started:?}");
+		tokio::time::timeout(Duration::from_millis(200), events.next()).await
+	})
+	.await;
+	assert!(next.is_err(), "the shell detached a command whose lifetime its client owns: {next:?}");
+	assert!(exec.state.lock().detaches.is_empty());
+}
+
 #[test]
 fn interrupt_during_async_setup_reports_effect_uncertainty() {
 	let exec = FakeExec::default();

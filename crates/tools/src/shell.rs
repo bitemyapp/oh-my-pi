@@ -716,7 +716,9 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 			let environment = args.env;
 			let (timeout_ms, adjustments) = self.timeout(args.timeout);
 
-			if args.asynchronous {
+			// A lifetime-owning client also owns explicit backgrounding. Keep
+			// this stream alive so its job board receives the terminal result.
+			if args.asynchronous && !client_owns_lifetime() {
 				let name = next_background_name("bash", &self.next_background_name);
 				let options = SessionOptions {
 					cwd,

@@ -1206,6 +1206,22 @@ pub struct PreparedCall {
 }
 
 impl PreparedCall {
+	fn foreground_deadline(&self, blocking_limit: Duration) -> Option<Instant> {
+		let started = self.started?;
+		// Native shell detachment is already handled by its registry. Remote
+		// shells retain the invocation stream; the kernel owns their jobs.
+		let immediate = matches!(&self.unit, Unit::External { .. })
+			&& self.identity.name == "bash"
+			&& self.args.as_ref().is_some_and(|args| {
+				serde_json::from_str::<serde_json::Value>(args.get())
+					.ok()
+					.is_some_and(|args| {
+						args.get("async").and_then(serde_json::Value::as_bool) == Some(true)
+					})
+			});
+		Some(started + if immediate { Duration::ZERO } else { blocking_limit })
+	}
+
 	/// Journal identity of the `tool.call@1`.
 	#[must_use]
 	pub const fn entry(&self) -> EntryId {
@@ -1569,8 +1585,7 @@ impl Dispatcher {
 			let deadline = calls
 				.iter()
 				.filter(|call| call.phase == Phase::Running)
-				.filter_map(|call| call.started)
-				.map(|started| started + policy.blocking_limit)
+				.filter_map(|call| call.foreground_deadline(policy.blocking_limit))
 				.min();
 			let grace = calls
 				.iter()
@@ -1790,8 +1805,8 @@ impl Dispatcher {
 							call.report = Some(report);
 						} else if call.phase == Phase::Running
 							&& call
-								.started
-								.is_some_and(|started| started + policy.blocking_limit <= now)
+								.foreground_deadline(policy.blocking_limit)
+								.is_some_and(|deadline| deadline <= now)
 						{
 							self.detach(session, call)?;
 						}

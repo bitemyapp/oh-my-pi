@@ -308,3 +308,10 @@ test-omperor-codex-metadata:
 test-omperor-background-progress:
     cargo nextest run -p omp-agent --test turn --test jobs --locked -E 'not test(tool_call_round_settles_in_the_dom_then_runs_second_inference)'
     cargo test --doc -p omp-agent --locked
+
+# Explicit async shell requests keep the kernel's completion-delivery stream.
+[group('test')]
+test-omperor-explicit-async:
+    cargo nextest run -p omp-tools --test it --locked -E 'test(shell::)'
+    cargo nextest run -p omp-agent --test dispatch --locked -E 'not test(central_truncation_spills_and_notrunc_explicitly_opts_out)'
+    cargo test --doc -p omp-tools -p omp-agent --locked
