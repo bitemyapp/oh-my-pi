@@ -407,17 +407,15 @@ pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, Reg
 					principal.clone(),
 				)
 			});
-		let mut cached = None;
-		if let Some(scoped) = &scoped {
-			cached = store
-				.load_fresh(scoped, now_ms)
-				.map_err(catalog_composition)?;
+		// Account listings remain usable offline after the refresh TTL. Never
+		// substitute a different account's listing for an explicitly pinned one.
+		let cache_key = scoped.as_ref().unwrap_or(&key);
+		let cached = if matches!(key.provider.as_str(), "anthropic" | "openai-codex") {
+			store.load_latest(cache_key)
+		} else {
+			store.load_fresh(cache_key, now_ms)
 		}
-		if cached.is_none() {
-			cached = store
-				.load_fresh(&key, now_ms)
-				.map_err(catalog_composition)?;
-		}
+		.map_err(catalog_composition)?;
 		let Some(cached) = cached else {
 			continue;
 		};
@@ -467,6 +465,9 @@ pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, Reg
 				// model; every bundled key is `provider/model`, and selectors
 				// resolve by key, so prefix the provider here.
 				let mut record = record;
+				if key.provider.as_str() == "anthropic" && record.model.thinking.is_none() {
+					record.model.thinking = discovered_anthropic_thinking(&configured, &record.model);
+				}
 				if !record.model.key.as_str().contains('/') {
 					let prefixed =
 						omp_catalog::ModelKey::from(format!("{}/{}", key.provider, record.model.key));
@@ -499,6 +500,40 @@ pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, Reg
 		)
 		.map_err(catalog_composition)?;
 	Ok(Arc::new(catalog))
+}
+
+/// Reuse a supported wire contract by reported capability, never by model ID.
+/// Anthropic models must explicitly report adaptive thinking and effort
+/// support. Unknown contracts remain unknown instead of silently borrowing
+/// model specs.
+fn discovered_anthropic_thinking(
+	catalog: &snapshot::Catalog,
+	model: &omp_catalog::ModelSpec,
+) -> Option<omp_catalog::ThinkingPolicyId> {
+	use omp_catalog::{Availability, ReasoningFeatureBits, ThinkingMode};
+	let Availability::Native(reasoning) = &model.capabilities.chat.as_ref()?.reasoning else {
+		return None;
+	};
+	if !reasoning.features.contains(ReasoningFeatureBits::EFFORT)
+		|| !reasoning.features.contains(ReasoningFeatureBits::ADAPTIVE)
+	{
+		return None;
+	}
+	catalog.models().iter().find_map(|known| {
+		if !known.key.as_str().starts_with("anthropic/") {
+			return None;
+		}
+		let id = known.thinking.as_ref()?;
+		let policy = catalog.thinking_policy(id)?;
+		(policy.mode == ThinkingMode::AnthropicAdaptive
+			&& policy
+				.efforts
+				.iter()
+				.copied()
+				.map(omp_catalog::ReasoningEffort::from)
+				.eq(reasoning.efforts.iter().copied()))
+		.then(|| id.clone())
+	})
 }
 
 /// The one fact a live listing may change on a bundled model: the service
@@ -1433,6 +1468,62 @@ fn production_azure_endpoint() -> Result<Option<AzureEndpointConfig>, RegistryEr
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn an_unbundled_anthropic_model_survives_cache_expiry_with_live_limits() {
+		use omp_catalog::{DiscoveredModel, ModelKey, ProviderId, RouteId, WireModelId};
+		let data_dir = tempfile::tempdir().expect("data dir");
+		let bundled = snapshot::Catalog::embedded();
+		let template = bundled
+			.model(ModelKey::from_ref("anthropic/claude-opus-5"))
+			.unwrap();
+		let key = ModelKey::from("anthropic/claude-opus-99-7");
+		assert!(bundled.model(&key).is_none());
+		let mut capabilities = template.capabilities.clone();
+		if let omp_catalog::Availability::Native(reasoning) =
+			&mut capabilities.chat.as_mut().unwrap().reasoning
+		{
+			reasoning.features =
+				omp_catalog::ReasoningFeatureBits::EFFORT | omp_catalog::ReasoningFeatureBits::ADAPTIVE;
+		}
+		let mut limits = template.limits;
+		limits.maximum_input_tokens = Some(987_654);
+		let row = DiscoveredModel {
+			provider:              ProviderId::from("anthropic"),
+			route:                 RouteId::from("anthropic/primary"),
+			wire_model:            WireModelId::from("claude-opus-99-7"),
+			aliases:               Box::new([]),
+			display_name:          Some(Str::new_static("Future model")),
+			declared_class:        Some(template.class.clone()),
+			declared_operations:   capabilities.operations,
+			declared_capabilities: Some(capabilities),
+			declared_limits:       Some(limits),
+			declared_pricing:      Box::new([]),
+			extended_context_mode: None,
+			availability:          Some(omp_catalog::ModelAvailability::Available),
+			source:                Str::new_static("runtime-anthropic-models-v1"),
+			observed_at_ms:        Some(1),
+			updated_at_ms:         None,
+			deprecated:            None,
+		};
+		omp_ai::discovery::DiscoveryStore::open(&data_dir.path().join("models.db"))
+			.unwrap()
+			.publish(
+				&omp_ai::discovery::DiscoveryCacheKey::provider("anthropic"),
+				&[row],
+				1,
+				Duration::from_secs(1),
+			)
+			.unwrap();
+		let catalog = production_catalog(data_dir.path()).expect("catalog hydrates offline");
+		let model = catalog
+			.model(&key)
+			.expect("unbundled model remains selectable");
+		assert_eq!(model.limits.maximum_input_tokens, Some(987_654));
+		assert_eq!(model.wire_ids[0].1.as_str(), "claude-opus-99-7");
+		assert!(model.thinking.is_some(), "observed adaptive effort contract is retained");
+		assert_eq!(model.pricing, omp_catalog::Pricing::default(), "no fabricated price");
+	}
 
 	#[test]
 	fn a_cached_row_for_a_bundled_model_changes_only_its_offered_tiers() {

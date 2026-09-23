@@ -332,6 +332,8 @@ pub enum ModelReasoningMode {
 bitset!(/// Independent reasoning behaviors.
 	ReasoningFeatureBits, u8);
 impl ReasoningFeatureBits {
+	/// The provider accepts adaptive thinking without an explicit token budget.
+	pub const ADAPTIVE: Self = Self(1 << 4);
 	/// An explicit token budget is accepted.
 	pub const BUDGET: Self = Self(1 << 2);
 	/// Named effort levels are accepted.

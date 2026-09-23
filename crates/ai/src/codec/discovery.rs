@@ -3,8 +3,10 @@
 use bytes::Bytes;
 use omp_catalog::{
 	Availability, ChatCapabilities, ClassId, DiscoveredModel, DiscoveryKind, DiscoveryPagination,
-	DiscoverySpec, ModalityBits, ModelAvailability, ModelLimits, OperationBits, OperationKind,
-	ProviderId, RouteId, ToolCapabilities, ToolFeatureBits, WireModelId, unknown_capabilities,
+	DiscoverySpec, ImageDecoderFamily, ImageInputCapabilities, ImageInputFormatBits, ModalityBits,
+	ModelAvailability, ModelLimits, OperationBits, OperationKind, ProviderId, ReasoningCapabilities,
+	ReasoningEffort, ReasoningFeatureBits, RouteId, StructuredOutputBits, ToolCapabilities,
+	ToolFeatureBits, WireModelId, unknown_capabilities,
 };
 use omp_core::Str;
 use serde::Deserialize;
@@ -27,6 +29,7 @@ const MAX_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
 const ANTHROPIC_PROVIDER: &str = "anthropic";
 const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
+const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const CLAUDE_CODE_USER_AGENT: &str = "claude-code/2.1.258";
 const CLAUDE_CODE_UPDATE_SENTINEL_PREFIX: &str = "cc-update-required-";
 
@@ -56,7 +59,7 @@ impl GoogleModelsDiscoveryCodec {
 	}
 }
 
-/// Standalone account-scoped `{ "models": [...] }` discovery codec.
+/// Standalone account-scoped model discovery codec.
 #[derive(Clone, Debug)]
 pub struct AccountModelsDiscoveryCodec {
 	core: DiscoveryCore,
@@ -65,6 +68,20 @@ pub struct AccountModelsDiscoveryCodec {
 impl AccountModelsDiscoveryCodec {
 	/// Constructs a codec from an exact account-models discovery specification.
 	pub fn from_spec(spec: &DiscoverySpec) -> Result<Self, Error> {
+		// Older bundled catalogs point at a client bootstrap whose optional
+		// model list is incomplete. The authenticated Models API is paginated
+		// and describes every model available to the account.
+		if matches!(
+			spec.path.as_str().split('?').next(),
+			Some("/api/claude_cli/bootstrap" | "/api/claude_code/bootstrap")
+		) {
+			let mut spec = spec.clone();
+			spec.path = Str::new_static("/v1/models?limit=1000");
+			spec.pagination =
+				DiscoveryPagination::Cursor { query_parameter: Str::new_static("after_id") };
+			spec.label = Str::new_static("anthropic-models-v1");
+			return DiscoveryCore::new(&spec, DiscoveryKind::AccountModels).map(|core| Self { core });
+		}
 		DiscoveryCore::new(spec, DiscoveryKind::AccountModels).map(|core| Self { core })
 	}
 }
@@ -136,7 +153,7 @@ impl DiscoveryCore {
 			OperationKind::DiscoverModels,
 			RequestMethod::Get,
 			uri,
-			discovery_headers(&context.route.provider, context.auth_scheme),
+			discovery_headers(&context.route.provider, context.auth_scheme, self.spec.path.as_str()),
 			BodySource::Bytes(Bytes::new()),
 			FramingProtocol::Raw,
 			SizeBounds {
@@ -175,16 +192,25 @@ impl DiscoveryCore {
 fn discovery_headers(
 	provider: &ProviderId<str>,
 	auth_scheme: Option<AuthScheme>,
+	path: &str,
 ) -> Box<[RequestHeader]> {
-	if provider.as_str() == ANTHROPIC_PROVIDER && auth_scheme == Some(AuthScheme::OAuth) {
-		return Box::new([
+	if provider.as_str() != ANTHROPIC_PROVIDER {
+		return Box::new([]);
+	}
+	let version = (path.split('?').next() == Some("/v1/models"))
+		.then(|| RequestHeader::new_static("anthropic-version", ANTHROPIC_API_VERSION));
+	if auth_scheme == Some(AuthScheme::OAuth) {
+		return [
 			RequestHeader::new_static("accept", "application/json, text/plain, */*"),
 			RequestHeader::new_static("content-type", "application/json"),
 			RequestHeader::new_static("anthropic-beta", ANTHROPIC_OAUTH_BETA),
 			RequestHeader::new_static("user-agent", CLAUDE_CODE_USER_AGENT),
-		]);
+		]
+		.into_iter()
+		.chain(version)
+		.collect();
 	}
-	Box::new([])
+	version.into_iter().collect()
 }
 
 fn discovery_uri(
@@ -397,6 +423,9 @@ impl DiscoveryDecoder {
 		let envelope: AccountEnvelope =
 			serde_json::from_slice(payload).map_err(|_| protocol_error())?;
 		let cursor = envelope.cursor();
+		if cursor.has_more == Some(true) && cursor.next.is_none() && cursor.last_id.is_none() {
+			return Err(protocol_error());
+		}
 		let mut rows = Vec::with_capacity(envelope.models.len());
 		for model in envelope.models {
 			let wire_model = model
@@ -414,11 +443,25 @@ impl DiscoveryDecoder {
 			};
 			let mut row =
 				self.row(wire_model, model.display_name, model.family.map(ClassId::from), availability);
-			// Anthropic's compact bootstrap rows describe models selectable by
-			// Claude's chat client but omit capability metadata. Absence there is
-			// not evidence that the model cannot chat.
 			if self.provider.as_str() == ANTHROPIC_PROVIDER {
+				let maximum_input_tokens = model.max_input_tokens.filter(|tokens| *tokens > 0);
+				let maximum_output_tokens = model.max_tokens.filter(|tokens| *tokens > 0);
+				row.declared_limits = (maximum_input_tokens.is_some()
+					|| maximum_output_tokens.is_some())
+				.then_some(ModelLimits {
+					context_window: None,
+					maximum_input_tokens,
+					maximum_output_tokens,
+					maximum_batch: None,
+				});
+				// Both the Models API and compact bootstrap list selectable
+				// Messages models. Missing optional metadata is not rejection
+				// evidence for chat or ordinary client-side tool use.
 				row.declared_operations.insert_kind(OperationKind::Chat);
+				let mut capabilities = unknown_capabilities();
+				capabilities.operations = row.declared_operations;
+				capabilities.chat = Some(anthropic_chat_capabilities(model.capabilities.as_ref()));
+				row.declared_capabilities = Some(capabilities);
 			}
 			rows.push(row);
 		}
@@ -475,11 +518,17 @@ impl DiscoveryDecoder {
 	fn next_cursor(&self, provider: ProviderCursor) -> Result<Option<Str>, Error> {
 		match &self.pagination {
 			DiscoveryPagination::SinglePage => Ok(None),
-			DiscoveryPagination::Cursor { .. } => Ok(provider.next.or_else(|| {
-				provider
-					.has_more
-					.and_then(|more| more.then_some(provider.last_id).flatten())
-			})),
+			DiscoveryPagination::Cursor { .. } => {
+				let next = provider.next.or_else(|| {
+					provider
+						.has_more
+						.and_then(|more| more.then_some(provider.last_id).flatten())
+				});
+				if provider.has_more == Some(true) && next.as_deref().is_none_or(str::is_empty) {
+					return Err(protocol_error());
+				}
+				Ok(next)
+			},
 			DiscoveryPagination::PageNumber { first_page, .. } => {
 				if provider.has_more != Some(true) {
 					return Ok(None);
@@ -497,6 +546,48 @@ impl DiscoveryDecoder {
 			},
 		}
 	}
+}
+
+fn anthropic_chat_capabilities(metadata: Option<&AnthropicCapabilities>) -> ChatCapabilities {
+	let mut chat = openai_chat_capabilities(
+		ModalityBits::TEXT,
+		Availability::Native(ToolCapabilities {
+			features:      ToolFeatureBits::empty(),
+			maximum_tools: None,
+		}),
+	);
+	let Some(metadata) = metadata else {
+		// A native bitset is a complete modality declaration; without image
+		// metadata, a text-only set would falsely reject image inputs.
+		chat.input_modalities = Availability::Unknown;
+		return chat;
+	};
+	match metadata
+		.image_input
+		.as_ref()
+		.and_then(|image| image.supported)
+	{
+		Some(true) => {
+			chat.input_modalities = Availability::Native(ModalityBits::TEXT | ModalityBits::IMAGE);
+			chat.image_input = Availability::Native(ImageInputCapabilities {
+				formats: ImageInputFormatBits::ALL,
+				decoder: ImageDecoderFamily::Native,
+			});
+		},
+		Some(false) => chat.image_input = Availability::Unsupported,
+		None => chat.input_modalities = Availability::Unknown,
+	}
+	chat.structured_output = match metadata
+		.structured_outputs
+		.as_ref()
+		.and_then(|structured| structured.supported)
+	{
+		Some(true) => Availability::Native(StructuredOutputBits::JSON_SCHEMA),
+		Some(false) => Availability::Unsupported,
+		None => Availability::Unknown,
+	};
+	chat.reasoning = metadata.reasoning();
+	chat
 }
 
 const fn openai_chat_capabilities(
@@ -612,7 +703,7 @@ struct GoogleModel {
 
 #[derive(Deserialize)]
 struct AccountEnvelope {
-	#[serde(default, alias = "additional_model_options")]
+	#[serde(default, alias = "additional_model_options", alias = "data")]
 	models:      Vec<AccountModel>,
 	#[serde(default)]
 	next:        Option<Str>,
@@ -637,17 +728,118 @@ impl AccountEnvelope {
 #[derive(Deserialize)]
 struct AccountModel {
 	#[serde(default)]
-	model:        Option<Str>,
+	model:            Option<Str>,
 	#[serde(default)]
-	slug:         Option<Str>,
+	slug:             Option<Str>,
 	#[serde(default)]
-	id:           Option<Str>,
+	id:               Option<Str>,
 	#[serde(default, alias = "name")]
-	display_name: Option<Str>,
+	display_name:     Option<Str>,
 	#[serde(default)]
-	family:       Option<Str>,
+	family:           Option<Str>,
 	#[serde(default)]
-	visibility:   Option<Str>,
+	visibility:       Option<Str>,
+	#[serde(default)]
+	max_input_tokens: Option<u64>,
+	#[serde(default)]
+	max_tokens:       Option<u64>,
+	#[serde(default)]
+	capabilities:     Option<AnthropicCapabilities>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicCapabilities {
+	image_input:        Option<AnthropicSupport>,
+	structured_outputs: Option<AnthropicSupport>,
+	thinking:           Option<AnthropicThinking>,
+	effort:             Option<AnthropicEffort>,
+}
+
+impl AnthropicCapabilities {
+	fn reasoning(&self) -> Availability<ReasoningCapabilities> {
+		let thinking = self.thinking.as_ref();
+		let supports_thinking = thinking.and_then(|thinking| thinking.supported);
+		let effort = self.effort.as_ref();
+		let supports_effort = effort.and_then(|effort| effort.supported) == Some(true);
+		if supports_thinking != Some(true) && !supports_effort {
+			return if supports_thinking == Some(false) {
+				Availability::Unsupported
+			} else {
+				Availability::Unknown
+			};
+		}
+		let mut features = ReasoningFeatureBits::empty();
+		if supports_thinking == Some(true) {
+			features.insert(ReasoningFeatureBits::VISIBLE | ReasoningFeatureBits::SIGNATURES);
+			if thinking
+				.and_then(|thinking| thinking.types.as_ref())
+				.and_then(|types| types.adaptive.as_ref())
+				.and_then(|support| support.supported)
+				== Some(true)
+			{
+				features.insert(ReasoningFeatureBits::ADAPTIVE);
+			}
+			if thinking
+				.and_then(|thinking| thinking.types.as_ref())
+				.and_then(|types| types.enabled.as_ref())
+				.and_then(|enabled| enabled.supported)
+				== Some(true)
+			{
+				features.insert(ReasoningFeatureBits::BUDGET);
+			}
+		}
+		let efforts: Box<[ReasoningEffort]> = if let Some(effort) = effort.filter(|_| supports_effort)
+		{
+			features.insert(ReasoningFeatureBits::EFFORT);
+			[
+				(ReasoningEffort::Low, &effort.low),
+				(ReasoningEffort::Medium, &effort.medium),
+				(ReasoningEffort::High, &effort.high),
+				(ReasoningEffort::Xhigh, &effort.xhigh),
+				(ReasoningEffort::Max, &effort.max),
+			]
+			.into_iter()
+			.filter_map(|(level, support)| {
+				(support.as_ref().and_then(|support| support.supported) == Some(true)).then_some(level)
+			})
+			.collect()
+		} else {
+			Box::new([])
+		};
+		Availability::Native(ReasoningCapabilities {
+			features,
+			efforts,
+			minimum_budget_tokens: None,
+			maximum_budget_tokens: None,
+		})
+	}
+}
+
+#[derive(Deserialize)]
+struct AnthropicSupport {
+	supported: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicThinking {
+	supported: Option<bool>,
+	types:     Option<AnthropicThinkingTypes>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicThinkingTypes {
+	enabled:  Option<AnthropicSupport>,
+	adaptive: Option<AnthropicSupport>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicEffort {
+	supported: Option<bool>,
+	low:       Option<AnthropicSupport>,
+	medium:    Option<AnthropicSupport>,
+	high:      Option<AnthropicSupport>,
+	xhigh:     Option<AnthropicSupport>,
+	max:       Option<AnthropicSupport>,
 }
 
 fn invalid_request() -> Error {
@@ -727,6 +919,114 @@ mod tests {
 		output.expect("discovery event")
 	}
 	#[test]
+	fn legacy_anthropic_route_migrates_to_paginated_models_api() {
+		let spec = DiscoverySpec {
+			id:            omp_catalog::DiscoverySpecId::from("fixture"),
+			kind:          DiscoveryKind::AccountModels,
+			label:         sf!("bootstrap"),
+			path:          sf!("/api/claude_cli/bootstrap?model=old-client-default"),
+			pagination:    DiscoveryPagination::SinglePage,
+			authoritative: false,
+			interval:      None,
+		};
+		let migrated = AccountModelsDiscoveryCodec::from_spec(&spec)
+			.unwrap()
+			.core
+			.spec;
+		assert_eq!(migrated.path.as_str(), "/v1/models?limit=1000");
+		assert_eq!(
+			discovery_uri(
+				"https://api.anthropic.com",
+				&migrated.path,
+				&migrated.pagination,
+				&request(Some("page-two"))
+			)
+			.unwrap()
+			.as_str(),
+			"https://api.anthropic.com/v1/models?limit=1000&after_id=page-two"
+		);
+		for auth in [AuthScheme::OAuth, AuthScheme::ApiKey] {
+			assert!(
+				discovery_headers(&ProviderId::from("anthropic"), Some(auth), &migrated.path)
+					.contains(&RequestHeader::new_static("anthropic-version", "2023-06-01"))
+			);
+		}
+		let mut custom = spec;
+		custom.path = sf!("/custom/catalog");
+		assert_eq!(
+			AccountModelsDiscoveryCodec::from_spec(&custom)
+				.unwrap()
+				.core
+				.spec
+				.path,
+			custom.path
+		);
+	}
+
+	#[test]
+	fn anthropic_models_api_discovers_future_models_with_reported_metadata() {
+		let (rows, next) = discovered_for_provider("anthropic", DiscoveryFlavor::Account,
+			DiscoveryPagination::Cursor { query_parameter: sf!("after_id") }, br#"{
+				"data":[{"id":"claude-opus-99-7","display_name":"Future Opus",
+				"max_input_tokens":1000000,"max_tokens":128000,
+				"capabilities":{"image_input":{"supported":true},"structured_outputs":{"supported":true},
+				"thinking":{"supported":true,"types":{"enabled":{"supported":false},"adaptive":{"supported":true}}},
+				"effort":{"supported":true,"low":{"supported":true},"high":{"supported":true},"max":{"supported":false}}}}],
+				"has_more":true,"last_id":"claude-opus-99-7"
+			}"#);
+		assert_eq!(next.as_deref(), Some("claude-opus-99-7"));
+		assert_eq!(rows[0].wire_model.as_str(), "claude-opus-99-7");
+		let limits = rows[0].declared_limits.unwrap();
+		assert_eq!(limits.maximum_input_tokens, Some(1000000));
+		assert_eq!(limits.maximum_output_tokens, Some(128000));
+		let chat = rows[0]
+			.declared_capabilities
+			.as_ref()
+			.unwrap()
+			.chat
+			.as_ref()
+			.unwrap();
+		assert!(matches!(chat.tools, Availability::Native(_)));
+		assert!(matches!(chat.image_input, Availability::Native(_)));
+		let Availability::Native(reasoning) = &chat.reasoning else {
+			panic!("reasoning")
+		};
+		assert_eq!(&*reasoning.efforts, &[ReasoningEffort::Low, ReasoningEffort::High]);
+		assert!(reasoning.features.contains(ReasoningFeatureBits::ADAPTIVE));
+		assert!(!reasoning.features.contains(ReasoningFeatureBits::BUDGET));
+		assert!(rows[0].declared_pricing.is_empty());
+	}
+
+	#[test]
+	fn anthropic_nullable_metadata_stays_unknown_and_missing_page_cursor_fails() {
+		let (rows, next) = discovered_for_provider(
+			"anthropic",
+			DiscoveryFlavor::Account,
+			DiscoveryPagination::Cursor { query_parameter: sf!("after_id") },
+			br#"{"data":[{"id":"future","capabilities":null,"max_tokens":null}],"has_more":false}"#,
+		);
+		assert!(next.is_none());
+		assert!(rows[0].declared_limits.is_none());
+		let chat = rows[0]
+			.declared_capabilities
+			.as_ref()
+			.unwrap()
+			.chat
+			.as_ref()
+			.unwrap();
+		assert!(chat.reasoning.is_unknown());
+		assert!(chat.image_input.is_unknown());
+		let decoder = decoder(DiscoveryFlavor::Account, DiscoveryPagination::Cursor {
+			query_parameter: sf!("after_id"),
+		});
+		assert!(
+			decoder
+				.decode_account(br#"{"data":[{"id":"future"}],"has_more":true}"#)
+				.is_err()
+		);
+	}
+
+	#[test]
 	fn standalone_constructors_require_their_exact_discovery_kind() {
 		let mut spec = DiscoverySpec {
 			id:            omp_catalog::DiscoverySpecId::from("fixture"),
@@ -759,7 +1059,11 @@ mod tests {
 
 	#[test]
 	fn anthropic_oauth_discovery_uses_claude_code_request_headers() {
-		let headers = discovery_headers(&ProviderId::from("anthropic"), Some(AuthScheme::OAuth));
+		let headers = discovery_headers(
+			&ProviderId::from("anthropic"),
+			Some(AuthScheme::OAuth),
+			"/api/claude_cli/bootstrap",
+		);
 		assert_eq!(headers.as_ref(), &[
 			RequestHeader::new_static("accept", "application/json, text/plain, */*"),
 			RequestHeader::new_static("content-type", "application/json"),
@@ -767,9 +1071,17 @@ mod tests {
 			RequestHeader::new_static("user-agent", "claude-code/2.1.258"),
 		]);
 		assert!(
-			discovery_headers(&ProviderId::from("anthropic"), Some(AuthScheme::ApiKey)).is_empty()
+			discovery_headers(
+				&ProviderId::from("anthropic"),
+				Some(AuthScheme::ApiKey),
+				"/api/claude_cli/bootstrap"
+			)
+			.is_empty()
 		);
-		assert!(discovery_headers(&ProviderId::from("openai"), Some(AuthScheme::OAuth)).is_empty());
+		assert!(
+			discovery_headers(&ProviderId::from("openai"), Some(AuthScheme::OAuth), "/v1/models")
+				.is_empty()
+		);
 	}
 
 	#[test]

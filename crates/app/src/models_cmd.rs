@@ -62,7 +62,8 @@ pub(crate) fn fresh_provider_models(
 	// exposes a selector that planning cannot use.
 	let stale = match provider.as_str() {
 		"anthropic" => cached.rows.iter().any(|row| {
-			!discovered_model_supports_chat(row) || row.wire_model.as_str().ends_with("[1m]")
+			!discovered_model_supports_chat(row)
+				|| row.source.as_str() != "runtime-anthropic-models-v1"
 		}),
 		"openai-codex" => cached.rows.iter().any(|row| {
 			row.declared_capabilities
@@ -76,6 +77,24 @@ pub(crate) fn fresh_provider_models(
 		return Ok(None);
 	}
 	Ok(Some(discovered_selectors(&cached.rows)))
+}
+
+/// Last successful account-scoped listing, even after its refresh TTL.
+/// Callers must report live discovery failure when using this fallback.
+pub(crate) fn cached_provider_models(
+	data_dir: &Path,
+	provider: &ProviderId<str>,
+	principal: Option<&str>,
+) -> miette::Result<Option<Vec<String>>> {
+	let path = data_dir.join("models.db");
+	if !path.exists() {
+		return Ok(None);
+	}
+	Ok(DiscoveryStore::open(&path)
+		.into_diagnostic()?
+		.load_latest(&provider_cache_key(provider, principal))
+		.into_diagnostic()?
+		.map(|cached| discovered_selectors(&cached.rows)))
 }
 
 /// Discovers and atomically caches the models advertised by a provider's
@@ -114,6 +133,7 @@ pub(crate) async fn refresh_provider(
 			response_hooks: Default::default(),
 		};
 		let mut cursor = None;
+		let mut seen_cursors = BTreeSet::new();
 		loop {
 			let mut client = Client::new(registry.service(), planner.clone(), meta.clone());
 			if let Some(pins) = pins {
@@ -136,6 +156,11 @@ pub(crate) async fn refresh_provider(
 					.filter_map(|model| discovered(model, provider, &route, now_ms)),
 			);
 			cursor = page.next_cursor;
+			if let Some(next) = &cursor
+				&& !seen_cursors.insert(next.clone())
+			{
+				return Err(miette!("{provider} model discovery repeated a page cursor"));
+			}
 			if cursor.is_none() {
 				break;
 			}
@@ -180,6 +205,7 @@ fn discovered_selectors(rows: &[DiscoveredModel]) -> Vec<String> {
 	let mut selectors = rows
 		.iter()
 		.filter(|row| discovered_model_supports_chat(row))
+		.filter(|row| row.availability != Some(omp_catalog::ModelAvailability::Disabled))
 		.map(|row| format!("{}/{}", row.provider, row.wire_model))
 		.collect::<Vec<_>>();
 	selectors.sort();
@@ -420,7 +446,7 @@ fn discovered(
 			})
 		})?;
 	let mut declared_operations = model.capabilities.operations;
-	// The Claude subscription bootstrap endpoint is itself an authoritative
+	// The authenticated Anthropic Models endpoint is an authoritative
 	// list of chat-selectable models. The mixed discovery projector may replace
 	// a compact response row with conservative catalog metadata, so retain this
 	// endpoint-level fact when materializing the durable cache row.
@@ -440,7 +466,11 @@ fn discovered(
 		declared_pricing: Box::new([]),
 		extended_context_mode: None,
 		availability: Some(model.availability.clone()),
-		source: Str::new_static("runtime-inference-discovery"),
+		source: Str::new_static(if provider.as_str() == "anthropic" {
+			"runtime-anthropic-models-v1"
+		} else {
+			"runtime-inference-discovery"
+		}),
 		observed_at_ms: Some(now_ms),
 		updated_at_ms: None,
 		deprecated: None,
@@ -520,6 +550,55 @@ fn print_rows(rows: &[&ModelSpec], json: bool) -> miette::Result<()> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn anthropic_bootstrap_cache_is_replaced_and_offline_fallback_is_scoped() {
+		let dir = tempfile::tempdir().unwrap();
+		let provider = ProviderId::from("anthropic");
+		let route = omp_catalog::RouteId::from("anthropic/primary");
+		let model = Catalog::embedded()
+			.model(omp_catalog::ModelKey::from_ref("anthropic/claude-opus-5"))
+			.unwrap();
+		let mut row = discovered(model, &provider, &route, 1).unwrap();
+		row.source = Str::new_static("runtime-inference-discovery");
+		let store = DiscoveryStore::open(&dir.path().join("models.db")).unwrap();
+		let key = provider_cache_key(&provider, Some("account-a"));
+		store
+			.publish(&key, &[row.clone()], discovery_now_ms().unwrap(), DISCOVERY_CACHE_TTL)
+			.unwrap();
+		assert!(
+			fresh_provider_models(dir.path(), &provider, Some("account-a"))
+				.unwrap()
+				.is_none()
+		);
+		row.source = Str::new_static("runtime-anthropic-models-v1");
+		store
+			.publish(&key, &[row.clone()], discovery_now_ms().unwrap(), DISCOVERY_CACHE_TTL)
+			.unwrap();
+		assert!(
+			fresh_provider_models(dir.path(), &provider, Some("account-a"))
+				.unwrap()
+				.is_some()
+		);
+		store
+			.publish(&key, &[row], 1, Duration::from_secs(1))
+			.unwrap();
+		assert!(
+			fresh_provider_models(dir.path(), &provider, Some("account-a"))
+				.unwrap()
+				.is_none()
+		);
+		assert!(
+			cached_provider_models(dir.path(), &provider, Some("account-a"))
+				.unwrap()
+				.is_some()
+		);
+		assert!(
+			cached_provider_models(dir.path(), &provider, Some("account-b"))
+				.unwrap()
+				.is_none()
+		);
+	}
 
 	#[test]
 	fn anthropic_cache_projection_retains_endpoint_chat_capability() {

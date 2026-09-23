@@ -269,6 +269,16 @@ impl DiscoveryStore {
 		Ok(Some(CachedDiscovery { key: key.clone(), generation, rows, expires_at_ms }))
 	}
 
+	/// Loads the last successful generation, including expired rows, for an
+	/// explicitly labelled offline fallback. Expiry still governs refresh.
+	/// Account namespaces remain isolated and invalidation still removes it.
+	pub fn load_latest(
+		&self,
+		key: &DiscoveryCacheKey,
+	) -> Result<Option<CachedDiscovery>, DiscoveryStoreError> {
+		self.load_fresh(key, 0)
+	}
+
 	/// Invalidates exactly one endpoint/account namespace.
 	pub fn invalidate(&self, key: &DiscoveryCacheKey) -> Result<(), DiscoveryStoreError> {
 		let mut connection = self.connection.lock();
@@ -458,6 +468,21 @@ mod tests {
 		]);
 		assert!(reopened.load_fresh(&key, 1_101).expect("expired").is_none());
 		assert_eq!(
+			reopened
+				.load_latest(&key)
+				.expect("offline")
+				.unwrap()
+				.rows
+				.len(),
+			1
+		);
+		assert!(
+			reopened
+				.load_latest(&DiscoveryCacheKey::credential(provider.clone(), "other-account"))
+				.expect("isolated")
+				.is_none()
+		);
+		assert_eq!(
 			reopened.lifecycle(&key).expect("lifecycle").unwrap().state,
 			ProviderDiscoveryState::Ready
 		);
@@ -589,6 +614,12 @@ mod tests {
 		assert_eq!(cached.generation, generation);
 		assert!(cached.rows.is_empty());
 		store.invalidate(&key).expect("invalidate");
+		assert!(
+			store
+				.load_latest(&key)
+				.expect("offline after invalidation")
+				.is_none()
+		);
 		assert!(
 			store
 				.load_fresh(&key, 201)

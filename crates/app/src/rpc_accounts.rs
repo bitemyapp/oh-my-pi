@@ -9,7 +9,7 @@
 //! owns that surface so the server loop only dispatches to it.
 
 use std::{
-	collections::{BTreeMap, HashMap, HashSet},
+	collections::BTreeMap,
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::Duration,
@@ -27,8 +27,10 @@ use omp_ai::{
 	id::LoginSessionId,
 	operation::usage::ConsoleUsageManager,
 };
-use omp_catalog::{ProviderId, settings::ModelSettings};
-use omp_core::{ExposeSecret as _, SecretString, Str};
+use omp_catalog::{
+	ProviderId, capability::OperationKind, settings::ModelSettings, snapshot::Catalog,
+};
+use omp_core::{ExposeSecret as _, FastHashMap, FastHashSet, SecretString, Str};
 use omp_rpc::protocol::{
 	OAuthProvider, RpcAccount, RpcAccountState, RpcAuthAccount, RpcAuthAnswerFrame, RpcAuthEvent,
 	RpcAuthEventFrame, RpcAuthInputKind, RpcAuthMethod, RpcAuthPromptKind, RpcAuthTerminalFrame,
@@ -48,10 +50,6 @@ const CODEX_PROVIDER: &str = "openai-codex";
 /// Providers whose authenticated discovery endpoint reports account-specific
 /// models beyond the bundled catalog.
 const ACCOUNT_DISCOVERY_PROVIDERS: [&str; 2] = [ANTHROPIC_PROVIDER, CODEX_PROVIDER];
-/// Claude subscription models every authenticated account can select; the
-/// authenticated bootstrap response adds account-specific options.
-const ANTHROPIC_SUBSCRIPTION_MODELS: [&str; 3] =
-	["anthropic/claude-fable-5", "anthropic/claude-opus-5", "anthropic/claude-sonnet-5"];
 
 /// Emits one protocol frame to the connected host.
 pub(crate) type Notify = Arc<dyn Fn(Value) + Send + Sync>;
@@ -94,8 +92,8 @@ struct Inner {
 	/// Account id pinned per provider for the live session.
 	pinned:           BTreeMap<String, String>,
 	/// Anthropic selectors the authenticated subscription can use.
-	anthropic_models: HashSet<String>,
-	pending_auth:     HashMap<String, PendingAuth>,
+	anthropic_models: FastHashSet<String>,
+	pending_auth:     FastHashMap<String, PendingAuth>,
 }
 
 /// Credential, account, and discovery authority shared by the RPC server
@@ -170,7 +168,8 @@ impl AccountAuthority {
 		);
 		let discovered =
 			discover_account_models(&registry, data_dir, &authenticated, false, &pins).await;
-		let anthropic_models = anthropic_models_for(&authenticated, &discovered);
+		let mut anthropic_models = FastHashSet::default();
+		discovered.update_anthropic_models(&authenticated, &mut anthropic_models);
 		let providers = registry
 			.catalog()
 			.providers()
@@ -194,7 +193,7 @@ impl AccountAuthority {
 				providers,
 				pinned: BTreeMap::new(),
 				anthropic_models,
-				pending_auth: HashMap::new(),
+				pending_auth: FastHashMap::default(),
 			}),
 		}))
 	}
@@ -256,14 +255,7 @@ impl AccountAuthority {
 		let discovered =
 			discover_account_models(&self.registry, &self.data_dir, &authenticated, true, &self.pins)
 				.await;
-		let anthropic_models = anthropic_models_for(&authenticated, &discovered);
-		self.inner.lock().anthropic_models = anthropic_models;
-		let mut models = discovered.values().flatten().cloned().collect::<Vec<_>>();
-		models.sort();
-		models.dedup();
-		let mut refreshed = discovered.keys().cloned().collect::<Vec<_>>();
-		refreshed.sort();
-		Ok(json!({ "models": models, "refreshed": refreshed, "restartRequired": true }))
+		discovered.into_refresh_response(&authenticated, &mut self.inner.lock().anthropic_models)
 	}
 
 	/// `set_account`: pins one stored account for its provider on every later
@@ -651,7 +643,7 @@ async fn stored_accounts(auth: &AuthManager) -> Result<Vec<AccountSummary>, Comm
 	}
 }
 
-fn active_providers(accounts: &[AccountSummary]) -> HashSet<String> {
+fn active_providers(accounts: &[AccountSummary]) -> FastHashSet<String> {
 	accounts
 		.iter()
 		.filter(|account| account.state == AccountState::Active)
@@ -659,32 +651,73 @@ fn active_providers(accounts: &[AccountSummary]) -> HashSet<String> {
 		.collect()
 }
 
-fn anthropic_models_for(
-	authenticated: &HashSet<String>,
-	discovered: &HashMap<String, Vec<String>>,
-) -> HashSet<String> {
-	if !authenticated.contains(ANTHROPIC_PROVIDER) {
-		return HashSet::new();
+#[derive(Default)]
+struct ModelDiscoveryReport {
+	/// Successful listings, or last-known/bundled fallbacks during startup.
+	models: BTreeMap<String, Vec<String>>,
+	/// Provider failures remain visible even when startup found a fallback.
+	errors: BTreeMap<String, String>,
+}
+
+impl ModelDiscoveryReport {
+	fn update_anthropic_models(
+		&self,
+		authenticated: &FastHashSet<String>,
+		visible: &mut FastHashSet<String>,
+	) {
+		if !authenticated.contains(ANTHROPIC_PROVIDER) {
+			visible.clear();
+		} else if let Some(models) = self.models.get(ANTHROPIC_PROVIDER) {
+			// A successful response is authoritative, including models unknown
+			// to this binary. A failed refresh keeps the previous visible list.
+			*visible = models.iter().cloned().collect();
+		}
 	}
-	anthropic_subscription_models(
-		discovered
-			.get(ANTHROPIC_PROVIDER)
-			.cloned()
-			.unwrap_or_default(),
-	)
+
+	fn into_refresh_response(
+		self,
+		authenticated: &FastHashSet<String>,
+		visible: &mut FastHashSet<String>,
+	) -> Result<Value, CommandError> {
+		self.update_anthropic_models(authenticated, visible);
+		if self.models.is_empty() && !self.errors.is_empty() {
+			let errors = self
+				.errors
+				.iter()
+				.map(|(provider, error)| format!("{provider}: {error}"))
+				.collect::<Vec<_>>()
+				.join("; ");
+			return Err(CommandError::new("model_discovery_failed", errors));
+		}
+		let mut models = self.models.values().flatten().collect::<Vec<_>>();
+		models.sort();
+		models.dedup();
+		let warnings = self
+			.errors
+			.iter()
+			.map(|(provider, error)| json!({ "providerId": provider, "error": error }))
+			.collect::<Vec<_>>();
+		Ok(json!({
+			"models": models,
+			"refreshed": self.models.keys().collect::<Vec<_>>(),
+			"warnings": warnings,
+			"restartRequired": !self.models.is_empty(),
+		}))
+	}
 }
 
 /// Account-verified model selectors per provider: the fresh discovery cache
 /// when one exists (unless `force_refresh`), otherwise one bounded live
 /// discovery. Providers are probed concurrently so a stalled endpoint costs
-/// one timeout, and failures degrade to no additions so startup never stalls.
+/// one timeout. Startup can reuse the same account's expired cache, then the
+/// bundled Anthropic chat catalog; explicit refresh preserves every failure.
 async fn discover_account_models(
 	registry: &Registry,
 	data_dir: &Path,
-	authenticated: &HashSet<String>,
+	authenticated: &FastHashSet<String>,
 	force_refresh: bool,
 	pins: &AccountPins,
-) -> HashMap<String, Vec<String>> {
+) -> ModelDiscoveryReport {
 	let probes = ACCOUNT_DISCOVERY_PROVIDERS
 		.into_iter()
 		.filter(|provider_id| authenticated.contains(*provider_id))
@@ -693,9 +726,54 @@ async fn discover_account_models(
 				discover_provider_models(registry, data_dir, provider_id, force_refresh, pins).await;
 			(provider_id.to_owned(), models)
 		});
-	futures::future::join_all(probes)
-		.await
-		.into_iter()
+	let mut report = ModelDiscoveryReport::default();
+	for (provider_id, result) in futures::future::join_all(probes).await {
+		match result {
+			Ok(models) => {
+				report.models.insert(provider_id, models);
+			},
+			Err(error) => {
+				eprintln!("warning: {provider_id} account model discovery failed: {error}");
+				if !force_refresh {
+					let models = fallback_provider_models(data_dir, &provider_id, pins);
+					report.models.insert(provider_id.clone(), models);
+				}
+				report.errors.insert(provider_id, error);
+			},
+		}
+	}
+	report
+}
+
+fn fallback_provider_models(data_dir: &Path, provider_id: &str, pins: &AccountPins) -> Vec<String> {
+	let provider = ProviderId::from_ref(provider_id);
+	let principal = pins
+		.snapshot()
+		.get(provider)
+		.map(|principal| principal.as_str().to_owned());
+	match crate::models_cmd::cached_provider_models(data_dir, provider, principal.as_deref()) {
+		Ok(Some(models)) => return models,
+		Ok(None) => {},
+		Err(error) => eprintln!("warning: {provider_id} model cache is unreadable: {error}"),
+	}
+	if provider_id != ANTHROPIC_PROVIDER {
+		return Vec::new();
+	}
+	Catalog::embedded()
+		.models()
+		.iter()
+		.filter(|model| {
+			model
+				.key
+				.as_str()
+				.split_once('/')
+				.is_some_and(|(provider, _)| provider == provider_id)
+				&& model
+					.capabilities
+					.operations
+					.contains_kind(OperationKind::Chat)
+		})
+		.map(|model| model.key.as_str().to_owned())
 		.collect()
 }
 
@@ -705,42 +783,35 @@ async fn discover_provider_models(
 	provider_id: &str,
 	force_refresh: bool,
 	pins: &AccountPins,
-) -> Vec<String> {
-	let provider = ProviderId::from(provider_id);
+) -> Result<Vec<String>, String> {
+	let provider = ProviderId::from_ref(provider_id);
 	let principal = pins
 		.snapshot()
-		.get(&provider)
+		.get(provider)
 		.map(|principal| principal.as_str().to_owned());
 	let cached = if force_refresh {
 		None
 	} else {
-		crate::models_cmd::fresh_provider_models(data_dir, &provider, principal.as_deref())
+		crate::models_cmd::fresh_provider_models(data_dir, provider, principal.as_deref())
 			.unwrap_or_else(|error| {
 				eprintln!("warning: {provider_id} model cache is unreadable: {error}");
 				None
 			})
 	};
 	if let Some(models) = cached {
-		return models;
+		return Ok(models);
 	}
 	match time::timeout(
 		ACCOUNT_MODEL_DISCOVERY_TIMEOUT,
-		crate::models_cmd::refresh_provider(registry, data_dir, &provider, Some(pins)),
+		crate::models_cmd::refresh_provider(registry, data_dir, provider, Some(pins)),
 	)
 	.await
 	{
-		Ok(Ok(models)) => models,
-		Ok(Err(error)) => {
-			eprintln!("warning: {provider_id} account model discovery failed: {error}");
-			Vec::new()
-		},
-		Err(_) => {
-			eprintln!(
-				"warning: {provider_id} account model discovery exceeded {} seconds",
-				ACCOUNT_MODEL_DISCOVERY_TIMEOUT.as_secs()
-			);
-			Vec::new()
-		},
+		Ok(result) => result.map_err(|error| error.to_string()),
+		Err(_) => Err(format!(
+			"account model discovery exceeded {} seconds",
+			ACCOUNT_MODEL_DISCOVERY_TIMEOUT.as_secs()
+		)),
 	}
 }
 
@@ -766,7 +837,8 @@ fn account_usage_value(
 							quantity.units as f64 / 10f64.powi(i32::from(quantity.decimal_exponent))
 						})
 					};
-					let (used, limit) = (decimal(&window.amount.consumed), decimal(&window.amount.limit));
+					let (used, limit) =
+						(decimal(&window.amount.consumed), decimal(&window.amount.limit));
 					let used_percent = match window.amount.unit {
 						omp_ai::answer::UsageUnit::Percent => used,
 						_ => match (used, limit) {
@@ -808,14 +880,6 @@ fn account_usage_value(
 		},
 	}
 	value
-}
-
-fn anthropic_subscription_models(discovered: Vec<String>) -> HashSet<String> {
-	ANTHROPIC_SUBSCRIPTION_MODELS
-		.into_iter()
-		.map(str::to_owned)
-		.chain(discovered)
-		.collect()
 }
 
 fn parse_params<P>(params: &Map<String, Value>) -> Result<P, CommandError>
@@ -970,25 +1034,117 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn anthropic_subscription_models_merge_the_baseline_with_discovery() {
-		let models = anthropic_subscription_models(vec![
-			"anthropic/claude-fable-5-1".into(),
-			"anthropic/claude-sonnet-5".into(),
-		]);
-		assert!(models.contains("anthropic/claude-fable-5-1"));
-		assert!(models.contains("anthropic/claude-opus-5"));
-		assert_eq!(models.len(), 4);
+	fn anthropic_discovery_is_authoritative_including_unbundled_models() {
+		let discovered = ModelDiscoveryReport {
+			models: BTreeMap::from([(ANTHROPIC_PROVIDER.to_owned(), vec![
+				"anthropic/claude-future-model".to_owned(),
+			])]),
+			..Default::default()
+		};
+		let authenticated = FastHashSet::from_iter([ANTHROPIC_PROVIDER.to_owned()]);
+		let mut visible = FastHashSet::from_iter(["anthropic/previous-model".to_owned()]);
+		let response = discovered
+			.into_refresh_response(&authenticated, &mut visible)
+			.expect("discovered model accepted");
+		assert_eq!(visible, FastHashSet::from_iter(["anthropic/claude-future-model".to_owned()]));
+		assert_eq!(response["models"], json!(["anthropic/claude-future-model"]));
+		assert_eq!(response["refreshed"], json!([ANTHROPIC_PROVIDER]));
+		assert_eq!(response["warnings"], json!([]));
 	}
 
 	#[test]
 	fn anthropic_models_require_an_authenticated_account() {
-		let discovered =
-			HashMap::from([("anthropic".to_owned(), vec!["anthropic/claude-fable-5-1".to_owned()])]);
-		assert!(anthropic_models_for(&HashSet::new(), &discovered).is_empty());
-		let authenticated = HashSet::from(["anthropic".to_owned()]);
-		assert!(
-			anthropic_models_for(&authenticated, &discovered).contains("anthropic/claude-fable-5-1")
+		let discovered = ModelDiscoveryReport {
+			models: BTreeMap::from([(ANTHROPIC_PROVIDER.to_owned(), vec![
+				"anthropic/claude-future-model".to_owned(),
+			])]),
+			..Default::default()
+		};
+		let mut visible = FastHashSet::from_iter(["anthropic/previous-model".to_owned()]);
+		discovered.update_anthropic_models(&FastHashSet::default(), &mut visible);
+		assert!(visible.is_empty());
+	}
+
+	#[test]
+	fn failed_refresh_preserves_visible_models_and_reports_failure() {
+		let discovered = ModelDiscoveryReport {
+			errors: BTreeMap::from([(
+				ANTHROPIC_PROVIDER.to_owned(),
+				"discovery unavailable".to_owned(),
+			)]),
+			..Default::default()
+		};
+		let authenticated = FastHashSet::from_iter([ANTHROPIC_PROVIDER.to_owned()]);
+		let previous = FastHashSet::from_iter(["anthropic/previous-model".to_owned()]);
+		let mut visible = previous.clone();
+		let error = discovered
+			.into_refresh_response(&authenticated, &mut visible)
+			.expect_err("failed refresh is not successful");
+		assert_eq!(visible, previous);
+		assert_eq!(error.code.as_str(), "model_discovery_failed");
+		assert!(error.message.contains("anthropic: discovery unavailable"));
+	}
+
+	#[test]
+	fn partial_refresh_reports_only_successes_and_preserves_failed_provider_models() {
+		let discovered = ModelDiscoveryReport {
+			models: BTreeMap::from([(CODEX_PROVIDER.to_owned(), vec![
+				"openai-codex/future-model".to_owned(),
+			])]),
+			errors: BTreeMap::from([(
+				ANTHROPIC_PROVIDER.to_owned(),
+				"discovery unavailable".to_owned(),
+			)]),
+		};
+		let authenticated =
+			FastHashSet::from_iter([ANTHROPIC_PROVIDER.to_owned(), CODEX_PROVIDER.to_owned()]);
+		let previous = FastHashSet::from_iter(["anthropic/previous-model".to_owned()]);
+		let mut visible = previous.clone();
+		let response = discovered
+			.into_refresh_response(&authenticated, &mut visible)
+			.expect("partial result");
+		assert_eq!(visible, previous);
+		assert_eq!(response["refreshed"], json!([CODEX_PROVIDER]));
+		assert_eq!(response["models"], json!(["openai-codex/future-model"]));
+		assert_eq!(
+			response["warnings"],
+			json!([{ "providerId": ANTHROPIC_PROVIDER, "error": "discovery unavailable" }])
 		);
+		assert_eq!(response["restartRequired"], true);
+	}
+
+	#[test]
+	fn refresh_without_authenticated_providers_does_not_require_restart() {
+		let mut visible = FastHashSet::from_iter(["anthropic/previous-model".to_owned()]);
+		let response = ModelDiscoveryReport::default()
+			.into_refresh_response(&FastHashSet::default(), &mut visible)
+			.expect("no providers need refresh");
+		assert!(visible.is_empty());
+		assert_eq!(response["refreshed"], json!([]));
+		assert_eq!(response["warnings"], json!([]));
+		assert_eq!(response["restartRequired"], false);
+	}
+
+	#[test]
+	fn uncached_startup_fallback_uses_bundled_anthropic_chat_models() {
+		let data_dir = tempfile::tempdir().expect("data dir");
+		let models =
+			fallback_provider_models(data_dir.path(), ANTHROPIC_PROVIDER, &AccountPins::default());
+		assert!(!models.is_empty());
+		for key in models {
+			assert_eq!(key.split_once('/').map(|(provider, _)| provider), Some(ANTHROPIC_PROVIDER));
+			let model = Catalog::embedded()
+				.models()
+				.iter()
+				.find(|model| model.key.as_str() == key)
+				.expect("bundled model");
+			assert!(
+				model
+					.capabilities
+					.operations
+					.contains_kind(OperationKind::Chat)
+			);
+		}
 	}
 
 	#[test]
