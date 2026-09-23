@@ -302,3 +302,9 @@ test-omperor-background:
 test-omperor-codex-metadata:
     cargo nextest run -p omp-ai --lib --locked -E 'test(codec::openai_codex::tests::)'
     cargo test --doc -p omp-ai --locked
+
+# Detached stdout must not wake inference before its terminal follow-up exists.
+[group('test')]
+test-omperor-background-progress:
+    cargo nextest run -p omp-agent --test turn --test jobs --locked -E 'not test(tool_call_round_settles_in_the_dom_then_runs_second_inference)'
+    cargo test --doc -p omp-agent --locked

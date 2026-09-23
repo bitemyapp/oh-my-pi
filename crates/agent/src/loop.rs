@@ -1723,7 +1723,10 @@ impl<C: Inference> Kernel<C> {
 			// settlement (or steering / an
 			// interrupt) and re-enters with the async-result follow-up.
 			if crate::jobs::pending_wake(session.dom()) {
-				match self.await_settlement(session, turn_cancel, control).await? {
+				match self
+					.await_settlement(session, turn, turn_cancel, control)
+					.await?
+				{
 					Awaited::Settled => continue,
 					Awaited::Steering => {
 						was_steered = true;
@@ -1908,6 +1911,7 @@ impl<C: Inference> Kernel<C> {
 	async fn await_settlement(
 		&mut self,
 		session: &mut Session,
+		turn: Handle,
 		turn_cancel: &crate::TurnCancellation,
 		control: &RunControl,
 	) -> Result<Awaited, KernelError> {
@@ -1931,7 +1935,17 @@ impl<C: Inference> Kernel<C> {
 					turn_cancel.cancel_turn();
 					return Ok(Awaited::Cancelled);
 				},
-				AwaitSignal::Finished => return Ok(Awaited::Settled),
+				AwaitSignal::Finished => {
+					// Detached tools signal on progress as well as completion. Drain
+					// their updates, but resume inference only after a terminal result
+					// has been journaled as a user follow-up. Otherwise the next
+					// request both wastes tokens and ends in assistant prefill.
+					let delivered = self.deliver_settlements(session, turn)?;
+					self.apply_live_components(session)?;
+					if delivered {
+						return Ok(Awaited::Settled);
+					}
+				},
 				AwaitSignal::Control(message) => match call_control.handle(session, message)? {
 					Received::ToolScopedAbort(_) => {},
 					Received::Cancelled => return Ok(Awaited::Cancelled),

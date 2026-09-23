@@ -526,3 +526,40 @@ async fn jobs_restart_adopts_terminal_artifact_and_settles_exactly_once() {
 		"the recovered terminal is journaled exactly once"
 	);
 }
+
+/// A restart between the tool's terminal entry and jobs.settle must recover
+/// an inline result, rather than re-delivering the initial detached handle.
+#[tokio::test]
+async fn jobs_restart_recovers_inline_terminal_output() {
+	let raw = |value: serde_json::Value| {
+		serde_json::value::to_raw_value(&value).expect("serialize test value")
+	};
+	let temp = tempdir().expect("temporary session directory");
+	let path = temp.path().join("inline.oms");
+	let mut session = Session::create(&path, ComponentRegistry::standard()).expect("create session");
+	session.begin_turn().expect("turn");
+	let call = session
+		.call("bash", 1, "inline-call", None, Some(raw(serde_json::json!({}))), None)
+		.expect("call");
+	session
+		.settle(call, raw(serde_json::json!({"kind": "detached", "id": "inline-job"})))
+		.expect("detach");
+	let output = serde_json::json!({"kind": "ok", "value": {"text": "INLINE_DONE"}});
+	session
+		.settle(call, raw(output.clone()))
+		.expect("terminal result");
+	drop(session);
+	let mut session = Session::open(&path, ComponentRegistry::standard()).expect("restart session");
+	let board = JobBoard::new();
+	board.rebuild(&session);
+	let jobs = board.poll(&mut session).expect("recover");
+	assert_eq!(jobs.len(), 1);
+	assert_eq!(jobs[0].status, "completed");
+	assert_eq!(
+		serde_json::from_str::<serde_json::Value>(
+			jobs[0].output.as_ref().expect("inline output").get()
+		)
+		.expect("json"),
+		output
+	);
+}

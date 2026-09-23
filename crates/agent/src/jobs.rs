@@ -523,9 +523,9 @@ impl JobBoard {
 		})
 	}
 
-	/// Whether any owned execution unit has finished but not yet been
-	/// committed to its DOM node (a cheap check the turn loop makes before
-	/// deciding whether to poll).
+	/// Whether any owned execution unit has progress or completion to commit
+	/// to its DOM node (a cheap check before polling). Progress alone does not
+	/// mean a result is ready for inference.
 	#[must_use]
 	pub fn has_finished_units(&self) -> bool {
 		self.jobs.lock().values().any(|job| {
@@ -540,8 +540,9 @@ impl JobBoard {
 		})
 	}
 
-	/// Resolves once any owned execution unit finishes (never when none is
-	/// live); used by hosts idling between turns.
+	/// Resolves when an owned execution unit has progress or completion
+	/// (never when none is live). Callers must poll and check for an actual
+	/// settlement before resuming inference.
 	pub async fn any_finished(&self) {
 		loop {
 			if self.has_finished_units() {
@@ -874,7 +875,14 @@ fn recovered_tool_settlement(dom: &Dom, record: &JobRecord) -> Option<RecoveredS
 			.and_then(|child| prop(child, PropId::Text))
 			.map_or_else(|| Str::new_static("detached tool failed"), Str::new)
 	});
-	Some(RecoveredSettlement { is_error, status: None, artifact, output: None, error })
+	// Inline terminals have no artifact. Recover their latest payload too;
+	// otherwise the job retains its original "detached/running" data.
+	let output = if artifact.is_none() {
+		call_outcome(dom, handle).map(ToOwned::to_owned)
+	} else {
+		None
+	};
+	Some(RecoveredSettlement { is_error, status: None, artifact, output, error })
 }
 
 fn find_call(dom: &Dom, parent: Handle, call: EntryId) -> Option<Handle> {
@@ -903,26 +911,30 @@ fn call_artifact(dom: &Dom, call: Handle) -> Option<BlobRef> {
 	{
 		return BlobRef::parse_hex(hash, size).ok();
 	}
-	let details = dom.children(call).iter().rev().find_map(|handle| {
-		let child = dom.get(*handle)?;
-		match child.tag {
-			Tag::Known(KnownTag::Result) => match child.prop(&PropKey::from(PropId::Outcome)) {
-				Some(Value::Json(raw)) => Some(raw),
-				_ => None,
-			},
-			Tag::Known(KnownTag::Diag) => match child.prop(&PropKey::from(PropId::Fault)) {
-				Some(Value::Json(raw)) => Some(raw),
-				_ => None,
-			},
-			_ => None,
-		}
-	})?;
+	let details = call_outcome(dom, call)?;
 	let CallOutcomeDetails::Spilled { blob, byte_len } =
 		serde_json::from_str::<CallOutcomeDetails>(details.get()).ok()?
 	else {
 		return None;
 	};
 	BlobRef::parse_hex(blob.hash.as_str(), byte_len).ok()
+}
+
+fn call_outcome(dom: &Dom, call: Handle) -> Option<&RawValue> {
+	dom.children(call).iter().rev().find_map(|handle| {
+		let child = dom.get(*handle)?;
+		match child.tag {
+			Tag::Known(KnownTag::Result) => match child.prop(&PropKey::from(PropId::Outcome)) {
+				Some(Value::Json(raw)) => Some(raw.as_ref()),
+				_ => None,
+			},
+			Tag::Known(KnownTag::Diag) => match child.prop(&PropKey::from(PropId::Fault)) {
+				Some(Value::Json(raw)) => Some(raw.as_ref()),
+				_ => None,
+			},
+			_ => None,
+		}
+	})
 }
 
 /// Inline shape of a settlement output that exceeded the board's bound: the

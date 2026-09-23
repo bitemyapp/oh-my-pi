@@ -960,6 +960,7 @@ async fn settled_background_job_is_delivered_to_the_model_as_a_follow_up_turn() 
 	assert_eq!(outcome.stop, TurnStop::Completed);
 	let requests = requests.lock();
 	assert_eq!(requests.len(), 2, "the settlement re-woke the loop for one follow-up request");
+	assert_eq!(requests[1].messages.last().expect("follow-up").role, Role::User);
 	assert!(requests[1].messages.iter().any(|message| {
 		message.role == Role::User
 			&& message.content.iter().any(|part| {
@@ -989,6 +990,92 @@ async fn settled_background_job_is_delivered_to_the_model_as_a_follow_up_turn() 
 			.expect("selector")
 			.count()
 			== 1
+	);
+}
+
+/// Progress from a detached tool updates the journal but must not spend a
+/// model request until the terminal result can be appended as a user follow-up.
+#[tokio::test]
+async fn background_progress_does_not_resume_inference_before_completion() {
+	use omp_agent::{
+		ExternalDispatchEvent, ExternalDispatchRequest, ExternalDispatchStream, ExternalToolExecutor,
+	};
+	use omp_tool::{CallOutcome, Claims, Part, Precedence, Presentation};
+
+	struct ProgressJob {
+		progress: flume::Receiver<()>,
+		complete: flume::Receiver<()>,
+	}
+	impl ExternalToolExecutor for ProgressJob {
+		fn invoke(&self, _: ExternalDispatchRequest) -> ExternalDispatchStream {
+			let progress = self.progress.clone();
+			let complete = self.complete.clone();
+			Box::pin(async_stream::stream! {
+				progress.recv_async().await.expect("progress gate");
+				yield ExternalDispatchEvent::Update(support::raw(serde_json::json!({"text": "still working"})));
+				complete.recv_async().await.expect("completion gate");
+				yield ExternalDispatchEvent::Done {
+					outcome: CallOutcome::Ok(serde_json::json!({"text": "FINAL_RESULT"})),
+					parts: vec![Part::Text { text: Str::new_static("FINAL_RESULT") }],
+					is_error: false,
+					source_artifact: None,
+				};
+			})
+		}
+	}
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let (inference, requests) = ScriptedInference::new([
+		tool_script("job-1", "worker", serde_json::json!({})),
+		text_script("waiting for completion"),
+		text_script("FINAL_RESULT"),
+	]);
+	let mut tools = omp_tool::Registry::new();
+	tools
+		.register_worker(support::tool_spec("worker", 1), Presentation::Slot, Claims {
+			precedence: Precedence::CORE,
+			claimant:   Str::new_static("test"),
+			replaces:   None,
+		})
+		.expect("worker registers");
+	let (progress_tx, progress_rx) = flume::bounded(1);
+	let (complete_tx, complete_rx) = flume::bounded(1);
+	let mut kernel = Kernel::new(
+		inference,
+		Arc::new(tools),
+		policy(&directory.path().join("blobs")).with_limits(64 * 1024, 512, Duration::from_millis(5)),
+		StaticPrompt(Str::new_static("test system")),
+	)
+	.with_external_executor(Arc::new(ProgressJob { progress: progress_rx, complete: complete_rx }));
+	let mut session = fresh_session(&directory.path().join("progress.oms"));
+	let probe = async {
+		tokio::time::timeout(Duration::from_secs(2), async {
+			while requests.lock().len() < 2 {
+				tokio::time::sleep(Duration::from_millis(1)).await;
+			}
+		})
+		.await
+		.expect("parent reaches candidate yield");
+		progress_tx.send(()).expect("send progress");
+		tokio::time::sleep(Duration::from_millis(150)).await;
+		assert_eq!(requests.lock().len(), 2, "progress must not trigger inference");
+		complete_tx.send(()).expect("send completion");
+	};
+	let (outcome, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+		tokio::join!(kernel.run_turn(&mut session, input("run worker"), RunControl::default()), probe)
+	})
+	.await
+	.expect("job completes");
+	assert_eq!(outcome.expect("turn succeeds").stop, TurnStop::Completed);
+	let requests = requests.lock();
+	assert_eq!(requests.len(), 3, "one invocation, one yield, one completion response");
+	let last = requests[2].messages.last().expect("completion input");
+	assert_eq!(last.role, Role::User, "completion must not become assistant prefill");
+	assert!(
+		last.content.iter().any(|part| matches!(part,
+			ContentPart::Text { text, .. } if text.contains("FINAL_RESULT") && text.contains("has completed")
+		)),
+		"completion content: {:?}",
+		last.content
 	);
 }
 
