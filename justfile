@@ -315,3 +315,15 @@ test-omperor-explicit-async:
     cargo nextest run -p omp-tools --test it --locked -E 'test(shell::)'
     cargo nextest run -p omp-agent --test dispatch --locked -E 'not test(central_truncation_spills_and_notrunc_explicitly_opts_out)'
     cargo test --doc -p omp-tools -p omp-agent --locked
+
+# RPC error events retain the actual terminal fault after output spill notices.
+[group('test')]
+test-omperor-rpc-tool-results:
+    cargo nextest run -p omp-app --lib --locked -E 'test(rpc_mode::tests::rpc_tool_)'
+    cargo test --doc -p omp-app --locked
+
+# Native environment verdicts keep their typed model projections across RPC.
+[group('test')]
+test-omperor-native-projection:
+    cargo nextest run -p omp-envd --lib --locked -E 'test(server::tests::native_verdict_)'
+    cargo test --doc -p omp-envd --locked

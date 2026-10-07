@@ -770,12 +770,24 @@ fn tool_args(dom: &Dom, tool: Handle) -> Value {
 }
 
 fn tool_result(dom: &Dom, tool: Handle, status: &str) -> Value {
-	let tag = if status == "error" {
-		KnownTag::Diag
+	let terminal = if status == "error" {
+		// Informational diagnostics (including output spill notices) precede
+		// the terminal fault. They must not replace its details in live RPC
+		// events or replayed history.
+		dom.children(tool)
+			.iter()
+			.rev()
+			.find_map(|handle| {
+				let node = dom.get(*handle)?;
+				(node.tag == Tag::Known(KnownTag::Diag)
+					&& node.prop(&PropKey::from(PropId::Fault)).is_some())
+				.then_some((*handle, node))
+			})
+			.or_else(|| child(dom, tool, KnownTag::Diag))
 	} else {
-		KnownTag::Result
+		child(dom, tool, KnownTag::Result)
 	};
-	let Some((handle, node)) = child(dom, tool, tag) else {
+	let Some((handle, node)) = terminal else {
 		return Value::Null;
 	};
 	if let Some(DomValue::Json(raw)) = node.prop(&PropKey::from(PropId::Outcome)) {
@@ -3126,6 +3138,115 @@ mod tests {
 	use serde_json::json;
 
 	use super::{inference_error_fields, offered_service_tiers, offers_fast_tier};
+
+	#[test]
+	fn rpc_tool_failure_after_spill_reports_terminal_fault_in_live_events_and_history() {
+		use omp_session::{ComponentRegistry, Session};
+		let directory = tempfile::tempdir().expect("temporary session directory");
+		let mut session = Session::create(
+			directory.path().join("rpc-failed-shell.oms"),
+			ComponentRegistry::default(),
+		)
+		.expect("session creates");
+		session.begin_turn().expect("turn starts");
+		let call = session
+			.call(
+				"bash",
+				2,
+				"failed-shell",
+				None,
+				Some(serde_json::value::to_raw_value(&json!({"command": "false"})).unwrap()),
+				None,
+			)
+			.expect("call starts");
+		session.call_started(call).expect("command starts");
+		let mut projection = super::RpcEventProjection::default();
+		projection.observe(session.dom());
+		session
+			.call_update(
+				call,
+				serde_json::value::to_raw_value(&json!({"diag": {
+					"severity": "info",
+					"kind": "output_bounded",
+					"text": "output exceeded inline limits"
+				}}))
+				.unwrap(),
+			)
+			.expect("spill notice appends");
+		assert!(
+			projection
+				.observe(session.dom())
+				.iter()
+				.all(|event| event["type"] != "tool_execution_end")
+		);
+		let fault = json!({
+			"kind": "command_failed",
+			"payload": {"status": {"exit_code": 1}, "stderr": "AssertionError: expected 4, got 3"}
+		});
+		let expected = json!({"content": [{"type": "text", "text":
+			"bash command failed: exit=1\nAssertionError: expected 4, got 3"
+		}]});
+		session
+			.fail_projected(
+				call,
+				serde_json::value::to_raw_value(&fault).unwrap(),
+				serde_json::value::to_raw_value(&json!([{"kind": "text", "text":
+					"bash command failed: exit=1\nAssertionError: expected 4, got 3"
+				}]))
+				.unwrap(),
+			)
+			.expect("command fails");
+		let events = projection.observe(session.dom());
+		let terminal = events
+			.iter()
+			.find(|event| event["type"] == "tool_execution_end")
+			.expect("terminal RPC event");
+		assert_eq!(terminal["isError"], true);
+		assert_eq!(terminal["result"], expected);
+		assert!(projection.observe(session.dom()).is_empty());
+		let messages = super::rpc_messages(session.dom());
+		let replay = messages
+			.iter()
+			.find(|message| message["role"] == "toolResult")
+			.expect("replayed tool result");
+		assert_eq!(replay["isError"], true);
+		assert_eq!(replay["content"], expected["content"]);
+	}
+
+	#[test]
+	fn rpc_tool_spill_notice_does_not_replace_successful_outcome() {
+		use omp_session::{ComponentRegistry, Session};
+		let directory = tempfile::tempdir().expect("temporary session directory");
+		let mut session = Session::create(
+			directory.path().join("rpc-successful-shell.oms"),
+			ComponentRegistry::default(),
+		)
+		.expect("session creates");
+		session.begin_turn().expect("turn starts");
+		let call = session
+			.call("bash", 2, "successful-shell", None, None, None)
+			.expect("call starts");
+		session
+			.call_update(
+				call,
+				serde_json::value::to_raw_value(&json!({"diag": {
+					"severity": "info", "kind": "output_bounded", "text": "output exceeded inline limits"
+				}}))
+				.unwrap(),
+			)
+			.expect("spill notice appends");
+		let outcome = json!({"status": {"exit_code": 0}, "stdout": "tests passed"});
+		session
+			.settle(call, serde_json::value::to_raw_value(&outcome).unwrap())
+			.expect("command succeeds");
+		let events = super::RpcEventProjection::default().observe(session.dom());
+		let terminal = events
+			.iter()
+			.find(|event| event["type"] == "tool_execution_end")
+			.expect("terminal RPC event");
+		assert_eq!(terminal["isError"], false);
+		assert_eq!(terminal["result"], outcome);
+	}
 
 	#[test]
 	fn receipt_rpc_preserves_journal_identity_and_accounting_provenance() {

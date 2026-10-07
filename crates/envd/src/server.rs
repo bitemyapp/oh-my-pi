@@ -9188,6 +9188,8 @@ async fn spawn_native_invocation(
 																request_id,
 																&invocation_id,
 																retention_session.as_deref(),
+																&registry,
+																&name,
 																&lifecycle,
 																output_request,
 																&blobs,
@@ -9244,6 +9246,8 @@ async fn spawn_native_invocation(
 															request_id,
 															&invocation_id,
 															retention_session.as_deref(),
+															&registry,
+															&name,
 															&lifecycle,
 															output_request,
 															&blobs,
@@ -9408,6 +9412,79 @@ fn output_projection(
 	}
 }
 
+#[derive(Debug, Error)]
+enum NativeProjectionError {
+	#[error("native tool identity disappeared")]
+	MissingIdentity,
+	#[error("native tool projection failed")]
+	Registry(#[from] RegistryError),
+	#[error("native JSON projection is not UTF-8")]
+	Utf8(#[from] str::Utf8Error),
+	#[error("native media projection has an invalid identity or media type")]
+	InvalidMedia,
+	#[error("native media projection could not be retained")]
+	Blob(#[from] BlobError),
+}
+
+/// Native verdicts use the tool's own model projection before crossing the
+/// environment boundary. Serializing shell transcript bytes as JSON here
+/// turns ordinary output into one long line that the central spill gate clips.
+fn native_verdict_parts(
+	registry: &Registry,
+	name: &str,
+	verdict: &[u8],
+	useless: bool,
+	blobs: &BlobHost,
+	retention_session: Option<&str>,
+	invocation_id: &str,
+) -> Result<Vec<thread_pb::Part>, NativeProjectionError> {
+	let identity = registry
+		.resolved_identity(name)
+		.ok_or(NativeProjectionError::MissingIdentity)?;
+	let caps = omp_tool::PromptCaps::for_tool(
+		omp_tool::CapsBase {
+			maximum_parts:      u16::MAX,
+			maximum_text_bytes: u32::MAX,
+			media:              true,
+			model_class:        omp_tool::ModelClass::Standard,
+		},
+		&identity.rev,
+	);
+	let projected = registry.project_verdict(&identity, verdict, useless, &caps)?;
+	projected
+		.parts
+		.iter()
+		.map(|part| {
+			let kind = match part {
+				omp_tool::Part::Text { text } => thread_pb::part::Kind::Text(text.to_string()),
+				omp_tool::Part::Json { json } => {
+					thread_pb::part::Kind::Text(str::from_utf8(json)?.to_owned())
+				},
+				omp_tool::Part::Blob { blob, .. } => {
+					if !valid_blob_media_type(&blob.media_type) {
+						return Err(NativeProjectionError::InvalidMedia);
+					}
+					let hash = blob
+						.hash
+						.parse::<Hash32>()
+						.map_err(|_| NativeProjectionError::InvalidMedia)?;
+					blobs.retain_verdict_blob(retention_session, invocation_id, BlobId {
+						hash: hash.into_bytes(),
+						size: blob.byte_len,
+					})?;
+					thread_pb::part::Kind::Blob(thread_pb::Blob {
+						hash: Bytes::copy_from_slice(hash.as_bytes()),
+						mime: blob.media_type.to_string(),
+						size: blob.byte_len,
+						..Default::default()
+					})
+				},
+			};
+			Ok(thread_pb::Part { kind: Some(kind) })
+		})
+		.collect()
+}
+
 async fn forward_native_event(
 	event: Option<Result<ErasedEv, omp_tool::RegistryError>>,
 	cancelling: bool,
@@ -9415,6 +9492,8 @@ async fn forward_native_event(
 	request_id: u64,
 	invocation_id: &Str,
 	retention_session: Option<&str>,
+	registry: &Registry,
+	name: &str,
 	lifecycle: &NativeLifecycle,
 	output_request: omp_tool::OutputRequest,
 	blobs: &BlobHost,
@@ -9442,7 +9521,35 @@ async fn forward_native_event(
 		},
 		Some(Ok(ErasedEv::Done(outcome))) => {
 			if lifecycle.claim_terminal() {
+				let project = matches!(&outcome, ErasedOutcome::Done { .. });
 				let (json, is_error, useless) = erased_outcome_wire(outcome);
+				let mut parts = if project {
+					match native_verdict_parts(
+						registry,
+						name,
+						&json,
+						useless,
+						blobs,
+						retention_session,
+						invocation_id,
+					) {
+						Ok(parts) => parts,
+						Err(error) => {
+							tracing::error!(%error, %invocation_id, "native verdict projection failed");
+							let _ = send_invocation_error(
+								responses,
+								request_id,
+								pb::ProtocolErrorCode::Internal,
+								"native verdict projection failed",
+							)
+							.await;
+							return NativeForward::Terminal;
+						},
+					}
+				} else {
+					Vec::new()
+				};
+				let (_, _, parts_omitted) = project_wire_parts(&mut parts, output_request);
 				let details_blob =
 					match blobs.put_verdict_bytes(retention_session, invocation_id, &json) {
 						Ok(reference) => reference,
@@ -9467,8 +9574,9 @@ async fn forward_native_event(
 					omp_tool::OutputRequest::Bounded => DEFAULT_RESULT_PROJECTION_BYTES,
 					omp_tool::OutputRequest::Complete => COMPLETE_RESULT_PROJECTION_BYTES,
 				};
-				let omitted = json.len() > limit;
-				let inline = if omitted { Bytes::new() } else { json };
+				let json_omitted = json.len() > limit;
+				let omitted = json_omitted || parts_omitted;
+				let inline = if json_omitted { Bytes::new() } else { json };
 				let inline_bytes = u64::try_from(inline.len()).unwrap_or(u64::MAX);
 				let projection = output_projection(
 					output_request,
@@ -9484,7 +9592,7 @@ async fn forward_native_event(
 						invocation_id: invocation_id.to_string(),
 						json: inline,
 						details_blob: Some(details_blob),
-						parts: Vec::new(),
+						parts,
 						is_error,
 						useless,
 						terminate: None,
@@ -12334,6 +12442,130 @@ fn ensure_directory(path: &Path) -> io::Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
 	use std::{fs, os::unix::fs::PermissionsExt as _, sync::Arc};
+
+	fn shell_projection_registry(root: &Path, blobs: &BlobHost) -> Registry {
+		let mut registry = Registry::new();
+		registry
+			.register_environment(
+				omp_tools::shell::shell(crate::tool_shell::ShellExecHost::new(
+					ExecHost::new(),
+					blobs.clone(),
+					Str::new(Url::from_directory_path(root).unwrap().as_str()),
+					Arc::new(ResolverTable::default()),
+					ShellSettings::default(),
+					SandboxSettings::default(),
+					AcpExecSlot::default(),
+					false,
+				)),
+				omp_tool::Presentation::Device,
+				omp_tool::Claims {
+					precedence: omp_tool::Precedence::ENHANCEMENT,
+					claimant:   sf!("omp/test"),
+					replaces:   None,
+				},
+			)
+			.expect("shell registration");
+		registry
+	}
+
+	fn shell_verdict(failed: bool, text: &str, attachments: serde_json::Value) -> Bytes {
+		let payload = serde_json::json!({
+			"session_id": [1], "exec_id": [2], "command": "test command",
+			"transcript": [{"channel": "stderr", "data": text.as_bytes(), "sequence": 1}],
+			"attachments": attachments, "adjustments": [],
+			"status": {"outcome": if failed { "failed" } else { "exited" },
+				"exit_code": if failed { 1 } else { 0 }, "signal": null,
+				"wall_clock_ms": 1, "spilled_output": null,
+				"aborted": false, "effects_unknown": false}
+		});
+		let outcome = if failed {
+			serde_json::json!({"kind": "faulted", "value": {"kind": "command_failed", "payload": payload}})
+		} else {
+			serde_json::json!({"kind": "ok", "value": payload})
+		};
+		let typed: CallOutcome<omp_tools::shell::Payload, omp_tools::shell::Fault> =
+			serde_json::from_value(outcome).expect("valid typed shell fixture");
+		Bytes::from(serde_json::to_vec(&typed).unwrap())
+	}
+
+	#[tokio::test]
+	async fn native_verdict_projects_shell_stdout_and_faults_before_transport() {
+		let directory = tempfile::tempdir().expect("temporary directory");
+		let blobs = BlobHost::open(directory.path().join("blobs")).expect("blobs");
+		let registry = shell_projection_registry(directory.path(), &blobs);
+		// Long enough to trigger the old single-JSON-line clamp, but ordinary
+		// short human-readable lines fit intact in the central projection.
+		let text = "AssertionError: expected 4, got 3\n".repeat(60);
+		for failed in [false, true] {
+			let verdict = shell_verdict(failed, &text, serde_json::json!([]));
+			let lifecycle = NativeLifecycle { state: AtomicU8::new(NATIVE_COMMITTED) };
+			let (responses, receiver) = flume::bounded(1);
+			let result = forward_native_event(
+				Some(Ok(ErasedEv::Done(ErasedOutcome::Done { verdict, useless: false }))),
+				false,
+				"",
+				1,
+				&sf!("shell-output"),
+				None,
+				&registry,
+				"bash",
+				&lifecycle,
+				omp_tool::OutputRequest::Bounded,
+				&blobs,
+				&responses,
+			)
+			.await;
+			assert!(matches!(result, NativeForward::Terminal));
+			let frame = receiver.recv().expect("terminal frame");
+			let Some(server_frame::Body::Verdict(verdict)) = frame.body else {
+				panic!("expected verdict: {:?}", frame.body);
+			};
+			assert_eq!(verdict.is_error, failed);
+			assert!(!verdict.projection.as_ref().unwrap().omitted);
+			let projected = verdict
+				.parts
+				.iter()
+				.filter_map(|part| match &part.kind {
+					Some(thread_pb::part::Kind::Text(text)) => Some(text.as_str()),
+					_ => None,
+				})
+				.collect::<String>();
+			assert!(projected.contains(&text), "complete decoded shell output: {projected}");
+			assert!(!projected.contains("transcript"));
+			if failed {
+				assert!(projected.contains("bash command failed"));
+			}
+		}
+	}
+
+	#[test]
+	fn native_verdict_retains_shell_media_and_preserves_its_wire_identity() {
+		let directory = tempfile::tempdir().expect("temporary directory");
+		let blobs = BlobHost::open(directory.path().join("blobs")).expect("blobs");
+		let registry = shell_projection_registry(directory.path(), &blobs);
+		let image = blobs.put(b"image fixture").expect("image blob");
+		let hash = Hash32::from(image.hash);
+		let verdict = shell_verdict(
+			false,
+			"image follows\n",
+			serde_json::json!([{
+				"hash": hash.to_string(), "media_type": "image/png", "byte_len": image.size
+			}]),
+		);
+		let parts =
+			native_verdict_parts(&registry, "bash", &verdict, false, &blobs, None, "media").unwrap();
+		let media = parts
+			.iter()
+			.find_map(|part| match &part.kind {
+				Some(thread_pb::part::Kind::Blob(blob)) => Some(blob),
+				_ => None,
+			})
+			.expect("media projection");
+		assert_eq!(media.hash.as_ref(), hash.as_bytes());
+		assert_eq!(media.mime, "image/png");
+		assert_eq!(media.size, image.size);
+		assert!(media.inline.is_empty());
+	}
 
 	#[test]
 	fn a_zero_deadline_means_the_client_owns_the_invocation() {
