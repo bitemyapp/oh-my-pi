@@ -8,7 +8,7 @@ use std::{
 	future::Future,
 	io,
 	io::IsTerminal as _,
-	path::Path,
+	path::{Path, PathBuf},
 	sync::{Arc, LazyLock},
 	time::Duration,
 };
@@ -145,6 +145,35 @@ pub enum RegistryError {
 	/// Native configuration or discovery cache could not be composed.
 	#[error("live catalog composition failed")]
 	CatalogComposition(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+	/// Another process held the discovery-cache writer lease past its deadline.
+	#[error("model discovery cache {path} is busy; retry startup after model refresh finishes")]
+	DiscoveryCacheBusy {
+		/// Cache whose writer lease was unavailable.
+		path:   PathBuf,
+		/// Typed cause retained without printing untrusted SQLite text.
+		#[source]
+		source: omp_ai::discovery::DiscoveryStoreError,
+	},
+	/// Discovery-cache SQLite access failed with a non-content diagnostic.
+	#[error("could not read model discovery cache {path} (SQLite code {code})")]
+	DiscoveryCacheSqlite {
+		/// Cache that could not be read.
+		path:   PathBuf,
+		/// SQLite extended result code.
+		code:   i32,
+		/// Typed cause retained without printing untrusted SQLite text.
+		#[source]
+		source: omp_ai::discovery::DiscoveryStoreError,
+	},
+	/// A cached model row could not be decoded.
+	#[error("could not decode model discovery cache {path}")]
+	DiscoveryCacheDecode {
+		/// Cache that could not be decoded.
+		path:   PathBuf,
+		/// Typed cause retained without printing model or credential contents.
+		#[source]
+		source: omp_ai::discovery::DiscoveryStoreError,
+	},
 	/// Registry construction or route service failed.
 	#[error(transparent)]
 	Inference(#[from] Box<omp_ai::Error>),
@@ -370,7 +399,8 @@ pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, Reg
 	if !cache_path.exists() {
 		return Ok(Arc::new(configured));
 	}
-	let store = omp_ai::discovery::DiscoveryStore::open(&cache_path).map_err(catalog_composition)?;
+	let store = omp_ai::discovery::DiscoveryStore::open(&cache_path)
+		.map_err(|source| catalog_cache_error(&cache_path, source))?;
 	let now_ms = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
 		.unwrap_or_default()
@@ -415,7 +445,7 @@ pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, Reg
 		} else {
 			store.load_fresh(cache_key, now_ms)
 		}
-		.map_err(catalog_composition)?;
+		.map_err(|source| catalog_cache_error(&cache_path, source))?;
 		let Some(cached) = cached else {
 			continue;
 		};
@@ -578,6 +608,28 @@ fn offered_tiers_patch(
 	)
 }
 
+fn catalog_cache_error(
+	path: &Path,
+	source: omp_ai::discovery::DiscoveryStoreError,
+) -> RegistryError {
+	if let omp_ai::discovery::DiscoveryStoreError::Sqlite(error) = &source {
+		if let Some(error) = error.sqlite_error() {
+			if matches!(
+				error.code,
+				rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+			) {
+				return RegistryError::DiscoveryCacheBusy { path: path.to_path_buf(), source };
+			}
+			return RegistryError::DiscoveryCacheSqlite {
+				path: path.to_path_buf(),
+				code: error.extended_code,
+				source,
+			};
+		}
+	}
+	RegistryError::DiscoveryCacheDecode { path: path.to_path_buf(), source }
+}
+
 fn catalog_composition(source: impl std::error::Error + Send + Sync + 'static) -> RegistryError {
 	RegistryError::CatalogComposition(Box::new(source))
 }
@@ -601,29 +653,34 @@ async fn refresh_model_discovery_cache(
 	if probes.is_empty() {
 		return Ok(catalog);
 	}
-	let store =
-		Arc::new(DiscoveryStore::open(&data_dir.join("models.db")).map_err(catalog_composition)?);
+	let cache_path = data_dir.join("models.db");
+	let store = Arc::new(
+		DiscoveryStore::open(&cache_path)
+			.map_err(|source| catalog_cache_error(&cache_path, source))?,
+	);
 	let now_ms = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
 		.unwrap_or_default()
 		.as_millis()
 		.try_into()
 		.unwrap_or(u64::MAX);
-	store.prune_expired(now_ms).map_err(catalog_composition)?;
+	store
+		.prune_expired(now_ms)
+		.map_err(|source| catalog_cache_error(&cache_path, source))?;
 	let http = omp_envd::model_discovery::ModelDiscoveryHttpHost::new();
 	let mut pending = Vec::new();
 	for probe in probes {
 		let key = DiscoveryCacheKey::endpoint(probe.provider.clone(), &probe.endpoint);
 		if store
 			.load_fresh(&key, now_ms)
-			.map_err(catalog_composition)?
+			.map_err(|source| catalog_cache_error(&cache_path, source))?
 			.is_some()
 		{
 			continue;
 		}
 		if store
 			.lifecycle(&key)
-			.map_err(catalog_composition)?
+			.map_err(|source| catalog_cache_error(&cache_path, source))?
 			.is_some_and(|state| {
 				state.state == ProviderDiscoveryState::Failed
 					&& state.retry_at_ms.is_some_and(|retry| retry > now_ms)
@@ -639,7 +696,7 @@ async fn refresh_model_discovery_cache(
 				observed_at_ms: now_ms,
 				retry_at_ms:    None,
 			})
-			.map_err(catalog_composition)?;
+			.map_err(|source| catalog_cache_error(&cache_path, source))?;
 		let store = Arc::clone(&store);
 		let http = http.clone();
 		pending.push(async move {
@@ -678,7 +735,7 @@ async fn refresh_model_discovery_cache(
 	}
 	let mut changed = false;
 	for result in futures::future::join_all(pending).await {
-		changed |= result.map_err(catalog_composition)?;
+		changed |= result.map_err(|source| catalog_cache_error(&cache_path, source))?;
 	}
 	if changed {
 		production_catalog(data_dir)
@@ -1468,6 +1525,35 @@ fn production_azure_endpoint() -> Result<Option<AzureEndpointConfig>, RegistryEr
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn catalog_cache_diagnostics_identify_file_and_sqlite_kind_without_raw_text() {
+		let path = Path::new("/scratch/models.db");
+		for (code, expected) in [(5, "is busy"), (1, "SQLite code 1"), (26, "SQLite code 26")] {
+			let error = catalog_cache_error(
+				path,
+				omp_ai::discovery::DiscoveryStoreError::Sqlite(rusqlite::Error::SqliteFailure(
+					rusqlite::ffi::Error::new(code),
+					Some("private credential-bearing diagnostic".into()),
+				)),
+			);
+			let rendered = error.to_string();
+			assert!(rendered.contains("/scratch/models.db"));
+			assert!(rendered.contains(expected));
+			assert!(!rendered.contains("private"));
+			assert!(std::error::Error::source(&error).is_some());
+		}
+	}
+
+	#[test]
+	fn catalog_cache_corruption_has_an_actionable_startup_diagnostic() {
+		let directory = tempfile::tempdir().expect("state");
+		fs::write(directory.path().join("models.db"), b"not a SQLite database")
+			.expect("broken cache");
+		let error = production_catalog(directory.path()).expect_err("cache must fail explicitly");
+		assert!(matches!(error, RegistryError::DiscoveryCacheSqlite { code: 26, .. }));
+		assert!(error.to_string().contains("models.db"));
+	}
 
 	#[test]
 	fn an_unbundled_anthropic_model_survives_cache_expiry_with_live_limits() {

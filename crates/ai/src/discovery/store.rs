@@ -1,12 +1,16 @@
 //! Versioned SQLite cache for secret-free model discovery and provider
 //! lifecycle.
 
-use std::{path::Path, time::Duration};
+use std::{
+	path::Path,
+	thread,
+	time::{Duration, Instant},
+};
 
 use omp_catalog::{DiscoveredModel, ProviderId};
 use omp_core::{Hash32, Str};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension as _, params, types};
+use rusqlite::{Connection, ErrorCode, OptionalExtension as _, TransactionBehavior, params, types};
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
@@ -14,6 +18,7 @@ use strum::{Display, EnumString, IntoStaticStr};
 // represents an authoritative empty generation, and repairs the old primary
 // keys that omitted `cache_scope`.
 const SCHEMA_VERSION: i64 = 5;
+const OPEN_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Secret-free identity of one provider discovery cache namespace.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -114,36 +119,37 @@ pub struct DiscoveryStore {
 impl DiscoveryStore {
 	/// Opens or creates a discovery cache and applies its versioned schema.
 	pub fn open(path: &Path) -> Result<Self, DiscoveryStoreError> {
-		let connection = Connection::open(path)?;
-		connection.pragma_update(None, "journal_mode", "WAL")?;
-		connection.execute_batch(
+		let mut connection = Connection::open(path)?;
+		connection.busy_timeout(OPEN_BUSY_TIMEOUT)?;
+		configure_journal(&connection)?;
+		if schema_version(&connection)? == Some(SCHEMA_VERSION) {
+			return Ok(Self { connection: Mutex::new(connection) });
+		}
+		// SAFETY: Every schema decision is rechecked under the SQLite writer
+		// lease; peers cannot observe partial schema or race another opener's
+		// migration.
+		let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		transaction.execute_batch(
 			"CREATE TABLE IF NOT EXISTS discovery_meta (
 			  key TEXT PRIMARY KEY,
 			  value INTEGER NOT NULL
-			);
-			 CREATE TABLE IF NOT EXISTS provider_lifecycle (
-			  provider TEXT NOT NULL,
-			  cache_scope TEXT NOT NULL,
-			  state TEXT NOT NULL,
-			  error_code TEXT,
-			  observed_at_ms INTEGER NOT NULL,
-			  retry_at_ms INTEGER,
-			  PRIMARY KEY(provider, cache_scope)
 			);",
 		)?;
-		let stored_version = connection
+		let stored_version = transaction
 			.query_row("SELECT value FROM discovery_meta WHERE key='schema_version'", [], |row| {
 				row.get::<_, i64>(0)
 			})
 			.optional()?;
-		if stored_version != Some(SCHEMA_VERSION) {
-			connection.execute_batch(
-				"DROP TABLE IF EXISTS discovered_models;
-				 DROP TABLE IF EXISTS discovery_generations;
-				 DROP TABLE IF EXISTS provider_lifecycle;",
-			)?;
+		if stored_version == Some(SCHEMA_VERSION) {
+			transaction.commit()?;
+			return Ok(Self { connection: Mutex::new(connection) });
 		}
-		connection.execute_batch(
+		transaction.execute_batch(
+			"DROP TABLE IF EXISTS discovered_models;
+			 DROP TABLE IF EXISTS discovery_generations;
+			 DROP TABLE IF EXISTS provider_lifecycle;",
+		)?;
+		transaction.execute_batch(
 			"CREATE TABLE IF NOT EXISTS provider_lifecycle (
 			  provider TEXT NOT NULL,
 			  cache_scope TEXT NOT NULL,
@@ -171,11 +177,12 @@ impl DiscoveryStore {
 			 CREATE INDEX IF NOT EXISTS discovered_models_generation
 			   ON discovered_models(provider, cache_scope, generation);",
 		)?;
-		connection.execute(
+		transaction.execute(
 			"INSERT INTO discovery_meta(key, value) VALUES('schema_version', ?1)
 			 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
 			[SCHEMA_VERSION],
 		)?;
+		transaction.commit()?;
 		Ok(Self { connection: Mutex::new(connection) })
 	}
 
@@ -194,7 +201,9 @@ impl DiscoveryStore {
 		}
 		let expires_at_ms = now_ms.saturating_add(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX));
 		let mut connection = self.connection.lock();
-		let transaction = connection.transaction()?;
+		// Acquire the writer lease before reading a generation or pruning it:
+		// deferred snapshot upgrades fail immediately against a concurrent writer.
+		let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		let generation: u64 = transaction
 			.query_row(
 				"SELECT COALESCE(generation, 0) + 1 FROM discovery_generations
@@ -242,8 +251,9 @@ impl DiscoveryStore {
 		key: &DiscoveryCacheKey,
 		now_ms: u64,
 	) -> Result<Option<CachedDiscovery>, DiscoveryStoreError> {
-		let connection = self.connection.lock();
-		let generation: Option<(u64, u64)> = connection
+		let mut connection = self.connection.lock();
+		let snapshot = connection.transaction()?;
+		let generation: Option<(u64, u64)> = snapshot
 			.query_row(
 				"SELECT generation, expires_at_ms FROM discovery_generations
 				 WHERE provider=?1 AND cache_scope=?2 AND expires_at_ms>?3",
@@ -254,7 +264,7 @@ impl DiscoveryStore {
 		let Some((generation, expires_at_ms)) = generation else {
 			return Ok(None);
 		};
-		let mut statement = connection.prepare(
+		let mut statement = snapshot.prepare(
 			"SELECT row_json FROM discovered_models
 			 WHERE provider=?1 AND cache_scope=?2 AND generation=?3 ORDER BY ordinal",
 		)?;
@@ -266,6 +276,8 @@ impl DiscoveryStore {
 		for row in encoded {
 			rows.push(serde_json::from_slice(&row?)?);
 		}
+		drop(statement);
+		snapshot.commit()?;
 		Ok(Some(CachedDiscovery { key: key.clone(), generation, rows, expires_at_ms }))
 	}
 
@@ -282,7 +294,9 @@ impl DiscoveryStore {
 	/// Invalidates exactly one endpoint/account namespace.
 	pub fn invalidate(&self, key: &DiscoveryCacheKey) -> Result<(), DiscoveryStoreError> {
 		let mut connection = self.connection.lock();
-		let transaction = connection.transaction()?;
+		// Acquire the writer lease before reading a generation or pruning it:
+		// deferred snapshot upgrades fail immediately against a concurrent writer.
+		let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		transaction.execute(
 			"DELETE FROM discovered_models WHERE provider=?1 AND cache_scope=?2",
 			params![key.provider.as_str(), key.scope()],
@@ -302,7 +316,9 @@ impl DiscoveryStore {
 	/// Removes expired generations and their model rows.
 	pub fn prune_expired(&self, now_ms: u64) -> Result<usize, DiscoveryStoreError> {
 		let mut connection = self.connection.lock();
-		let transaction = connection.transaction()?;
+		// Acquire the writer lease before reading a generation or pruning it:
+		// deferred snapshot upgrades fail immediately against a concurrent writer.
+		let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		let stale = {
 			let mut statement = transaction.prepare(
 				"SELECT provider, cache_scope FROM discovery_generations WHERE expires_at_ms<=?1",
@@ -364,6 +380,51 @@ impl DiscoveryStore {
 	}
 }
 
+fn configure_journal(connection: &Connection) -> rusqlite::Result<()> {
+	let started = Instant::now();
+	loop {
+		let result: rusqlite::Result<()> = (|| {
+			let mode: String =
+				connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+			if !mode.eq_ignore_ascii_case("wal") {
+				connection.pragma_update(None, "journal_mode", "WAL")?;
+			}
+			Ok(())
+		})();
+		match result {
+			// Concurrent first-open journal transitions can return BUSY without
+			// invoking SQLite's busy handler. Bound this transition retry too.
+			Err(error)
+				if matches!(
+					error.sqlite_error_code(),
+					Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+				) && started.elapsed() < OPEN_BUSY_TIMEOUT =>
+			{
+				thread::sleep(
+					Duration::from_millis(10).min(OPEN_BUSY_TIMEOUT.saturating_sub(started.elapsed())),
+				);
+			},
+			result => return result,
+		}
+	}
+}
+
+fn schema_version(connection: &Connection) -> rusqlite::Result<Option<i64>> {
+	let has_metadata: bool = connection.query_row(
+		"SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='discovery_meta')",
+		[],
+		|row| row.get(0),
+	)?;
+	if !has_metadata {
+		return Ok(None);
+	}
+	connection
+		.query_row("SELECT value FROM discovery_meta WHERE key='schema_version'", [], |row| {
+			row.get(0)
+		})
+		.optional()
+}
+
 fn upsert_lifecycle(
 	connection: &Connection,
 	lifecycle: &ProviderLifecycle,
@@ -403,7 +464,11 @@ pub enum DiscoveryStoreError {
 
 #[cfg(test)]
 mod tests {
-	use std::str;
+	use std::{
+		str,
+		sync::{Arc, Barrier},
+		thread,
+	};
 
 	use omp_catalog::{
 		ModelAvailability, ModelLimits, OperationBits, Price, PriceUnit, RouteId, WireModelId,
@@ -435,6 +500,124 @@ mod tests {
 			updated_at_ms:         None,
 			deprecated:            None,
 		}
+	}
+
+	#[test]
+	fn concurrent_cache_initialization_and_migration_preserve_every_published_namespace() {
+		for round in 0..20 {
+			let directory = tempfile::tempdir().expect("directory");
+			let path = directory.path().join("models.db");
+			if round % 2 == 1 {
+				let connection = Connection::open(&path).expect("legacy cache");
+				connection
+					.execute_batch(
+						"CREATE TABLE discovery_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+					 INSERT INTO discovery_meta VALUES ('schema_version', 4);",
+					)
+					.expect("old schema");
+			}
+			let barrier = Arc::new(Barrier::new(8));
+			thread::scope(|scope| {
+				let workers = (0..8)
+					.map(|index| {
+						let barrier = Arc::clone(&barrier);
+						let path = &path;
+						scope.spawn(move || {
+							barrier.wait();
+							let store = DiscoveryStore::open(path)?;
+							let key = DiscoveryCacheKey::credential("local", format!("account-{index}"));
+							store.publish(&key, &[row(&key.provider)], 1, Duration::from_secs(30))?;
+							Ok::<_, DiscoveryStoreError>(())
+						})
+					})
+					.collect::<Vec<_>>();
+				for worker in workers {
+					worker
+						.join()
+						.expect("cache opener")
+						.expect("cache initialization/publish");
+				}
+			});
+			let store = DiscoveryStore::open(&path).expect("reopen");
+			for index in 0..8 {
+				let key = DiscoveryCacheKey::credential("local", format!("account-{index}"));
+				assert_eq!(
+					store
+						.load_latest(&key)
+						.expect("load")
+						.expect("published namespace")
+						.rows
+						.len(),
+					1
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn initialized_cache_opens_for_read_while_another_connection_owns_the_writer() {
+		let directory = tempfile::tempdir().expect("directory");
+		let path = directory.path().join("models.db");
+		let store = DiscoveryStore::open(&path).expect("initialization");
+		let key = DiscoveryCacheKey::provider("local");
+		store
+			.publish(&key, &[row(&key.provider)], 1, Duration::from_secs(30))
+			.expect("generation");
+		let writer = Connection::open(&path).expect("writer");
+		writer
+			.execute_batch("BEGIN IMMEDIATE")
+			.expect("writer lease");
+		let reader =
+			DiscoveryStore::open(&path).expect("opening a current cache must not need a writer lease");
+		assert_eq!(
+			reader
+				.load_latest(&key)
+				.expect("read")
+				.expect("generation")
+				.rows
+				.len(),
+			1
+		);
+		writer.execute_batch("ROLLBACK").expect("release writer");
+	}
+
+	#[test]
+	fn concurrent_publishers_serialize_generation_updates() {
+		let directory = tempfile::tempdir().expect("directory");
+		let path = directory.path().join("models.db");
+		let stores = (0..8)
+			.map(|_| DiscoveryStore::open(&path).expect("open"))
+			.collect::<Vec<_>>();
+		let barrier = Arc::new(Barrier::new(stores.len()));
+		thread::scope(|scope| {
+			let workers = stores
+				.into_iter()
+				.map(|store| {
+					let barrier = Arc::clone(&barrier);
+					scope.spawn(move || {
+						barrier.wait();
+						let key = DiscoveryCacheKey::provider("local");
+						for _ in 0..20 {
+							store.publish(&key, &[row(&key.provider)], 1, Duration::from_secs(30))?;
+						}
+						Ok::<_, DiscoveryStoreError>(())
+					})
+				})
+				.collect::<Vec<_>>();
+			for worker in workers {
+				worker
+					.join()
+					.expect("cache publisher")
+					.expect("concurrent publish");
+			}
+		});
+		let store = DiscoveryStore::open(&path).expect("reopen");
+		let cached = store
+			.load_latest(&DiscoveryCacheKey::provider("local"))
+			.expect("load")
+			.expect("generation");
+		assert_eq!(cached.generation, 160);
+		assert_eq!(cached.rows.len(), 1);
 	}
 
 	#[test]

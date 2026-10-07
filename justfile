@@ -366,3 +366,11 @@ test-omperor-screenshot-projection:
     cargo test --doc -p omp-ai --locked
     cargo nextest run -p omp-driver --lib --locked -E 'test(headless::kernel::tests::journaled_screenshot_)'
     cargo test --doc -p omp-driver --locked
+
+# Concurrent catalog initialization, generation publication, and safe startup diagnostics.
+[group('test')]
+test-omperor-catalog-startup:
+    cargo nextest run -p omp-ai --lib --locked -E 'test(discovery::store::tests::)'
+    cargo test --doc -p omp-ai --locked
+    cargo nextest run -p omp-driver --lib --locked -E 'test(registry::tests::catalog_cache_)'
+    cargo test --doc -p omp-driver --locked
