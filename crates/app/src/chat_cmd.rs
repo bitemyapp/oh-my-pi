@@ -338,6 +338,7 @@ impl Launch {
 			.collect::<miette::Result<Vec<_>>>()?;
 		apply_launch_convars(&ctx, &LaunchConvars {
 			computer_use,
+			tools: tools.as_ref().map(|names| names.0.as_slice()),
 			hide_thinking,
 			service_tier,
 			external_thinking,
@@ -716,6 +717,8 @@ pub(crate) struct LaunchConvars<'a> {
 	/// Explicit host choice, applied after cfg overlays without resetting other
 	/// tools.
 	pub computer_use:      Option<bool>,
+	/// Explicit `--tools` allow list; naming `browser` opts the session in.
+	pub tools:             Option<&'a [Str]>,
 	pub hide_thinking:     bool,
 	pub service_tier:      Option<omp_catalog::settings::TierSetting>,
 	pub external_thinking: bool,
@@ -745,6 +748,21 @@ pub(crate) fn apply_launch_convars(
 			.push((Str::new_static("computer"), omp_con::Value::Bool(enabled)));
 		omp_envd::tool_settings::SV_TOOLS_ENABLED.set(ctx, tools)?;
 		omp_tools::settings::SV_COMPUTER_ENABLED.set(ctx, enabled)?;
+	}
+	// Naming browser use in an explicit tool list opts the session into it, as
+	// `--computer-use` does for computer use; opted-in tools are presented as
+	// first-class tools. A configured `false` still wins.
+	if flags
+		.tools
+		.is_some_and(|names| names.iter().any(|name| name.as_str() == "browser"))
+	{
+		let mut tools = omp_envd::tool_settings::SV_TOOLS_ENABLED.get(ctx);
+		if !tools.0.iter().any(|(name, _)| name.as_str() == "browser") {
+			tools
+				.0
+				.push((Str::new_static("browser"), omp_con::Value::Bool(true)));
+			omp_envd::tool_settings::SV_TOOLS_ENABLED.set(ctx, tools)?;
+		}
 	}
 	if flags.hide_thinking {
 		omp_chat::settings::CL_SHOWTHINKING.set(ctx, false)?;
@@ -1677,6 +1695,7 @@ mod tests {
 			.unwrap();
 		apply_launch_convars(&ctx, &LaunchConvars {
 			computer_use:      None,
+			tools:             None,
 			hide_thinking:     false,
 			service_tier:      None,
 			external_thinking: false,

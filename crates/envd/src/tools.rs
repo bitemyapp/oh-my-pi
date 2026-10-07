@@ -4004,10 +4004,12 @@ fn environment_declarations(
 		declarations.push(EnvironmentDeclaration { spec, presentation, claims });
 	};
 	if browser_settings.enabled && tool_settings.enabled("browser") {
-		push(omp_tools::browser::spec(), long_tail_presentation(policy), builtin_device_claims());
+		let (presentation, claims) = opt_in_presentation(tool_settings, "browser", policy);
+		push(omp_tools::browser::spec(), presentation, claims);
 	}
 	if tool_settings.enabled("computer") {
-		push(omp_tools::computer::spec(), long_tail_presentation(policy), builtin_device_claims());
+		let (presentation, claims) = opt_in_presentation(tool_settings, "computer", policy);
+		push(omp_tools::computer::spec(), presentation, claims);
 	}
 	if tool_settings.enabled("security_scan") {
 		push(omp_tools::security_scan::spec(), Presentation::Device, builtin_device_claims());
@@ -4352,20 +4354,24 @@ pub(crate) fn production_registry<
 		)?;
 	if browser_settings.enabled && tool_settings.enabled("browser") {
 		let browser_daemon = BrowserDaemon::start(blobs.clone(), browser_settings.clone());
+		let (presentation, claims) = opt_in_presentation(tool_settings, "browser", policy);
 		environment_registry(
 			&mut registry,
 			omp_tools::browser::tool(browser_daemon),
-			long_tail_presentation(policy),
-			builtin_device_claims(),
+			presentation,
+			claims,
 		)?;
 	}
 	if connection_computer || tool_settings.enabled("computer") {
 		let computer = ComputerConnectionHost::new(blobs.clone(), con);
+		// A connection-scoped grant leaves the shared roster alone: other
+		// connections of this daemon reach computer use only through `dyn`.
+		let (presentation, claims) = opt_in_presentation(tool_settings, "computer", policy);
 		environment_registry(
 			&mut registry,
 			omp_tools::computer::tool(computer),
-			long_tail_presentation(policy),
-			builtin_device_claims(),
+			presentation,
+			claims,
 		)?;
 	}
 	let security = SecurityScanService::new(workspace.root().to_path_buf(), state_dir)
@@ -5550,6 +5556,28 @@ const fn bash_presentation(_policy: ToolsPolicy) -> Presentation {
 	Presentation::Slot
 }
 
+/// Browser and computer use are first-class tools once a session opts in
+/// (`tools.enabled.<name> = true`, which `--computer-use` and naming the
+/// tool in `--tools` set), as other agent desktops present them: reached
+/// through the dynamic device transport, every use began with two discovery
+/// round trips. Sessions that never opt in keep them as long-tail devices
+/// and do not carry their schemas.
+fn opt_in_presentation(
+	tool_settings: &ToolSettings,
+	name: &str,
+	policy: ToolsPolicy,
+) -> (Presentation, Claims) {
+	opt_in_presentation_for(tool_settings.enabled.get(name) == Some(&true), policy)
+}
+
+const fn opt_in_presentation_for(opted_in: bool, policy: ToolsPolicy) -> (Presentation, Claims) {
+	if opted_in && !matches!(policy, ToolsPolicy::DeviceOnly) {
+		(Presentation::Slot, core_claims())
+	} else {
+		(long_tail_presentation(policy), builtin_device_claims())
+	}
+}
+
 const fn long_tail_presentation(policy: ToolsPolicy) -> Presentation {
 	if matches!(policy, ToolsPolicy::ToolOnly) {
 		Presentation::Slot
@@ -6377,6 +6405,60 @@ mod tests {
 		}
 		// `write` is a slot now, so it is no longer mounted as a device.
 		assert!(!devices.contains("write"), "write is advertised as a slot, not a dyn device");
+	}
+
+	#[test]
+	fn opted_in_browser_and_computer_use_are_first_class_tools() {
+		let inputs = EnvironmentDeclarationInputs {
+			read_policy:      omp_tools::read::ReadPolicy::default(),
+			selected_edit:    omp_tools::edit::hashline_spec().rev,
+			eval_description: None,
+			shell_snapshot:   None,
+			memory:           omp_memory::Capabilities::default(),
+			managed_skills:   false,
+		};
+		let presentation = |tool_settings: &ToolSettings, policy, name: &str| {
+			environment_declarations(
+				tool_settings,
+				&BrowserSettings::default(),
+				&inputs,
+				false,
+				policy,
+			)
+			.into_iter()
+			.find(|declaration| declaration.spec.name == name)
+			.map(|declaration| declaration.presentation)
+		};
+		let mut tool_settings = ToolSettings::default();
+		assert_eq!(
+			presentation(&tool_settings, ToolsPolicy::Auto, "browser"),
+			Some(Presentation::Device)
+		);
+		for name in ["browser", "computer"] {
+			tool_settings.enabled.insert(Str::new(name), true);
+		}
+		for name in ["browser", "computer"] {
+			assert_eq!(
+				presentation(&tool_settings, ToolsPolicy::Auto, name),
+				Some(Presentation::Slot)
+			);
+			assert_eq!(
+				presentation(&tool_settings, ToolsPolicy::DeviceOnly, name),
+				Some(Presentation::Device)
+			);
+		}
+		assert_eq!(
+			opt_in_presentation_for(false, ToolsPolicy::Auto)
+				.1
+				.precedence,
+			builtin_device_claims().precedence
+		);
+		assert_eq!(
+			opt_in_presentation_for(true, ToolsPolicy::Auto)
+				.1
+				.precedence,
+			core_claims().precedence
+		);
 	}
 
 	#[test]

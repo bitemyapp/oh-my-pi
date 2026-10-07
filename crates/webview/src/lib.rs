@@ -758,17 +758,21 @@ impl WebView {
 		}
 	}
 
-	/// Forward a synthetic input event to a frames surface.
+	/// Forward a synthetic input event to a frames surface, or to a remote
+	/// engine's window for automation (a person's input reaches a window
+	/// directly).
 	///
 	/// # Errors
 	///
-	/// [`Error::Unsupported`] on non-frames surfaces.
+	/// [`Error::Unsupported`] on child surfaces and system-engine windows.
 	pub fn input(&self, input: Input) -> Result<()> {
 		match (&self.inner, self.surface) {
-			(Inner::Remote(view), SurfaceKind::Frames) => view.send(Command::Input(input)),
+			(Inner::Remote(view), SurfaceKind::Frames | SurfaceKind::Window) => {
+				view.send(Command::Input(input))
+			},
 			#[cfg(target_os = "macos")]
 			(Inner::WkFrames(view), _) => view.input(input),
-			_ => Err(Error::Unsupported("input applies to frames surfaces")),
+			_ => Err(Error::Unsupported("input applies to frames and remote window surfaces")),
 		}
 	}
 

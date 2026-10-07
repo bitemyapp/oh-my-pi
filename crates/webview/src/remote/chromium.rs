@@ -1259,28 +1259,48 @@ impl Cdp {
 					.await
 			},
 			Input::KeyDown { key, modifiers } => {
+				let (code, virtual_code) = key_code(key);
+				// Printable keys and Enter carry text so the page sees a
+				// keypress (and Enter submits), except in shortcut chords where
+				// no text is produced. Text-less keys go down raw, which is
+				// what lets Chromium run their default editing actions.
+				let text = match key {
+					Key::Char(c) if !modifiers.ctrl && !modifiers.meta => Some(sf!("{c}")),
+					Key::Enter if !modifiers.ctrl && !modifiers.meta => Some(sf!("\r")),
+					_ => None,
+				};
 				let mut params = json!({
-					"type": "keyDown",
+					"type": if text.is_some() { "keyDown" } else { "rawKeyDown" },
 					"key": &*key_name(key),
+					"code": code,
+					"windowsVirtualKeyCode": virtual_code,
+					"nativeVirtualKeyCode": virtual_code,
 					"modifiers": modifier_bits(modifiers),
 				});
-				// Printable keys carry text so the page sees a keypress,
-				// except in shortcut chords where no text is produced.
-				if let Key::Char(c) = key
-					&& !modifiers.ctrl
-					&& !modifiers.meta
+				if let Some(text) = text {
+					params["text"] = json!(&*text);
+					params["unmodifiedText"] = json!(&*text);
+				}
+				// macOS Chromium does not map Command shortcuts to editing
+				// commands for synthetic events; name the command explicitly.
+				if cfg!(target_os = "macos")
+					&& let Some(command) = mac_editing_command(key, modifiers)
 				{
-					params["text"] = json!(c);
+					params["commands"] = json!([command]);
 				}
 				self.cmd("Input.dispatchKeyEvent", params).await
 			},
 			Input::KeyUp { key, modifiers } => {
+				let (code, virtual_code) = key_code(key);
 				self
 					.cmd(
 						"Input.dispatchKeyEvent",
 						json!({
 							"type": "keyUp",
 							"key": &*key_name(key),
+							"code": code,
+							"windowsVirtualKeyCode": virtual_code,
+							"nativeVirtualKeyCode": virtual_code,
 							"modifiers": modifier_bits(modifiers),
 						}),
 					)
@@ -1578,6 +1598,68 @@ fn key_name(key: Key) -> Str {
 }
 
 /// CDP modifier bitmask: alt=1, ctrl=2, meta=4, shift=8.
+/// DOM `code` and Windows virtual-key code for a key, as Chromium's input
+/// pipeline expects them (US layout). Unknown characters get neither.
+fn key_code(key: Key) -> (Str, u32) {
+	let named = |code: &'static str, virtual_code: u32| (Str::new_static(code), virtual_code);
+	match key {
+		Key::Enter => named("Enter", 13),
+		Key::Tab => named("Tab", 9),
+		Key::Backspace => named("Backspace", 8),
+		Key::Delete => named("Delete", 46),
+		Key::Escape => named("Escape", 27),
+		Key::ArrowUp => named("ArrowUp", 38),
+		Key::ArrowDown => named("ArrowDown", 40),
+		Key::ArrowLeft => named("ArrowLeft", 37),
+		Key::ArrowRight => named("ArrowRight", 39),
+		Key::Home => named("Home", 36),
+		Key::End => named("End", 35),
+		Key::PageUp => named("PageUp", 33),
+		Key::PageDown => named("PageDown", 34),
+		Key::F(n) => {
+			let n = n.clamp(1, 24);
+			(sf!("F{n}"), 111 + u32::from(n))
+		},
+		Key::Char(c) if c.is_ascii_alphabetic() => {
+			let upper = c.to_ascii_uppercase();
+			(sf!("Key{upper}"), u32::from(upper))
+		},
+		Key::Char(c) if c.is_ascii_digit() => (sf!("Digit{c}"), u32::from(c)),
+		Key::Char(c) => match c {
+			' ' => named("Space", 32),
+			';' | ':' => named("Semicolon", 186),
+			'=' | '+' => named("Equal", 187),
+			',' | '<' => named("Comma", 188),
+			'-' | '_' => named("Minus", 189),
+			'.' | '>' => named("Period", 190),
+			'/' | '?' => named("Slash", 191),
+			'`' | '~' => named("Backquote", 192),
+			'[' | '{' => named("BracketLeft", 219),
+			'\\' | '|' => named("Backslash", 220),
+			']' | '}' => named("BracketRight", 221),
+			'\'' | '"' => named("Quote", 222),
+			_ => (Str::default(), 0),
+		},
+	}
+}
+
+/// The editing command a Command shortcut performs on macOS.
+fn mac_editing_command(key: Key, m: Modifiers) -> Option<&'static str> {
+	if !m.meta || m.ctrl || m.alt {
+		return None;
+	}
+	let Key::Char(c) = key else { return None };
+	Some(match (c.to_ascii_lowercase(), m.shift) {
+		('a', false) => "selectAll",
+		('c', false) => "copy",
+		('x', false) => "cut",
+		('v', false) => "paste",
+		('z', false) => "undo",
+		('z', true) => "redo",
+		_ => return None,
+	})
+}
+
 fn modifier_bits(m: Modifiers) -> u32 {
 	u32::from(m.alt)
 		| (u32::from(m.ctrl) << 1)

@@ -80,6 +80,8 @@ pub enum Operation {
 	RaiseWindow,
 	/// Capture a bounded accessibility tree.
 	AxSnapshot,
+	/// Capture one app window and its accessibility tree together.
+	AppState,
 	/// Query accessibility nodes.
 	AxQuery,
 	/// Hit-test an accessibility node.
@@ -157,6 +159,10 @@ pub struct NativeParams {
 	pub dx:          Option<f64>,
 	/// Vertical scroll delta.
 	pub dy:          Option<f64>,
+	/// Scroll distance in heights (or widths) of the target; `dx`/`dy` then
+	/// give only the direction.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub pages:       Option<f64>,
 	/// Drag path as ordered `[x, y]` pairs.
 	pub points:      Option<Vec<[f64; 2]>>,
 	/// Pointer button.
@@ -197,6 +203,9 @@ impl NativeParams {
 			},
 			Operation::Capture => {
 				DesktopEffects { capture: true, accessibility: false, input: false }
+			},
+			Operation::AppState => {
+				DesktopEffects { capture: true, accessibility: true, input: false }
 			},
 			Operation::AxSnapshot
 			| Operation::AxQuery
@@ -477,7 +486,7 @@ pub fn spec() -> ToolSpec {
 	ToolSpec {
 		name:            sf!("computer"),
 		rev:             Rev { family: Str::default(), n: 3 },
-		description:     sf!(
+		description:     Str::new_static(
 			"Controls one persistent, session-owned native desktop. action=run executes a bounded \
 			 domain program with desktop, wait, assert, display, and print in scope; \
 			 action=capabilities reports backend permissions; action=close permanently releases the \
@@ -485,7 +494,21 @@ pub fn spec() -> ToolSpec {
 			 deliver pointer, keyboard, and clipboard input; inspect/query/act on accessibility \
 			 elements; and wait for assertions. Pointer coordinates are pixels in the most recent \
 			 screenshot of the same target, while accessibility bounds and hit tests use global \
-			 logical coordinates."
+			 logical coordinates.\nApp-scoped calls: desktop.list_apps(), \
+			 desktop.get_app_state({app}) (screenshot plus accessibility tree), click({app, x, y, \
+			 mouse_button, click_count}) or click({app, element_index}), drag({app, from_x, from_y, \
+			 to_x, to_y}), scroll({app, x, y, direction, pages}), type_text({app, text}), \
+			 press_key({app, key}), set_value({app, element_index, value}), \
+			 perform_secondary_action({app, element_index}). x and y are pixels in that app's latest \
+			 get_app_state screenshot; element_index is the number in a ref (e12 is 12).\nWindow and \
+			 element calls: windows({app, title}), window({app, title}), screenshot({maxWidth, \
+			 maxHeight}), click(x, y, {button, count}), doubleClick(x, y), move(x, y), drag([[x, y], \
+			 ...]), scroll(x, y, {dx, dy}), type(text), press(keys), ax({maxDepth}), find({role, \
+			 title, value}), ref('e5'), then .click(), .setValue(text), .perform(action), .focus(); \
+			 clipboard.read(), clipboard.write(text). Call them on desktop or on a bound window, as \
+			 in `const win = await desktop.window({app: 'Notes'}); await win.click(40, 60)`.\nKeys \
+			 accept xdotool, Playwright or upper-case names: 'super+c', 'Return', 'Page_Down', \
+			 'cmd+shift+p'.",
 		),
 		schema:          omp_tool::schema::<Params>(),
 		constraint:      Constraint::Schema {

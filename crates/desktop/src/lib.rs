@@ -38,6 +38,7 @@ use error::CoreResult;
 pub use error::{DesktopError, DesktopResult, ErrorCode};
 use flume::Receiver;
 use frame::{FrameGeometry, apply_capture_caps, encode_png};
+pub use keys::{KeyName, chord_components, parse_key};
 use keys::{parse_keys, parse_modifiers};
 use parking_lot::Mutex;
 use tokio::task;

@@ -3,7 +3,9 @@ use super::{
 	error::{CoreResult, DesktopError},
 };
 
+/// A key named in a chord; see [`parse_key`] for the accepted spellings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs, reason = "each variant is the key it names")]
 pub enum KeyName {
 	Ctrl,
 	Alt,
@@ -115,31 +117,67 @@ impl KeyName {
 	}
 }
 
+/// The platform's primary shortcut modifier: Command on macOS, Control
+/// elsewhere (Playwright's `ControlOrMeta`).
+#[cfg(target_os = "macos")]
+const PRIMARY: KeyName = KeyName::Meta;
+#[cfg(not(target_os = "macos"))]
+const PRIMARY: KeyName = KeyName::Ctrl;
+
+/// Parse one key name. Accepts the spellings agents are trained on:
+/// Playwright/DOM names (`ArrowUp`, `PageDown`, `ControlOrMeta`), xdotool
+/// keysyms (`Return`, `BackSpace`, `Page_Down`, `Prior`, `KP_Enter`,
+/// `Super_L`, `bracketleft`), and the upper-case names of computer-use action
+/// schemas (`CTRL`, `ENTER`, `ARROWLEFT`). Case, `_`, `-` and a trailing
+/// `_L`/`_R` side are ignored for named keys.
 pub fn parse_key(value: &str) -> CoreResult<KeyName> {
-	let normalized = value.trim().to_ascii_uppercase();
+	let trimmed = value.trim();
+	let unsided = ["_L", "_R", "_l", "_r"]
+		.iter()
+		.find_map(|side| trimmed.strip_suffix(side))
+		.unwrap_or(trimmed);
+	let normalized = unsided
+		.chars()
+		.filter(|character| !matches!(character, '_' | '-' | ' '))
+		.collect::<String>()
+		.to_ascii_uppercase();
 	let key = match normalized.as_str() {
 		"CTRL" | "CONTROL" => KeyName::Ctrl,
+		"CONTROLORMETA" | "MOD" | "PRIMARY" => PRIMARY,
 		"SHIFT" => KeyName::Shift,
-		"ALT" | "OPTION" => KeyName::Alt,
-		"META" | "CMD" | "COMMAND" | "SUPER" | "WIN" | "WINDOWS" => KeyName::Meta,
-		"ENTER" | "RETURN" => KeyName::Enter,
+		"ALT" | "OPTION" | "OPT" | "ALTGR" => KeyName::Alt,
+		"META" | "CMD" | "COMMAND" | "SUPER" | "WIN" | "WINDOWS" | "HYPER" => KeyName::Meta,
+		"ENTER" | "RETURN" | "KPENTER" | "LINEFEED" => KeyName::Enter,
 		"ESC" | "ESCAPE" => KeyName::Escape,
 		"TAB" => KeyName::Tab,
-		"SPACE" => KeyName::Space,
-		"BACKSPACE" => KeyName::Backspace,
-		"DELETE" | "DEL" => KeyName::Delete,
-		"INSERT" => KeyName::Insert,
-		"HOME" => KeyName::Home,
-		"END" => KeyName::End,
-		"PAGEUP" => KeyName::PageUp,
-		"PAGEDOWN" => KeyName::PageDown,
-		"UP" | "ARROWUP" => KeyName::Up,
-		"DOWN" | "ARROWDOWN" => KeyName::Down,
-		"LEFT" | "ARROWLEFT" => KeyName::Left,
-		"RIGHT" | "ARROWRIGHT" => KeyName::Right,
+		"SPACE" | "SPACEBAR" | "KPSPACE" => KeyName::Space,
+		"BACKSPACE" | "BKSP" => KeyName::Backspace,
+		"DELETE" | "DEL" | "KPDELETE" => KeyName::Delete,
+		"INSERT" | "INS" | "KPINSERT" => KeyName::Insert,
+		"HOME" | "KPHOME" => KeyName::Home,
+		"END" | "KPEND" => KeyName::End,
+		"PAGEUP" | "PGUP" | "PRIOR" | "KPPRIOR" | "KPPAGEUP" => KeyName::PageUp,
+		"PAGEDOWN" | "PGDN" | "NEXT" | "KPNEXT" | "KPPAGEDOWN" => KeyName::PageDown,
+		"UP" | "ARROWUP" | "KPUP" => KeyName::Up,
+		"DOWN" | "ARROWDOWN" | "KPDOWN" => KeyName::Down,
+		"LEFT" | "ARROWLEFT" | "KPLEFT" => KeyName::Left,
+		"RIGHT" | "ARROWRIGHT" | "KPRIGHT" => KeyName::Right,
 		"CAPSLOCK" => KeyName::CapsLock,
 		"NUMLOCK" => KeyName::NumLock,
-		"PRINTSCREEN" | "PRINTSCR" => KeyName::PrintScreen,
+		"PRINTSCREEN" | "PRINTSCR" | "PRINT" => KeyName::PrintScreen,
+		"PLUS" | "KPADD" => KeyName::Char('+'),
+		"MINUS" | "KPSUBTRACT" => KeyName::Char('-'),
+		"EQUAL" | "EQUALS" | "KPEQUAL" => KeyName::Char('='),
+		"ASTERISK" | "KPMULTIPLY" => KeyName::Char('*'),
+		"COMMA" => KeyName::Char(','),
+		"PERIOD" | "KPDECIMAL" => KeyName::Char('.'),
+		"SLASH" | "KPDIVIDE" => KeyName::Char('/'),
+		"BACKSLASH" => KeyName::Char('\\'),
+		"SEMICOLON" => KeyName::Char(';'),
+		"APOSTROPHE" | "QUOTE" => KeyName::Char('\''),
+		"GRAVE" | "BACKQUOTE" => KeyName::Char('`'),
+		"BRACKETLEFT" => KeyName::Char('['),
+		"BRACKETRIGHT" => KeyName::Char(']'),
 		"F1" => KeyName::F1,
 		"F2" => KeyName::F2,
 		"F3" => KeyName::F3,
@@ -164,6 +202,25 @@ pub fn parse_key(value: &str) -> CoreResult<KeyName> {
 		"F22" => KeyName::F22,
 		"F23" => KeyName::F23,
 		"F24" => KeyName::F24,
+		digit
+			if digit.len() == 3 && digit.starts_with("KP") && digit.as_bytes()[2].is_ascii_digit() =>
+		{
+			KeyName::Char(digit.chars().nth(2).unwrap_or('0'))
+		},
+		letter
+			if letter.len() == 4
+				&& letter.starts_with("KEY")
+				&& letter.as_bytes()[3].is_ascii_alphabetic() =>
+		{
+			KeyName::Char(letter.chars().nth(3).unwrap_or('a').to_ascii_lowercase())
+		},
+		digit
+			if digit.len() == 6
+				&& digit.starts_with("DIGIT")
+				&& digit.as_bytes()[5].is_ascii_digit() =>
+		{
+			KeyName::Char(digit.chars().nth(5).unwrap_or('0'))
+		},
 		_ => {
 			let mut chars = value.trim().chars();
 			match (chars.next(), chars.next()) {
@@ -177,10 +234,22 @@ pub fn parse_key(value: &str) -> CoreResult<KeyName> {
 	Ok(key)
 }
 
+/// Split a chord on `+`, keeping a literal `+` key (`ctrl++`, `+`).
+pub fn chord_components(keypress: &str) -> Vec<&str> {
+	let trimmed = keypress.trim();
+	if trimmed == "+" {
+		return vec!["+"];
+	}
+	match trimmed.strip_suffix("++") {
+		Some(head) => head.split('+').chain(["+"]).collect(),
+		None => trimmed.split('+').collect(),
+	}
+}
+
 pub fn parse_keys(keys: &[String]) -> CoreResult<Vec<KeyName>> {
 	let mut parsed = Vec::new();
 	for keypress in keys {
-		for component in keypress.split('+') {
+		for component in chord_components(keypress) {
 			if component.trim().is_empty() {
 				return Err(DesktopError::invalid_key(format!(
 					"invalid empty component in keypress `{keypress}`"
@@ -280,6 +349,33 @@ mod tests {
 			KeyName::Shift,
 			KeyName::Char('p')
 		]);
+		let xdotool = [
+			("Return", KeyName::Enter),
+			("KP_Enter", KeyName::Enter),
+			("BackSpace", KeyName::Backspace),
+			("Page_Down", KeyName::PageDown),
+			("Prior", KeyName::PageUp),
+			("Next", KeyName::PageDown),
+			("Super_L", KeyName::Meta),
+			("Control_R", KeyName::Ctrl),
+			("Alt_L", KeyName::Alt),
+			("Caps_Lock", KeyName::CapsLock),
+			("bracketleft", KeyName::Char('[')),
+			("plus", KeyName::Char('+')),
+			("KP_7", KeyName::Char('7')),
+			("KeyA", KeyName::Char('a')),
+			("Digit3", KeyName::Char('3')),
+			("ARROWLEFT", KeyName::Left),
+			("_", KeyName::Char('_')),
+			("-", KeyName::Char('-')),
+		];
+		for (alias, expected) in xdotool {
+			assert_eq!(parse_key(alias).unwrap(), expected, "{alias}");
+		}
+		assert_eq!(parse_key("ControlOrMeta").unwrap(), PRIMARY);
+		assert_eq!(parse_keys(&["super+c".into()]).unwrap(), [KeyName::Meta, KeyName::Char('c')]);
+		assert_eq!(parse_keys(&["ctrl++".into()]).unwrap(), [KeyName::Ctrl, KeyName::Char('+')]);
+		assert_eq!(parse_keys(&["+".into()]).unwrap(), [KeyName::Char('+')]);
 		assert_eq!(
 			parse_key("garbage").unwrap_err().code,
 			super::super::error::ErrorCode::InvalidKey

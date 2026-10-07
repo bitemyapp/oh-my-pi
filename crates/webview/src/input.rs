@@ -1,9 +1,10 @@
-//! Synthetic input for `frames` surfaces.
+//! Synthetic input for `frames` surfaces and automated remote windows.
 //!
-//! `child` and `window` surfaces receive real OS input directly; a `frames`
-//! surface is composited by the host, so the host forwards input explicitly
-//! via [`WebView::input`](crate::WebView::input). Coordinates are in CSS
-//! pixels of the page viewport (device pixels divided by the frame scale).
+//! `child` and `window` surfaces receive a person's OS input directly; a
+//! `frames` surface is composited by the host, so the host forwards input
+//! explicitly via [`WebView::input`](crate::WebView::input), as automation
+//! does for a remote engine's window. Coordinates are in CSS pixels of the
+//! page viewport (device pixels divided by the frame scale).
 
 use omp_core::Str;
 

@@ -309,15 +309,24 @@ pub fn spec() -> ToolSpec {
 			 tab.waitForSelector(selector) wait for an element. For a timed delay use `await \
 			 wait(300)`; for a condition use `await wait(async () => (await \
 			 tab.extract('text')).includes('Ready'))`. Do not pass milliseconds to \
-			 tab.waitFor.\nNavigation: tab.goto(url), tab.url(), await tab.title(), \
-			 tab.waitForUrl(pattern), tab.waitForResponse(pattern), tab.waitForNavigation().\nRead: \
-			 tab.observe(), tab.ariaSnapshot(), tab.extract('text'|'html'|'markdown'), \
-			 tab.evaluate(fn, ...args). Capture: await tab.screenshot({fullPage: true}) retains an \
-			 image; tab.download(url) retains a download.\nExample run: `await tab.fill('input', \
-			 'Draft'); await tab.click('button'); return await tab.ariaSnapshot()`. If a run fails, \
-			 inspect the page before retrying: earlier actions remain applied.\napp.path spawns an \
-			 owned browser; app.cdp_url attaches without owning the page; app.relay uses the \
-			 logged-in relay browser. Request interception is scoped to one run.",
+			 tab.waitFor.\nReal input, for pages that ignore scripted clicks, works in the default \
+			 headless tab (no app.path needed): tab.cua takes computer-use actions in screenshot \
+			 pixels, click({x, y, button}), double_click, move, drag({path: [[x, y], ...]}), \
+			 scroll({x, y, scroll_x, scroll_y}), type({text}), keypress({keys: ['CTRL', 'A']}), \
+			 perform(action); tab.ax takes the numeric ids from tab.ax.get() (or [x, y]): click(id, \
+			 {clickCount, mouseButton}), typeText(id|null, text), pressKey(id|null, key), \
+			 scroll(id|null, 'down', pages), setValue(id, value). Keys accept Playwright, xdotool or \
+			 upper-case names (Enter, Return, Page_Down, ctrl+a); ctrl is Command on \
+			 macOS.\nNavigation: tab.goto(url), tab.back(), tab.forward(), tab.reload(), tab.url(), \
+			 await tab.title(), tab.waitForUrl(pattern), tab.waitForResponse(pattern), \
+			 tab.waitForNavigation().\nRead: tab.observe(), tab.ariaSnapshot(), \
+			 tab.extract('text'|'html'|'markdown'), tab.evaluate(fn, ...args). Capture: await \
+			 tab.screenshot({fullPage: true}) retains an image; tab.download(url) retains a \
+			 download.\nExample run: `await tab.fill('input', 'Draft'); await tab.click('button'); \
+			 return await tab.ariaSnapshot()`. If a run fails, inspect the page before retrying: \
+			 earlier actions remain applied.\napp.path spawns an owned browser; app.cdp_url attaches \
+			 without owning the page; app.relay uses the logged-in relay browser. Request \
+			 interception is scoped to one run.",
 		),
 		schema:          omp_tool::schema::<Params>(),
 		constraint:      Constraint::Schema {

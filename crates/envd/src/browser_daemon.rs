@@ -17,12 +17,14 @@ use async_trait::async_trait;
 use flume::Receiver;
 use omp_con::Ctx;
 use omp_core::{IntoStr as _, Str, encoding::base64, sf};
+use omp_desktop::{KeyName, chord_components, parse_key};
 use omp_tools::browser::{
 	Action, Artifact, BrowserHost, Fault, Params, Payload, Update, WaitUntil, mode_name,
 };
 use omp_webview::{
-	Engine, FrameConfig, SurfaceKind, WebView, WebViewBuilder, WindowConfig,
-	automation::{ExtractFormat, ObserveOptions, Selector},
+	Engine, FrameConfig, Input, Key, Modifiers, MouseButton, SurfaceKind, WebView, WebViewBuilder,
+	WindowConfig,
+	automation::{ExtractFormat, ObserveOptions, Selector, TabHandle},
 };
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -1114,6 +1116,23 @@ fn dispatch_helper(
 	let ready = match op {
 		"url" => json!(view.url()),
 		"title" => json!(view.title()),
+		"back" | "forward" | "reload" => {
+			let (result, operation) = match op {
+				"back" => (tab.back(remaining), "tab.back"),
+				"forward" => (tab.forward(remaining), "tab.forward"),
+				_ => (tab.reload(remaining), "tab.reload"),
+			};
+			result.map_err(|error| browser_fault(operation, error))?;
+			json!(view.url())
+		},
+		"input" => {
+			let events = values
+				.first()
+				.and_then(Value::as_array)
+				.ok_or_else(|| invalid("input requires an array of events"))?;
+			perform_input(view, events, remaining)?;
+			Value::Null
+		},
 		"goto" => {
 			tab.goto(arg_str(values, 0, "goto requires a URL")?, remaining)
 				.map_err(|error| browser_fault("tab.goto", error))?;
@@ -1603,7 +1622,306 @@ fn parse_wait_until(value: &str) -> Result<WaitUntil, Fault> {
 }
 
 fn mutates_page(op: &str) -> bool {
-	matches!(op, "goto" | "click" | "press" | "drag")
+	matches!(op, "goto" | "back" | "forward" | "reload" | "click" | "press" | "drag" | "input")
+}
+
+/// Perform `tab.cua`/`tab.ax` input: pointer, wheel and keyboard events, the
+/// action vocabulary computer-use models are trained on. Explicit `x`,`y`
+/// are screenshot pixels, converted to CSS pixels by the device pixel ratio.
+/// Remote engines receive trusted native events, headless or in a window; a
+/// surface without native input receives the equivalent DOM events instead.
+///
+/// Events are `{type, ...}` objects: `move`/`down`/`up` with `x`,`y` or a
+/// `target` selector (its centre, scrolled into view), `button` and
+/// `clicks`; `wheel` with `dx`,`dy` or `direction` and `pages`; `key` with a
+/// `keys` chord; `text`; and `focus` with a `target`.
+fn perform_input(view: &WebView, events: &[Value], timeout: Duration) -> Result<(), Fault> {
+	let tab = view.automation();
+	let document = tab.document();
+	let fault = |error| browser_fault("tab.input", error);
+	let mut native = true;
+	let mut viewport = None;
+	let mut pixel_ratio = None;
+	for event in events {
+		let event = event
+			.as_object()
+			.ok_or_else(|| invalid("input events must be objects"))?;
+		let kind = event
+			.get("type")
+			.and_then(Value::as_str)
+			.ok_or_else(|| invalid("input events require a type"))?;
+		let number = |name: &str| event.get(name).and_then(Value::as_f64);
+		let target = event
+			.get("target")
+			.and_then(Value::as_str)
+			.map(|raw| {
+				let selector = Selector::parse(raw).map_err(fault)?;
+				document.resolve(selector).map_err(fault)
+			})
+			.transpose()?;
+		if kind == "focus" {
+			target
+				.ok_or_else(|| invalid("focus requires a target"))?
+				.evaluate("el.focus(); return true")
+				.map_err(fault)?;
+			continue;
+		}
+		let mut viewport_size = || -> Result<(f64, f64), Fault> {
+			if let Some(size) = viewport {
+				return Ok(size);
+			}
+			let size = tab
+				.evaluate("[innerWidth, innerHeight]", timeout)
+				.map_err(fault)?;
+			let dimension = |index: usize| size.get(index).and_then(Value::as_f64).unwrap_or(0.0);
+			let size = (dimension(0), dimension(1));
+			viewport = Some(size);
+			Ok(size)
+		};
+		let point = match &target {
+			Some(handle) => {
+				handle.scroll_into_view().map_err(fault)?;
+				let [x, y, width, height] = handle.metadata().map_err(fault)?.bounds;
+				Some((x + width / 2.0, y + height / 2.0))
+			},
+			None => match number("x").zip(number("y")) {
+				Some((x, y)) => {
+					let ratio = match pixel_ratio {
+						Some(ratio) => ratio,
+						None => {
+							let ratio = tab
+								.evaluate("devicePixelRatio", timeout)
+								.map_err(fault)?
+								.as_f64()
+								.filter(|ratio| *ratio > 0.0)
+								.unwrap_or(1.0);
+							*pixel_ratio.insert(ratio)
+						},
+					};
+					Some((x / ratio, y / ratio))
+				},
+				None => None,
+			},
+		};
+		let required_point =
+			|| point.ok_or_else(|| invalid("pointer input requires x and y or a target"));
+		let button = || mouse_button(event.get("button").and_then(Value::as_str));
+		let clicks = event
+			.get("clicks")
+			.and_then(Value::as_u64)
+			.map_or(1, |count| u8::try_from(count.clamp(1, 3)).unwrap_or(1));
+		let inputs = match kind {
+			"move" => {
+				let (x, y) = required_point()?;
+				vec![Input::MouseMove { x, y }]
+			},
+			"down" => {
+				let (x, y) = required_point()?;
+				vec![Input::MouseDown { button: button()?, x, y, clicks }]
+			},
+			"up" => {
+				let (x, y) = required_point()?;
+				vec![Input::MouseUp { button: button()?, x, y }]
+			},
+			"wheel" => {
+				let (mut dx, mut dy) = (number("dx").unwrap_or(0.0), number("dy").unwrap_or(0.0));
+				if let Some(direction) = event.get("direction").and_then(Value::as_str) {
+					let (width, height) = viewport_size()?;
+					let pages = number("pages").unwrap_or(1.0);
+					(dx, dy) = match direction {
+						"up" => (0.0, -height * pages),
+						"down" => (0.0, height * pages),
+						"left" => (-width * pages, 0.0),
+						"right" => (width * pages, 0.0),
+						_ => return Err(invalid("scroll direction must be up, down, left or right")),
+					};
+				}
+				let (x, y) = match point {
+					Some(point) => point,
+					None => {
+						let (width, height) = viewport_size()?;
+						(width / 2.0, height / 2.0)
+					},
+				};
+				vec![Input::MouseMove { x, y }, Input::Scroll { x, y, dx, dy }]
+			},
+			"key" => chord_inputs(
+				event
+					.get("keys")
+					.and_then(Value::as_str)
+					.ok_or_else(|| invalid("key input requires a keys chord"))?,
+			)?,
+			"text" => vec![Input::Text(Str::new(
+				event
+					.get("text")
+					.and_then(Value::as_str)
+					.ok_or_else(|| invalid("text input requires text"))?,
+			))],
+			_ => return Err(invalid("unknown input event type")),
+		};
+		for input in inputs {
+			if native {
+				match view.input(input.clone()) {
+					Ok(()) => continue,
+					Err(omp_webview::Error::Unsupported(_)) => native = false,
+					Err(error) => return Err(fault(error)),
+				}
+			}
+			dom_input(tab, &input, clicks, timeout)?;
+		}
+	}
+	Ok(())
+}
+
+fn mouse_button(name: Option<&str>) -> Result<MouseButton, Fault> {
+	match name.map(str::to_ascii_lowercase).as_deref() {
+		None | Some("left" | "primary") => Ok(MouseButton::Left),
+		Some("right" | "secondary") => Ok(MouseButton::Right),
+		Some("middle" | "wheel" | "auxiliary") => Ok(MouseButton::Middle),
+		Some(_) => Err(invalid("mouse button must be left, right or middle")),
+	}
+}
+
+/// Key events for a chord such as `ctrl+shift+p`, `Return`, `super+c` or
+/// `ArrowDown`. Any spelling `omp_desktop::parse_key` accepts works. As in
+/// other agent browsers, `ctrl` is the platform's primary modifier (Command
+/// on macOS) so trained shortcuts behave; Playwright's `Control` is the
+/// literal key.
+fn chord_inputs(chord: &str) -> Result<Vec<Input>, Fault> {
+	let mut modifiers = Modifiers::NONE;
+	let mut keys = Vec::new();
+	for component in chord_components(chord) {
+		let component = component.trim();
+		let parsed = parse_key(component)
+			.map_err(|error| invalid_owned(Str::new(&error.message), Some(sf!("tab.keypress"))))?;
+		match parsed {
+			KeyName::Ctrl if component == "Control" || !cfg!(target_os = "macos") => {
+				modifiers.ctrl = true;
+			},
+			KeyName::Ctrl | KeyName::Meta => modifiers.meta = true,
+			KeyName::Alt => modifiers.alt = true,
+			KeyName::Shift => modifiers.shift = true,
+			other => keys.push(other),
+		}
+	}
+	let mut inputs = Vec::with_capacity(keys.len() * 2);
+	for name in keys {
+		let key = browser_key(name, modifiers.shift)?;
+		inputs.push(Input::KeyDown { key, modifiers });
+		inputs.push(Input::KeyUp { key, modifiers });
+	}
+	Ok(inputs)
+}
+
+fn browser_key(name: KeyName, shift: bool) -> Result<Key, Fault> {
+	const FUNCTION_KEYS: [KeyName; 24] = [
+		KeyName::F1,
+		KeyName::F2,
+		KeyName::F3,
+		KeyName::F4,
+		KeyName::F5,
+		KeyName::F6,
+		KeyName::F7,
+		KeyName::F8,
+		KeyName::F9,
+		KeyName::F10,
+		KeyName::F11,
+		KeyName::F12,
+		KeyName::F13,
+		KeyName::F14,
+		KeyName::F15,
+		KeyName::F16,
+		KeyName::F17,
+		KeyName::F18,
+		KeyName::F19,
+		KeyName::F20,
+		KeyName::F21,
+		KeyName::F22,
+		KeyName::F23,
+		KeyName::F24,
+	];
+	Ok(match name {
+		KeyName::Enter => Key::Enter,
+		KeyName::Escape => Key::Escape,
+		KeyName::Tab => Key::Tab,
+		KeyName::Space => Key::Char(' '),
+		KeyName::Backspace => Key::Backspace,
+		KeyName::Delete => Key::Delete,
+		KeyName::Home => Key::Home,
+		KeyName::End => Key::End,
+		KeyName::PageUp => Key::PageUp,
+		KeyName::PageDown => Key::PageDown,
+		KeyName::Up => Key::ArrowUp,
+		KeyName::Down => Key::ArrowDown,
+		KeyName::Left => Key::ArrowLeft,
+		KeyName::Right => Key::ArrowRight,
+		KeyName::Char(c) if shift => Key::Char(c.to_ascii_uppercase()),
+		KeyName::Char(c) => Key::Char(c),
+		function => match FUNCTION_KEYS.iter().position(|key| *key == function) {
+			Some(index) => Key::F(u8::try_from(index + 1).unwrap_or(1)),
+			None => return Err(invalid("that key is not available in the browser")),
+		},
+	})
+}
+
+/// Deliver one input event as DOM events, for surfaces without native input
+/// (pages ignoring untrusted events will ignore these).
+fn dom_input(
+	tab: TabHandle<'_>,
+	input: &Input,
+	clicks: u8,
+	timeout: Duration,
+) -> Result<(), Fault> {
+	let modifiers =
+		|m: &Modifiers| json!({ "ctrl": m.ctrl, "alt": m.alt, "shift": m.shift, "meta": m.meta });
+	let event = match input {
+		Input::MouseMove { x, y } => json!({ "type": "move", "x": x, "y": y }),
+		Input::MouseDown { button, x, y, clicks } => {
+			json!({ "type": "down", "x": x, "y": y, "button": button.to_string(), "clicks": clicks })
+		},
+		Input::MouseUp { button, x, y } => {
+			json!({ "type": "up", "x": x, "y": y, "button": button.to_string(), "clicks": clicks })
+		},
+		Input::Scroll { x, y, dx, dy } => {
+			json!({ "type": "wheel", "x": x, "y": y, "dx": dx, "dy": dy })
+		},
+		Input::KeyDown { key, modifiers: held } | Input::KeyUp { key, modifiers: held } => {
+			let mut event = modifiers(held);
+			event["type"] = json!(if matches!(input, Input::KeyDown { .. }) {
+				"keydown"
+			} else {
+				"keyup"
+			});
+			event["key"] = json!(dom_key_name(*key));
+			event
+		},
+		Input::Text(text) => json!({ "type": "text", "text": &**text }),
+		_ => return Err(invalid("unsupported input event")),
+	};
+	tab.evaluate(&format!("{DOM_INPUT}({event})"), timeout)
+		.map(drop)
+		.map_err(|error| browser_fault("tab.input", error))
+}
+
+fn dom_key_name(key: Key) -> Str {
+	match key {
+		Key::Char(c) => sf!("{c}"),
+		Key::Enter => sf!("Enter"),
+		Key::Tab => sf!("Tab"),
+		Key::Backspace => sf!("Backspace"),
+		Key::Delete => sf!("Delete"),
+		Key::Escape => sf!("Escape"),
+		Key::ArrowUp => sf!("ArrowUp"),
+		Key::ArrowDown => sf!("ArrowDown"),
+		Key::ArrowLeft => sf!("ArrowLeft"),
+		Key::ArrowRight => sf!("ArrowRight"),
+		Key::Home => sf!("Home"),
+		Key::End => sf!("End"),
+		Key::PageUp => sf!("PageUp"),
+		Key::PageDown => sf!("PageDown"),
+		Key::F(n) => sf!("F{n}"),
+		_ => sf!("Unidentified"),
+	}
 }
 
 fn selector(values: &[Value], index: usize, operation: &str) -> Result<Selector, Fault> {
@@ -1872,8 +2190,41 @@ const RUN_RUNTIME: &str = r#"
    waitForSelector:async selector=>{await rpc('waitForSelector',[selector]);return element(selector)}, waitForUrl:async(pattern,opts)=>{currentUrl=await rpc('waitForUrl',[String(pattern),opts]);return currentUrl},
    waitForResponse:(pattern,opts)=>rpc('waitForResponse',[String(pattern),opts]), waitForNavigation:async opts=>{currentUrl=await rpc('waitForNavigation',[opts]);return currentUrl},
    id:async id=>element(`aria-ref=e${id}`), ref:async ref=>element(ref.startsWith('e')?`aria-ref=${ref}`:ref),
-   download:url=>rpc('download',[url])
+   download:url=>rpc('download',[url]),
+   back:async()=>{currentUrl=await rpc('back');return undefined}, forward:async()=>{currentUrl=await rpc('forward');return undefined},
+   reload:async()=>{currentUrl=await rpc('reload');return undefined}
  };
+ // The coordinate and indexed-element vocabularies of other agent desktops:
+ // tab.cua takes computer-use actions in screenshot pixels, tab.ax takes the
+ // `id` numbers from tab.observe() (or [x, y]). Both deliver real input.
+ const input=events=>rpc('input',[events]);
+ const at=t=>typeof t==='number'?{target:`aria-ref=e${t}`}:Array.isArray(t)?{x:t[0],y:t[1]}:typeof t==='string'?{target:t}:t&&typeof t==='object'&&'x' in t?{x:t.x,y:t.y}:null;
+ const where=(t,what)=>{const point=at(t);if(!point)throw new TypeError(`${what} needs an element id, a selector, or [x, y]`);return point};
+ const clicks=(point,button,count)=>{const events=[{type:'move',...point}];for(let n=1;n<=count;n++)events.push({type:'down',...point,button,clicks:n},{type:'up',...point,button,clicks:n});return input(events)};
+ const chord=keys=>Array.isArray(keys)?keys.join('+'):String(keys);
+ const focused=(t,event)=>input(t==null?[event]:[{type:'focus',...where(t,'focus')},event]);
+ const cua={
+   click:({x,y,button='left'}={})=>clicks({x,y},button,1), double_click:({x,y}={})=>clicks({x,y},'left',2),
+   move:({x,y}={})=>input([{type:'move',x,y}]),
+   drag:({path=[]}={})=>{const points=path.map(p=>Array.isArray(p)?{x:p[0],y:p[1]}:{x:p.x,y:p.y});if(!points.length)throw new TypeError('drag needs a path of points');
+     return input([{type:'move',...points[0]},{type:'down',...points[0]},...points.slice(1).map(p=>({type:'move',...p})),{type:'up',...points.at(-1)}])},
+   scroll:({x,y,scrollX,scrollY,scroll_x,scroll_y}={})=>input([{type:'wheel',x,y,dx:scrollX??scroll_x??0,dy:scrollY??scroll_y??0}]),
+   keypress:({keys}={})=>input([{type:'key',keys:chord(keys)}]), type:({text}={})=>input([{type:'text',text:String(text)}]),
+   wait:({ms=1000}={})=>new Promise(resolve=>setTimeout(resolve,ms)), screenshot:opts=>rpc('screenshot',[opts])
+ };
+ cua.doubleClick=cua.double_click;
+ cua.perform=async action=>{if(Array.isArray(action))return cua.perform({actions:action});if(Array.isArray(action?.actions)){for(const step of action.actions)await cua.perform(step);return}
+   const type=String(action?.type??action?.action??'').replace(/[A-Z]/g,c=>'_'+c.toLowerCase()),run=cua[type],point=action?.coordinate;
+   if(typeof run!=='function'||type==='perform')throw new TypeError(`unknown computer action ${type||'(missing type)'}; use click, double_click, move, drag, scroll, type, keypress, wait or screenshot`);
+   return run(point?{...action,x:point.x??point[0],y:point.y??point[1]}:action)};
+ const ax={
+   get:opts=>rpc('observe',[opts]),
+   click:(t,{clickCount=1,mouseButton='left'}={})=>clicks(where(t,'click'),mouseButton,clickCount),
+   typeText:(t,text)=>focused(t,{type:'text',text:String(text)}), pressKey:(t,key)=>focused(t,{type:'key',keys:chord(key)}),
+   scroll:(t,direction='down',pages=1)=>input([{type:'wheel',...(t==null?{}:where(t,'scroll')),direction,pages}]),
+   setValue:(t,value)=>{const point=where(t,'setValue');if(!point.target)throw new TypeError('setValue needs an element id or selector');return rpc('fill',[point.target,String(value)])}
+ };
+ Object.assign(tab,{cua,ax});
  const page=Object.assign(tab,{
    setRequestInterception:enabled=>rpc('setRequestInterception',[enabled]),
    on:(event,handler)=>event==='request'?fire('onRequest',[String(handler)]):page,
@@ -1897,6 +2248,36 @@ const RUN_RUNTIME: &str = r#"
  return true
 })()
 "#;
+
+/// DOM-event delivery of one input event (see [`dom_input`]). Untrusted
+/// events run no browser default actions, so the common ones (focus on
+/// press, typing, Enter, deletion, select-all, scrolling) are performed here.
+const DOM_INPUT: &str = r#"(e=>{
+ const buttons={left:0,middle:1,right:2}, mods={ctrlKey:!!e.ctrl,altKey:!!e.alt,shiftKey:!!e.shift,metaKey:!!e.meta};
+ const at=()=>document.elementFromPoint(e.x,e.y)||document.body;
+ const mouse=(el,type)=>el.dispatchEvent(new (type.startsWith('pointer')?PointerEvent:MouseEvent)(type,{bubbles:true,cancelable:true,composed:true,view:window,clientX:e.x,clientY:e.y,button:buttons[e.button]??0,detail:e.clicks||1,...mods}));
+ const active=()=>{let el=document.activeElement||document.body;while(el?.shadowRoot?.activeElement)el=el.shadowRoot.activeElement;return el};
+ const insert=text=>{if(document.execCommand('insertText',false,text))return;const el=active();if('value' in el){el.value+=text;el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:text}))}};
+ const key=type=>active().dispatchEvent(new KeyboardEvent(type,{key:e.key,bubbles:true,cancelable:true,composed:true,...mods}));
+ switch(e.type){
+  case 'move':{const el=at();mouse(el,'pointermove');mouse(el,'mousemove');break}
+  case 'down':{const el=at();mouse(el,'pointerdown');if(mouse(el,'mousedown')&&e.button==='left')(el.closest('input,textarea,select,button,a[href],[tabindex],[contenteditable]')||el).focus?.();break}
+  case 'up':{const el=at();mouse(el,'pointerup');mouse(el,'mouseup');if(e.button==='left'){mouse(el,'click');if(e.clicks===2)mouse(el,'dblclick')}else mouse(el,e.button==='right'?'contextmenu':'auxclick');break}
+  case 'wheel':{let el=at();if(!el.dispatchEvent(new WheelEvent('wheel',{bubbles:true,cancelable:true,clientX:e.x,clientY:e.y,deltaX:e.dx,deltaY:e.dy,...mods})))break;
+   for(;el&&el!==document.body&&el!==document.documentElement;el=el.parentElement){const s=getComputedStyle(el);if(/auto|scroll/.test(s.overflowX+s.overflowY)&&(el.scrollHeight>el.clientHeight||el.scrollWidth>el.clientWidth)){el.scrollBy(e.dx,e.dy);return true}}
+   window.scrollBy(e.dx,e.dy);break}
+  case 'keydown':{const el=active();if(!key('keydown'))break;
+   if(e.ctrl||e.meta){const command={a:'selectAll',z:e.shift?'redo':'undo'}[e.key.toLowerCase()];if(command)document.execCommand(command);break}
+   if(e.alt)break;
+   if(e.key.length===1)insert(e.key);
+   else if(e.key==='Enter'){if(el.tagName==='TEXTAREA'||el.isContentEditable)document.execCommand('insertLineBreak');else if(el.form)el.form.requestSubmit();else if(/^(A|BUTTON)$/.test(el.tagName))el.click()}
+   else if(e.key==='Backspace')document.execCommand('delete');
+   else if(e.key==='Delete')document.execCommand('forwardDelete');
+   break}
+  case 'keyup':key('keyup');break;
+  case 'text':insert(e.text);break
+ }
+ return true})"#;
 
 const INTERCEPTION_INSTALL: &str = r#"
 (()=>{
@@ -2086,6 +2467,173 @@ mod tests {
 	}
 
 	#[test]
+	#[ignore = "requires an installed headless browser engine"]
+	fn computer_use_vocabulary_drives_a_real_page() {
+		let engine = Engine::find(SurfaceKind::Frames).expect("headless browser engine");
+		let view = WebViewBuilder::new(engine)
+			.html(
+				r#"<!doctype html><title>Input contract</title>
+				<form id="f"><input id="q" aria-label="Query"></form>
+				<button id="b" style="position:absolute;left:100px;top:100px;width:120px;height:40px">Go</button>
+				<div id="s" style="position:absolute;left:300px;top:100px;width:200px;height:200px;overflow:auto"><div style="height:4000px"></div></div>
+				<script>window.log=[];
+				b.onclick=()=>log.push('click');b.ondblclick=()=>log.push('dbl');
+				b.oncontextmenu=e=>{e.preventDefault();log.push('menu')};
+				f.onsubmit=e=>{e.preventDefault();log.push('submit:'+q.value)};
+				addEventListener('keydown',e=>{if(e.key==='a'&&(e.metaKey||e.ctrlKey))log.push('primary-a')});</script>"#,
+			)
+			.incognito(true)
+			.build_frames(FrameConfig::default())
+			.expect("isolated page");
+		view
+			.automation()
+			.wait_for_navigation(Duration::from_secs(10))
+			.expect("loaded page");
+		let session = TabSession { view, backend: sf!("headless") };
+		let temp = tempfile::tempdir().expect("tempdir");
+		let blobs = BlobHost::open(temp.path()).expect("blobs");
+		let (updates, _receiver) = flume::unbounded();
+		let cancellation = CancellationToken::new();
+		let run = |code| {
+			run_code(
+				&session,
+				&blobs,
+				"contract",
+				code,
+				Duration::from_secs(15),
+				&cancellation,
+				&updates,
+			)
+		};
+		let (_, result, _) = run(
+			"await tab.cua.click({x: 160, y: 120}); await tab.cua.double_click({x: 160, y: 120}); \
+			 await tab.cua.perform({action: 'click', coordinate: [160, 120], button: 'right'}); \
+			 const field = (await tab.ax.get()).elements.find(e => e.name === 'Query'); await \
+			 tab.ax.typeText(field.id, 'hello'); await tab.ax.pressKey(null, 'Return'); await \
+			 tab.cua.keypress({keys: ['CTRL', 'A']}); await tab.cua.scroll({x: 400, y: 200, \
+			 scroll_x: 0, scroll_y: 300}); await wait(() => tab.evaluate(() => \
+			 document.querySelector('#s').scrollTop >= 300)); await tab.ax.scroll([400, 200], \
+			 'down', 1); await wait(() => tab.evaluate(() => document.querySelector('#s').scrollTop \
+			 >= 1100)); return await tab.evaluate(() => window.log)",
+		)
+		.expect("computer-use actions");
+		assert_eq!(
+			result,
+			Some(json!(["click", "click", "click", "dbl", "menu", "submit:hello", "primary-a"]))
+		);
+		let (_, result, _) = run(
+			"const first = tab.url(); await tab.goto('data:text/html,<title>two</title>two'); const \
+			 second = tab.url(); await tab.back(); const back = tab.url(); await tab.forward(); \
+			 await tab.reload(); return [first === back, second === tab.url(), await tab.title()]",
+		)
+		.expect("history navigation");
+		assert_eq!(result, Some(json!([true, true, "two"])));
+	}
+
+	#[test]
+	#[ignore = "requires an installed headless browser engine"]
+	fn coordinates_are_screenshot_pixels_at_any_device_pixel_ratio() {
+		let engine = Engine::find(SurfaceKind::Frames).expect("headless browser engine");
+		let view = WebViewBuilder::new(engine)
+			.html(
+				r#"<!doctype html><button id="b" style="position:absolute;left:100px;top:100px;width:120px;height:40px">Go</button>
+				<script>window.log=[];b.onclick=e=>log.push(e.isTrusted?'trusted':'scripted');</script>"#,
+			)
+			.incognito(true)
+			.build_frames(FrameConfig { scale: 2.0, ..FrameConfig::default() })
+			.expect("isolated page");
+		view
+			.automation()
+			.wait_for_navigation(Duration::from_secs(10))
+			.expect("loaded page");
+		let session = TabSession { view, backend: sf!("headless") };
+		let temp = tempfile::tempdir().expect("tempdir");
+		let blobs = BlobHost::open(temp.path()).expect("blobs");
+		let (updates, _receiver) = flume::unbounded();
+		let (_, result, _) = run_code(
+			&session,
+			&blobs,
+			"contract",
+			"await tab.cua.perform({actions: [{type: 'click', x: 320, y: 240}, {type: 'click', x: \
+			 160, y: 120}]}); return await tab.evaluate(() => [devicePixelRatio, window.log])",
+			Duration::from_secs(15),
+			&CancellationToken::new(),
+			&updates,
+		)
+		.expect("scaled click");
+		// (320, 240) in a 2x screenshot is the button; (160, 120) is above it.
+		assert_eq!(result, Some(json!([2, ["trusted"]])));
+	}
+
+	#[test]
+	#[ignore = "requires an installed headless browser engine"]
+	fn dom_input_fallback_performs_default_actions() {
+		let engine = Engine::find(SurfaceKind::Frames).expect("headless browser engine");
+		let view = WebViewBuilder::new(engine)
+			.html(
+				r#"<!doctype html><form id="f"><input id="q"></form>
+				<button id="b" style="position:absolute;left:100px;top:100px;width:120px;height:40px">Go</button>
+				<div id="s" style="position:absolute;left:300px;top:100px;width:200px;height:200px;overflow:auto"><div style="height:4000px"></div></div>
+				<script>window.log=[];b.onclick=()=>log.push('click');b.ondblclick=()=>log.push('dbl');
+				f.onsubmit=e=>{e.preventDefault();log.push('submit:'+q.value)};</script>"#,
+			)
+			.incognito(true)
+			.build_frames(FrameConfig::default())
+			.expect("isolated page");
+		let tab = view.automation();
+		tab.wait_for_navigation(Duration::from_secs(10))
+			.expect("loaded page");
+		let timeout = Duration::from_secs(5);
+		let mut events = vec![
+			Input::MouseDown { button: MouseButton::Left, x: 160.0, y: 120.0, clicks: 2 },
+			Input::MouseUp { button: MouseButton::Left, x: 160.0, y: 120.0 },
+			Input::MouseDown { button: MouseButton::Left, x: 0.0, y: 0.0, clicks: 1 },
+			Input::Scroll { x: 400.0, y: 200.0, dx: 0.0, dy: 250.0 },
+		];
+		tab.evaluate("document.querySelector('#q').focus()", timeout)
+			.expect("focus");
+		events.push(Input::Text(sf!("hi")));
+		events.extend(chord_inputs("Backspace").unwrap());
+		events.extend(chord_inputs("Return").unwrap());
+		for event in &events {
+			dom_input(tab, event, 2, timeout).expect("dom input");
+		}
+		let state = tab
+			.evaluate("[window.log, document.querySelector('#s').scrollTop]", timeout)
+			.expect("state");
+		assert_eq!(state, json!([["click", "dbl", "submit:h"], 250]));
+	}
+
+	#[test]
+	fn chords_accept_trained_spellings() {
+		let primary = if cfg!(target_os = "macos") {
+			Modifiers { meta: true, ..Modifiers::NONE }
+		} else {
+			Modifiers { ctrl: true, ..Modifiers::NONE }
+		};
+		let down = |inputs: Vec<Input>| match inputs.first() {
+			Some(Input::KeyDown { key, modifiers }) => (*key, *modifiers),
+			other => panic!("expected a key down, got {other:?}"),
+		};
+		assert_eq!(down(chord_inputs("Return").unwrap()), (Key::Enter, Modifiers::NONE));
+		assert_eq!(down(chord_inputs("Page_Down").unwrap()), (Key::PageDown, Modifiers::NONE));
+		assert_eq!(down(chord_inputs("ctrl+a").unwrap()), (Key::Char('a'), primary));
+		assert_eq!(down(chord_inputs("CTRL+C").unwrap()), (Key::Char('c'), primary));
+		assert_eq!(
+			down(chord_inputs("Control+a").unwrap()),
+			(Key::Char('a'), Modifiers { ctrl: true, ..Modifiers::NONE })
+		);
+		assert_eq!(
+			down(chord_inputs("super+shift+z").unwrap()),
+			(Key::Char('Z'), Modifiers { meta: true, shift: true, ..Modifiers::NONE })
+		);
+		assert_eq!(down(chord_inputs("space").unwrap()), (Key::Char(' '), Modifiers::NONE));
+		assert!(chord_inputs("shift").unwrap().is_empty());
+		assert!(chord_inputs("CapsLock").is_err());
+		assert!(chord_inputs("hyperdrive").is_err());
+	}
+
+	#[test]
 	fn runtime_lifts_the_complete_bounded_helper_vocabulary() {
 		for helper in [
 			"observe",
@@ -2097,6 +2645,14 @@ mod tests {
 			"waitForResponse",
 			"setRequestInterception",
 			"clearRequestHandlers",
+			"rpc('back')",
+			"rpc('forward')",
+			"rpc('reload')",
+			"double_click",
+			"keypress",
+			"typeText",
+			"pressKey",
+			"setValue",
 		] {
 			assert!(RUN_RUNTIME.contains(helper), "missing {helper}");
 		}

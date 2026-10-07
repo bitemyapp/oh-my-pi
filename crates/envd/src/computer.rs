@@ -352,7 +352,8 @@ impl ComputerSessionHost {
 			match statement {
 				Statement::Desktop { bind, mut params } => {
 					resolve_bound_params(&mut params, &self.state.lock())?;
-					if matches!(params.operation, Operation::Capture)
+					self.resolve_app_window(&mut params).await?;
+					if matches!(params.operation, Operation::Capture | Operation::AppState)
 						&& artifacts.len() >= MAX_SCREENSHOTS
 					{
 						return Err(invalid("computer programs are limited to 32 screenshots"));
@@ -420,6 +421,84 @@ impl ComputerSessionHost {
 			}
 		}
 		Ok((results, artifacts))
+	}
+
+	/// Point an `app`-scoped call at that app's frontmost window: an exact
+	/// app-name match before a partial one, the focused window first.
+	async fn resolve_app_window(&self, params: &mut NativeParams) -> Result<(), Fault> {
+		let Some(app) = params.app.as_deref() else {
+			return Ok(());
+		};
+		if params.window.is_some()
+			|| params.reference.is_some()
+			|| matches!(
+				params.operation,
+				Operation::ListWindows | Operation::ResolveWindow | Operation::FocusedWindow
+			) {
+			return Ok(());
+		}
+		let operation = params.operation;
+		let windows = self
+			.session
+			.list_windows()
+			.await
+			.map_err(|error| native_fault(operation, error))?;
+		let wanted = app.to_lowercase();
+		let rank = |window: &omp_desktop::DesktopWindow| {
+			let name = window.app.to_lowercase();
+			let closeness = if name == wanted {
+				0
+			} else if name.contains(&wanted) {
+				1
+			} else {
+				return None;
+			};
+			Some((closeness, !window.focused))
+		};
+		let chosen = windows
+			.iter()
+			.enumerate()
+			.filter_map(|(order, window)| rank(window).map(|rank| (rank, order, window)))
+			.min_by_key(|(rank, order, _)| (*rank, *order))
+			.map(|(_, _, window)| window.id.clone());
+		params.window = Some(Str::new(chosen.ok_or_else(|| {
+			fault(
+				FaultCode::WindowNotFound,
+				&format!("no open window belongs to `{app}`; list_apps() shows what is open"),
+				Some(operation),
+			)
+		})?));
+		Ok(())
+	}
+
+	/// Size of a call's target in global logical units, for page scrolling.
+	async fn target_size(&self, params: &NativeParams) -> Result<(f64, f64), Fault> {
+		let operation = params.operation;
+		if let Some(id) = params
+			.window
+			.as_deref()
+			.filter(|id| !id.eq_ignore_ascii_case("desktop"))
+		{
+			let windows = self
+				.session
+				.list_windows()
+				.await
+				.map_err(|error| native_fault(operation, error))?;
+			if let Some(window) = windows.iter().find(|window| window.id == id) {
+				return Ok((f64::from(window.width), f64::from(window.height)));
+			}
+		}
+		let displays = self
+			.session
+			.list_displays()
+			.await
+			.map_err(|error| native_fault(operation, error))?;
+		displays
+			.iter()
+			.find(|display| display.is_primary)
+			.or_else(|| displays.first())
+			.map(|display| (f64::from(display.width), f64::from(display.height)))
+			.ok_or_else(|| fault(FaultCode::InvalidRequest, "no display to scroll", Some(operation)))
 	}
 
 	async fn execute_native(
@@ -520,6 +599,21 @@ impl ComputerSessionHost {
 					_ => unreachable!("covered window operation"),
 				}
 			},
+			Operation::AppState => {
+				let screenshot = NativeParams { operation: Operation::Capture, ..params.clone() };
+				let tree = NativeParams { operation: Operation::AxSnapshot, ..params.clone() };
+				let (screenshot, created) =
+					Box::pin(self.execute_native(screenshot, cancellation.clone(), updates)).await?;
+				artifacts.extend(created);
+				let (accessibility, _) =
+					Box::pin(self.execute_native(tree, cancellation, updates)).await?;
+				json!({
+					"app": params.app,
+					"window": params.window,
+					"screenshot": screenshot,
+					"accessibility": accessibility,
+				})
+			},
 			Operation::Capture => {
 				let capture = self
 					.session
@@ -606,14 +700,19 @@ impl ComputerSessionHost {
 				Value::Bool(true)
 			},
 			Operation::Scroll => {
+				let (mut dx, mut dy) = (params.dx.unwrap_or(0.0), params.dy.unwrap_or(0.0));
+				if let Some(pages) = params.pages {
+					let (width, height) = self.target_size(&params).await?;
+					(dx, dy) = (dx.signum() * width * pages, dy.signum() * height * pages);
+				}
 				self
 					.session
 					.scroll(
 						target(&params),
 						number(params.x, "x")?,
 						number(params.y, "y")?,
-						params.dx.unwrap_or(0.0),
-						params.dy.unwrap_or(0.0),
+						dx,
+						dy,
 						pointer_options(&params),
 					)
 					.await
@@ -1230,25 +1329,93 @@ fn split_arguments(arguments: &str) -> Result<Vec<Str>, Fault> {
 fn parse_arguments(arguments: &str) -> Result<Vec<Value>, Fault> {
 	split_arguments(arguments)?
 		.into_iter()
-		.map(|argument| match serde_json::from_str(argument.as_str()) {
-			Ok(value) => Ok(value),
-			Err(_)
-				if argument.bytes().all(|byte| {
-					byte == b'_'
-						|| byte == b'.'
-						|| byte == b'?'
-						|| byte == b'['
-						|| byte == b']'
-						|| byte.is_ascii_alphanumeric()
-				}) =>
-			{
-				Ok(json!({ "$expr": argument }))
-			},
-			Err(_) => {
-				Err(invalid("computer call arguments must be JSON values or retained-value paths"))
-			},
+		.map(|argument| {
+			match serde_json::from_str(argument.as_str()).or_else(|error| {
+				javascript_literal(argument.as_str())
+					.and_then(|json| serde_json::from_str(&json).ok())
+					.ok_or(error)
+			}) {
+				Ok(value) => Ok(value),
+				Err(_)
+					if argument.bytes().all(|byte| {
+						byte == b'_'
+							|| byte == b'.'
+							|| byte == b'?'
+							|| byte == b'['
+							|| byte == b']'
+							|| byte.is_ascii_alphanumeric()
+					}) =>
+				{
+					Ok(json!({ "$expr": argument }))
+				},
+				Err(_) => {
+					Err(invalid("computer call arguments must be JSON values or retained-value paths"))
+				},
+			}
 		})
 		.collect()
+}
+
+/// Rewrite a JavaScript object/array literal (bare keys, single-quoted
+/// strings, trailing commas) as JSON. Returns `None` for anything else, such
+/// as retained-value paths, so those keep their meaning.
+fn javascript_literal(source: &str) -> Option<String> {
+	let trimmed = source.trim();
+	if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+		return None;
+	}
+	let mut json = String::with_capacity(trimmed.len() + 16);
+	let mut chars = trimmed.chars().peekable();
+	while let Some(character) = chars.next() {
+		match character {
+			'"' | '\'' => {
+				json.push('"');
+				while let Some(inner) = chars.next() {
+					match inner {
+						'\\' => match chars.next()? {
+							'\'' => json.push('\''),
+							escaped => {
+								json.push('\\');
+								json.push(escaped);
+							},
+						},
+						'"' if character == '\'' => json.push_str("\\\""),
+						end if end == character => break,
+						other => json.push(other),
+					}
+				}
+				json.push('"');
+			},
+			',' => {
+				let rest = chars.clone().find(|next| !next.is_whitespace());
+				if !matches!(rest, Some('}' | ']')) {
+					json.push(',');
+				}
+			},
+			start if start.is_ascii_alphabetic() || start == '_' || start == '$' => {
+				let mut word = String::from(start);
+				while let Some(&next) = chars.peek()
+					&& (next.is_ascii_alphanumeric() || next == '_' || next == '$')
+				{
+					word.push(next);
+					chars.next();
+				}
+				let is_key = chars.clone().find(|next| !next.is_whitespace()) == Some(':');
+				match word.as_str() {
+					_ if is_key => {
+						json.push('"');
+						json.push_str(&word);
+						json.push('"');
+					},
+					"true" | "false" | "null" => json.push_str(&word),
+					"undefined" => json.push_str("null"),
+					_ => return None,
+				}
+			},
+			other => json.push(other),
+		}
+	}
+	Some(json)
 }
 
 fn expression_argument(value: &Value) -> Option<Str> {
@@ -1270,6 +1437,9 @@ fn parse_desktop_call(method: &str, arguments: &[Value]) -> Result<NativeParams,
 			return Err(invalid("desktop session close is available only as action=close"));
 		}
 		return Ok(params);
+	}
+	if let Some(params) = parse_app_call(method, arguments) {
+		return params;
 	}
 	let operation = match method {
 		"capabilities" => Operation::Capabilities,
@@ -1305,30 +1475,7 @@ fn parse_desktop_call(method: &str, arguments: &[Value]) -> Result<NativeParams,
 		"clipboard.write" => Operation::ClipboardWrite,
 		_ => return Err(invalid("unknown `desktop`, window, or accessibility method")),
 	};
-	let mut params = NativeParams {
-		operation,
-		window: None,
-		reference: None,
-		value: None,
-		app: None,
-		title: None,
-		query_value: None,
-		x: None,
-		y: None,
-		dx: None,
-		dy: None,
-		points: None,
-		button: None,
-		count: None,
-		modifiers: None,
-		delivery: None,
-		max_width: None,
-		max_height: None,
-		max_depth: None,
-		limit: None,
-		all: None,
-		silent: false,
-	};
+	let mut params = empty_params(operation);
 	match operation {
 		Operation::Close
 		| Operation::Capabilities
@@ -1360,6 +1507,7 @@ fn parse_desktop_call(method: &str, arguments: &[Value]) -> Result<NativeParams,
 		},
 		Operation::ListWindows
 		| Operation::Capture
+		| Operation::AppState
 		| Operation::AxSnapshot
 		| Operation::AxQuery
 		| Operation::AxClick => {
@@ -1476,6 +1624,188 @@ fn parse_desktop_call(method: &str, arguments: &[Value]) -> Result<NativeParams,
 		if params.reference.is_none() {
 			return Err(invalid("accessibility ref requires a string"));
 		}
+	}
+	Ok(params)
+}
+
+const fn empty_params(operation: Operation) -> NativeParams {
+	NativeParams {
+		operation,
+		window: None,
+		reference: None,
+		value: None,
+		app: None,
+		title: None,
+		query_value: None,
+		x: None,
+		y: None,
+		dx: None,
+		dy: None,
+		pages: None,
+		points: None,
+		button: None,
+		count: None,
+		modifiers: None,
+		delivery: None,
+		max_width: None,
+		max_height: None,
+		max_depth: None,
+		limit: None,
+		all: None,
+		silent: false,
+	}
+}
+
+/// Lift a call in the app-scoped, snake_case form other agent desktops use,
+/// such as `desktop.click({app: "Notes", x: 120, y: 48})` or
+/// `desktop.press_key({app: "Notes", key: "super+n"})`, onto the native
+/// operations. `element_index` is the number in an accessibility ref (`e12`
+/// is 12); `app` names the window the call targets and is resolved to that
+/// app's frontmost window when the call runs. Positional calls fall through
+/// to the native vocabulary.
+fn parse_app_call(method: &str, arguments: &[Value]) -> Option<Result<NativeParams, Fault>> {
+	const CHATTY: &[&str] =
+		&["element_index", "mouse_button", "click_count", "from_x", "direction", "pages", "x"];
+	let options = match arguments {
+		[] => None,
+		[Value::Object(options)] => Some(options),
+		_ => return None,
+	};
+	let app_form = match method {
+		"list_apps"
+		| "get_app_state"
+		| "type_text"
+		| "press_key"
+		| "set_value"
+		| "perform_secondary_action" => true,
+		"click" | "drag" | "scroll" => {
+			options.is_some_and(|options| CHATTY.iter().any(|key| options.contains_key(*key)))
+		},
+		_ => false,
+	};
+	app_form.then(|| lift_app_call(method, options.cloned().unwrap_or_default()))
+}
+
+fn lift_app_call(method: &str, options: Map<String, Value>) -> Result<NativeParams, Fault> {
+	const KEYS: &[&str] = &[
+		"app",
+		"window",
+		"x",
+		"y",
+		"element_index",
+		"mouse_button",
+		"click_count",
+		"from_x",
+		"from_y",
+		"to_x",
+		"to_y",
+		"direction",
+		"pages",
+		"text",
+		"key",
+		"value",
+		"silent",
+	];
+	if options.keys().any(|key| !KEYS.contains(&key.as_str())) {
+		return Err(invalid("app-scoped computer call contains an unknown field"));
+	}
+	let element = options
+		.get("element_index")
+		.map(|value| {
+			value
+				.as_u64()
+				.map(|index| sf!("e{index}"))
+				.ok_or_else(|| invalid("element_index must be a non-negative integer"))
+		})
+		.transpose()?;
+	let required_number = |name: &'static str| {
+		number_option(&options, name)?.ok_or_else(|| {
+			fault(FaultCode::InvalidRequest, &format!("{method} requires a numeric `{name}`"), None)
+		})
+	};
+	let required_text = |name: &'static str| {
+		string_option(&options, name)?.ok_or_else(|| {
+			fault(FaultCode::InvalidRequest, &format!("{method} requires `{name}`"), None)
+		})
+	};
+	let mut params = empty_params(Operation::ListWindows);
+	params.app = string_option(&options, "app")?;
+	params.window = string_option(&options, "window")?;
+	params.silent = bool_option(&options, "silent")?.unwrap_or(false);
+	match method {
+		"list_apps" => {},
+		"get_app_state" => {
+			if params.app.is_none() && params.window.is_none() {
+				return Err(invalid("get_app_state requires `app`"));
+			}
+			params.operation = Operation::AppState;
+		},
+		"click" => {
+			let button = string_option(&options, "mouse_button")?;
+			if let Some(reference) = element {
+				params.reference = Some(reference);
+				params.operation = if button.as_deref() == Some("right") {
+					params.value = Some(sf!("showmenu"));
+					Operation::AxPerform
+				} else {
+					Operation::AxClick
+				};
+			} else {
+				params.operation = Operation::Click;
+				params.x = Some(required_number("x")?);
+				params.y = Some(required_number("y")?);
+				params.button = button;
+				params.count = integer_option(&options, "click_count")?;
+			}
+		},
+		"drag" => {
+			params.operation = Operation::Drag;
+			params.points = Some(vec![[required_number("from_x")?, required_number("from_y")?], [
+				required_number("to_x")?,
+				required_number("to_y")?,
+			]]);
+		},
+		"scroll" => {
+			if element.is_some() {
+				return Err(invalid(
+					"scroll takes x and y from get_app_state's screenshot, not element_index",
+				));
+			}
+			params.operation = Operation::Scroll;
+			params.x = Some(required_number("x")?);
+			params.y = Some(required_number("y")?);
+			let (dx, dy) = match string_option(&options, "direction")?.as_deref() {
+				Some("up") => (0.0, -1.0),
+				None | Some("down") => (0.0, 1.0),
+				Some("left") => (-1.0, 0.0),
+				Some("right") => (1.0, 0.0),
+				Some(_) => return Err(invalid("scroll direction must be up, down, left or right")),
+			};
+			(params.dx, params.dy) = (Some(dx), Some(dy));
+			params.pages = Some(number_option(&options, "pages")?.unwrap_or(1.0));
+		},
+		"type_text" => {
+			params.operation = Operation::TypeText;
+			params.value = Some(required_text("text")?);
+		},
+		"press_key" => {
+			params.operation = Operation::KeyChord;
+			params.value = Some(required_text("key")?);
+		},
+		"set_value" => {
+			params.operation = Operation::AxSetValue;
+			params.reference =
+				Some(element.ok_or_else(|| invalid("set_value requires `element_index`"))?);
+			params.value = Some(required_text("value")?);
+		},
+		"perform_secondary_action" => {
+			params.operation = Operation::AxPerform;
+			params.reference = Some(
+				element.ok_or_else(|| invalid("perform_secondary_action requires `element_index`"))?,
+			);
+			params.value = Some(sf!("showmenu"));
+		},
+		_ => unreachable!("parse_app_call admits only app-scoped methods"),
 	}
 	Ok(params)
 }
@@ -1848,11 +2178,12 @@ mod tests {
 
 	use omp_con::Ctx;
 	use omp_core::Str;
-	use serde_json::{Map, json};
+	use serde_json::{Map, Value, json};
 
 	use super::{
 		ComputerAccess, ComputerSettings, Operation, SV_COMPUTER_DISPLAY, SV_COMPUTER_MAX_HEIGHT,
-		SV_COMPUTER_MAX_WIDTH, Statement, bounded_cap, evaluate_assertion, parse_program,
+		SV_COMPUTER_MAX_WIDTH, Statement, bounded_cap, evaluate_assertion, javascript_literal,
+		parse_program,
 	};
 
 	#[tokio::test]
@@ -1979,6 +2310,56 @@ mod tests {
 				.iter()
 				.any(|statement| { matches!(statement, Statement::WaitUntil { .. }) })
 		);
+	}
+
+	#[test]
+	fn computer_program_lifts_app_scoped_calls() {
+		let lifted = |code: &str| match parse_program(code).expect(code).pop() {
+			Some(Statement::Desktop { params, .. }) => params,
+			_ => panic!("{code} did not lift to a desktop call"),
+		};
+		let state = lifted("const state = await desktop.get_app_state({app: 'Notes'})");
+		assert_eq!(state.operation, Operation::AppState);
+		assert_eq!(state.app.as_deref(), Some("Notes"));
+		let click = lifted(
+			"await desktop.click({app: 'Notes', x: 12, y: 34, mouse_button: 'right', click_count: 2})",
+		);
+		assert_eq!(click.operation, Operation::Click);
+		assert_eq!((click.x, click.y, click.count), (Some(12.0), Some(34.0), Some(2)));
+		assert_eq!(click.button.as_deref(), Some("right"));
+		let element = lifted("await desktop.click({app: 'Notes', element_index: 7})");
+		assert_eq!(element.operation, Operation::AxClick);
+		assert_eq!(element.reference.as_deref(), Some("e7"));
+		let menu = lifted("await desktop.perform_secondary_action({app: 'Notes', element_index: 7})");
+		assert_eq!((menu.operation, menu.value.as_deref()), (Operation::AxPerform, Some("showmenu")));
+		let key = lifted("await desktop.press_key({app: 'Notes', key: 'super+n'})");
+		assert_eq!((key.operation, key.value.as_deref()), (Operation::KeyChord, Some("super+n")));
+		let text = lifted("await desktop.type_text({app: 'Notes', text: 'hi'})");
+		assert_eq!((text.operation, text.value.as_deref()), (Operation::TypeText, Some("hi")));
+		let set = lifted("await desktop.set_value({app: 'Notes', element_index: 3, value: 'x'})");
+		assert_eq!((set.operation, set.reference.as_deref()), (Operation::AxSetValue, Some("e3")));
+		let drag =
+			lifted("await desktop.drag({app: 'Notes', from_x: 1, from_y: 2, to_x: 3, to_y: 4})");
+		assert_eq!(drag.points, Some(vec![[1.0, 2.0], [3.0, 4.0]]));
+		let scroll =
+			lifted("await desktop.scroll({app: 'Notes', x: 5, y: 6, direction: 'up', pages: 2})");
+		assert_eq!((scroll.dx, scroll.dy, scroll.pages), (Some(0.0), Some(-1.0), Some(2.0)));
+		assert_eq!(lifted("await desktop.list_apps()").operation, Operation::ListWindows);
+		let literal = javascript_literal("{app: 'It\\'s \"q\"', n: [1, 2,], ok: true, }")
+			.expect("object literal");
+		assert_eq!(
+			serde_json::from_str::<Value>(&literal).expect(&literal),
+			json!({"app": "It's \"q\"", "n": [1, 2], "ok": true})
+		);
+		assert_eq!(javascript_literal("windows[0]"), None);
+		assert_eq!(javascript_literal("{app: someVariable}"), None);
+		assert!(parse_program("await desktop.get_app_state({})").is_err());
+		assert!(parse_program("await desktop.click({app: 'Notes', x: 1})").is_err());
+		assert!(parse_program("await desktop.click({app: 'Notes', x: 1, y: 2, bogus: 1})").is_err());
+		assert!(parse_program("await desktop.scroll({app: 'Notes', element_index: 3})").is_err());
+		// Positional and native-option calls keep their meaning.
+		assert_eq!(lifted("await desktop.click(10, 20)").operation, Operation::Click);
+		assert_eq!(lifted("await desktop.click({reference: 'e4'})").operation, Operation::AxClick);
 	}
 
 	#[test]
