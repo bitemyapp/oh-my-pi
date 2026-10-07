@@ -1468,3 +1468,25 @@ mod tests {
 		);
 	}
 }
+
+/// Keeps a private copy of each encoded request body when
+/// `OMP_DEBUG_REQUEST_DIR` names a directory: prompt-cache and token
+/// investigations need the exact bytes a provider saw. Bodies hold the
+/// conversation, never credentials (those travel in headers). Off by default;
+/// failures to write are ignored so a debug aid never fails a request.
+pub(crate) fn debug_capture_request(provider: &str, body: &[u8]) {
+	use std::sync::atomic::{AtomicU64, Ordering};
+	static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+	let Some(directory) = std::env::var_os("OMP_DEBUG_REQUEST_DIR").filter(|value| !value.is_empty())
+	else {
+		return;
+	};
+	let directory = std::path::PathBuf::from(directory);
+	let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+	let millis = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map_or(0, |elapsed| elapsed.as_millis());
+	let path = directory.join(format!("{millis}-{}-{sequence:05}-{provider}.json", std::process::id()));
+	let _ = std::fs::create_dir_all(&directory);
+	let _ = std::fs::write(path, body);
+}

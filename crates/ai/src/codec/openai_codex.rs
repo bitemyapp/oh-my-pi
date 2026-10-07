@@ -1198,6 +1198,7 @@ impl Codec for OpenAiCodexCodec {
 			),
 		};
 		let body = body.map_err(|_| fail("codex_request_serialization"))?;
+		crate::codec::debug_capture_request("openai-codex", &body);
 		let mut headers = vec![
 			super::RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
 			super::RequestHeader { name: sf!("accept"), value: Str::new(accept) },
