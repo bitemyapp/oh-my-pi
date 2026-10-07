@@ -469,6 +469,7 @@ struct AcceptedHello {
 	capabilities:  BTreeSet<Str>,
 	props:         Option<ValueMap>,
 	approval_mode: Option<ApprovalMode>,
+	computer_use:  Option<bool>,
 }
 
 fn approval_mode_from_wire(value: i32) -> Result<Option<ApprovalMode>, i32> {
@@ -2571,6 +2572,7 @@ impl EnvServer {
 			ext_hosts.as_ref(),
 			interrupt_grace,
 			py_eval,
+			false,
 			&host_settings.tools,
 			&browser_settings,
 			&shell_settings,
@@ -2858,6 +2860,7 @@ impl EnvServer {
 			ext_hosts.as_ref(),
 			interrupt_grace,
 			py_eval,
+			doc_connections.is_some(),
 			&host_settings.tools,
 			&browser_settings,
 			&shell_settings,
@@ -3884,8 +3887,9 @@ impl EnvServer {
 					while let Ok(done) = finished.try_recv() {
 						connection.finish(done);
 					}
-					self
-						.dispatch(*frame, &responses, &finished_tx, &mut connection, &policy)
+					let computer_access = connection.computer_access.clone();
+					computer_access
+						.scope(self.dispatch(*frame, &responses, &finished_tx, &mut connection, &policy))
 						.await;
 				},
 			}
@@ -3964,6 +3968,24 @@ impl EnvServer {
 				return None;
 			},
 		};
+		let computer_use = match hello
+			.props
+			.as_ref()
+			.and_then(|props| props.fields.get("computer-use"))
+		{
+			None => None,
+			Some(Value { kind: Some(value::Kind::Bool(enabled)) }) => Some(*enabled),
+			Some(_) => {
+				send_error(
+					responses,
+					0,
+					pb::ProtocolErrorCode::InvalidArgument,
+					"ClientHello computer-use must be a boolean",
+				)
+				.await;
+				return None;
+			},
+		};
 		let data_capabilities = hello
 			.capabilities
 			.iter()
@@ -4004,6 +4026,7 @@ impl EnvServer {
 				capabilities: hello.capabilities.into_iter().map(Str::from).collect(),
 				props: hello.props,
 				approval_mode,
+				computer_use,
 			})
 	}
 
@@ -4376,7 +4399,9 @@ impl EnvServer {
 				.as_ref()
 				.filter(|scope| !scope.invocation_id.is_empty())
 				.is_some_and(|scope| {
-					let pending = self.blobs.is_pending_verdict(scope.invocation_id.as_str(), request);
+					let pending = self
+						.blobs
+						.is_pending_verdict(scope.invocation_id.as_str(), request);
 					tracing::debug!(
 						invocation_id = %scope.invocation_id,
 						session_id = %scope.session_id,
@@ -5520,8 +5545,7 @@ impl EnvServer {
 					},
 				};
 				if !authorize_data_operation(
-					connection, scope, operation, "env.exec", responses, request_id,
-					false,
+					connection, scope, operation, "env.exec", responses, request_id, false,
 				)
 				.await
 				{
@@ -6145,8 +6169,10 @@ impl EnvServer {
 			},
 			_ => unreachable!("DAP dispatch receives only DAP request arms"),
 		};
-		if !authorize_data_operation(connection, scope, operation, capability, responses, request_id, false)
-			.await
+		if !authorize_data_operation(
+			connection, scope, operation, capability, responses, request_id, false,
+		)
+		.await
 		{
 			return;
 		}
@@ -8303,6 +8329,7 @@ struct ConnectionState {
 	requests:         HashMap<u64, RequestState>,
 	invocation_ids:   HashMap<Str, u64>,
 	tool_settings:    ToolSettings,
+	computer_access:  crate::computer::ComputerAccess,
 	exec_host:        ExecHost,
 	document_leases:  HashMap<Bytes, DocumentLease>,
 	grants:           Grants,
@@ -8455,14 +8482,21 @@ impl ConnectionState {
 			},
 		);
 		let quotas = QuotaAccount::new(Arc::clone(&authority), policy.host.clone());
-		let tool_settings = base_settings
+		let mut tool_settings = base_settings
 			.clone()
 			.with_approval_mode_override(hello.approval_mode);
+		if let Some(enabled) = hello.computer_use {
+			tool_settings
+				.enabled
+				.insert(Str::new_static("computer"), enabled);
+		}
+		let computer_access = crate::computer::ComputerAccess::new(tool_settings.enabled("computer"));
 		Self {
 			owner,
 			requests: HashMap::new(),
 			invocation_ids: HashMap::new(),
 			tool_settings,
+			computer_access,
 			exec_host,
 			document_leases: HashMap::new(),
 			grants: hello.grants,
@@ -9007,6 +9041,7 @@ impl ConnectionState {
 	}
 
 	fn cancel_all(&mut self, exec_host: &ExecHost) {
+		self.computer_access.revoke();
 		for (_, state) in mem::take(&mut self.requests) {
 			match state {
 				RequestState::Invocation(InvocationState::Native {
@@ -9134,12 +9169,13 @@ async fn spawn_native_invocation(
 	responses: flume::Sender<pb::ServerFrame>,
 	finished: flume::Sender<Finished>,
 ) {
+	let computer_access = crate::computer::ComputerAccess::current();
 	let (started, start) = flume::bounded(1);
 	let retention_session = session_id.clone();
 	// A client that asks for no env deadline owns the invocation's lifetime:
 	// the tools it runs must not detach the invocation on their own clock.
 	let client_owns_lifetime = deadline.is_none();
-	tokio::spawn(with_invocation_scope(
+	tokio::spawn(computer_access.scope(with_invocation_scope(
 		pty_denied,
 		with_output_request_scope(
 			output_request,
@@ -9321,7 +9357,7 @@ async fn spawn_native_invocation(
 				),
 			),
 		),
-	));
+	)));
 	let _ = start.recv_async().await;
 }
 
@@ -12643,7 +12679,13 @@ mod tests {
 	}
 
 	fn accepted_hello(grants: Grants, approval_mode: Option<ApprovalMode>) -> AcceptedHello {
-		AcceptedHello { grants, capabilities: BTreeSet::new(), props: None, approval_mode }
+		AcceptedHello {
+			grants,
+			capabilities: BTreeSet::new(),
+			props: None,
+			approval_mode,
+			computer_use: None,
+		}
 	}
 
 	#[test]
@@ -13791,6 +13833,191 @@ mod tests {
 		assert!(!first_binding.grants().contains("*"));
 		assert!(cancel.is_cancelled());
 		assert!(first.requests.is_empty());
+	}
+
+	#[test]
+	fn computer_use_is_connection_scoped_through_native_and_shell_protocols() {
+		// Joined daemon composition needs more stack than Rust's 2 MiB test
+		// thread in unoptimized builds, like the normal application runtime.
+		std::thread::Builder::new()
+			.stack_size(16 * 1024 * 1024)
+			.spawn(|| {
+				tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.unwrap()
+					.block_on(computer_owner_protocol_case());
+			})
+			.unwrap()
+			.join()
+			.unwrap();
+	}
+
+	async fn computer_owner_protocol_case() {
+		use omp_env::InvocationEvent;
+		let root = tempfile::tempdir().unwrap();
+		let state = tempfile::tempdir().unwrap();
+		let con = Arc::new(Ctx::new());
+		assert!(!ToolSettings::from_con(&con).enabled("computer"));
+		let convars = Arc::new(crate::exthost::ConvarControlFactory::new(Arc::clone(&con)));
+		let (connections, _watch) = watch::channel(0);
+		let server = Arc::new(
+			Box::pin(EnvServer::open_project(
+				root.path(),
+				state.path(),
+				&state.path().join("doc.sock"),
+				Registry::new(),
+				ExtHostConfig::new(
+					PathBuf::from("unused"),
+					Principal::new(sf!("test"), sf!("Test")),
+					sf!("computer-test"),
+					1,
+				),
+				Some(connections),
+				true,
+				None,
+				&con,
+				convars,
+				RegistryBridges::default(),
+			))
+			.await
+			.unwrap(),
+		);
+		assert!(
+			server.registry().live_identity("computer").is_some(),
+			"daemon route must exist even when its own cfg disables computer"
+		);
+		let mut clients = Vec::new();
+		let mut tasks = Vec::new();
+		for enabled in [false, true] {
+			let (client, transport) = EnvClient::in_process(64);
+			let owner = Arc::clone(&server);
+			tasks.push(tokio::spawn(async move { owner.serve_in_process(transport).await }));
+			client
+				.hello(pb::ClientHello {
+					client: "computer-scope-test".to_owned(),
+					schema_rev: omp_proto::SCHEMA_REV,
+					props: Some(ValueMap {
+						fields: [("computer-use".to_owned(), Value {
+							kind: Some(value::Kind::Bool(enabled)),
+						})]
+						.into_iter()
+						.collect(),
+					}),
+					..pb::ClientHello::default()
+				})
+				.await
+				.unwrap();
+			let cwd =
+				EnvPath::new(Url::from_directory_path(root.path()).unwrap().to_string()).unwrap();
+			let opened = client
+				.open_session(&cwd, pb::OpenSessionRequest::default())
+				.await
+				.unwrap();
+			clients.push((client, opened.session));
+		}
+		let computer_rev = server
+			.registry()
+			.live_identity("computer")
+			.unwrap()
+			.1
+			.to_string();
+		// No desktop operation is executed: assert(true) is evaluated by the
+		// computer-language parser and uses only cached (unprobed) capabilities.
+		for (enabled, reuse_other_shell) in
+			[(false, false), (true, false), (false, true), (true, true)]
+		{
+			let (client, own_session) = &clients[usize::from(enabled)];
+			let session = if reuse_other_shell {
+				&clients[usize::from(!enabled)].1
+			} else {
+				own_session
+			};
+			for script in [
+				"dyn computer --action run --code 'assert(true)'",
+				"result=$(dyn computer --action run --code 'assert(true)'); result_status=$?; printf \
+				 '%s' \"$result\"; (exit \"$result_status\")",
+				"set -o pipefail; { dyn computer --action run --code 'assert(true)'; } | cat",
+				"set -o pipefail; probe() { dyn computer --action run --code 'assert(true)'; }; probe \
+				 | cat",
+			] {
+				let mut run = client
+					.exec(pb::ExecRequest {
+						session: session.clone(),
+						source: Some(pb::Script { text: script.to_owned(), ..pb::Script::default() }),
+						..pb::ExecRequest::default()
+					})
+					.await
+					.unwrap();
+				let mut output = Vec::new();
+				let status = time::timeout(Duration::from_secs(10), async {
+					loop {
+						match run.next_event().await.unwrap().unwrap() {
+							ClientExecEvent::Started(_) => {},
+							ClientExecEvent::Output(frame) => output.extend_from_slice(&frame.data),
+							ClientExecEvent::Exit(exit) => break exit.status.unwrap(),
+						}
+					}
+				})
+				.await
+				.unwrap();
+				assert_eq!(
+					status.exit_code,
+					Some(if enabled { 0 } else { 1 }),
+					"{}",
+					String::from_utf8_lossy(&output)
+				);
+				if !enabled {
+					assert!(String::from_utf8_lossy(&output).contains("computer use is disabled"));
+				}
+			}
+
+			let mut invocation = client
+				.invoke(pb::InvokeTool {
+					invocation_id: format!("computer-native-{enabled}"),
+					name: "computer".to_owned(),
+					rev: computer_rev.clone(),
+					..pb::InvokeTool::default()
+				})
+				.await
+				.unwrap();
+			assert!(matches!(
+				invocation.next_event().await.unwrap(),
+				Some(InvocationEvent::Accepted(_))
+			));
+			invocation
+				.commit_args(
+					Bytes::from_static(br#"{"action":"run","code":"assert(true)"}"#),
+					Bytes::from_static(b"computer-test"),
+					1000,
+					None,
+				)
+				.await
+				.unwrap();
+			let verdict = time::timeout(Duration::from_secs(10), async {
+				loop {
+					match invocation.next_event().await.unwrap().unwrap() {
+						InvocationEvent::Verdict(verdict) => break verdict,
+						InvocationEvent::Update(_) => {},
+						other => panic!("unexpected event {other:?}"),
+					}
+				}
+			})
+			.await
+			.unwrap();
+			assert_eq!(verdict.is_error, !enabled, "{}", String::from_utf8_lossy(&verdict.json));
+		}
+		assert!(
+			!server.tool_settings.enabled("computer"),
+			"no connection mutates the shared daemon settings"
+		);
+		drop(clients);
+		for task in tasks {
+			time::timeout(Duration::from_secs(10), task)
+				.await
+				.unwrap()
+				.unwrap();
+		}
 	}
 
 	#[test]

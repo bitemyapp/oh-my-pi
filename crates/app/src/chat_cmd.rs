@@ -286,6 +286,7 @@ impl Launch {
 			prewalk,
 			no_prewalk,
 			prewalk_into,
+			computer_use,
 			config,
 			add_dir,
 			skills,
@@ -336,6 +337,7 @@ impl Launch {
 			.map(|root| fs::canonicalize(root).into_diagnostic())
 			.collect::<miette::Result<Vec<_>>>()?;
 		apply_launch_convars(&ctx, &LaunchConvars {
+			computer_use,
 			hide_thinking,
 			service_tier,
 			external_thinking,
@@ -711,6 +713,9 @@ impl omp_chat::commands::prompts::SkillExpander for InteractivePrompts {
 /// invocation's archive-layer overrides (ADR 0012: the convar is the live
 /// setting; the kernel and every projection read it from here).
 pub(crate) struct LaunchConvars<'a> {
+	/// Explicit host choice, applied after cfg overlays without resetting other
+	/// tools.
+	pub computer_use:      Option<bool>,
 	pub hide_thinking:     bool,
 	pub service_tier:      Option<omp_catalog::settings::TierSetting>,
 	pub external_thinking: bool,
@@ -732,6 +737,15 @@ pub(crate) fn apply_launch_convars(
 	ctx: &omp_con::Ctx,
 	flags: &LaunchConvars<'_>,
 ) -> omp_con::ConResult<()> {
+	if let Some(enabled) = flags.computer_use {
+		let mut tools = omp_envd::tool_settings::SV_TOOLS_ENABLED.get(ctx);
+		tools.0.retain(|(name, _)| name.as_str() != "computer");
+		tools
+			.0
+			.push((Str::new_static("computer"), omp_con::Value::Bool(enabled)));
+		omp_envd::tool_settings::SV_TOOLS_ENABLED.set(ctx, tools)?;
+		omp_tools::settings::SV_COMPUTER_ENABLED.set(ctx, enabled)?;
+	}
 	if flags.hide_thinking {
 		omp_chat::settings::CL_SHOWTHINKING.set(ctx, false)?;
 	}
@@ -1256,6 +1270,76 @@ mod tests {
 		LaunchEnv { data_dir: root.join("data"), home: root.join("home"), catalog: embedded() }
 	}
 
+	#[tokio::test]
+	async fn computer_use_override_wins_over_cfg_without_resetting_other_tools() {
+		for desired in [false, true] {
+			let dir = tempfile::tempdir().unwrap();
+			let overlay = dir.path().join("computer.cfg");
+			fs::write(
+				&overlay,
+				format!(
+					"sv_computer_enabled {}\nsv_tools_enabled {{ computer {} read false browser true \
+					 }}\n",
+					!desired, !desired,
+				),
+			)
+			.unwrap();
+			let before = fs::read(&overlay).unwrap();
+			let mut args = ChatArgs::default_interactive();
+			args.model = Some(Str::new_static("openai/gpt-5"));
+			args.project = dir.path().to_path_buf();
+			args.config = vec![overlay.clone()];
+			args.computer_use = Some(desired);
+			let ctx = Arc::new(omp_con::Ctx::new());
+			// Stand in for process_ctx's earlier user/project config load.
+			ctx.exec(
+				"sv_computer_enabled true\nsv_tools_enabled { computer true write false }\n",
+				omp_con::Source::Config(Str::new_static("user.cfg")),
+			)
+			.unwrap();
+			Launch::prepare(args, Arc::clone(&ctx), test_env(dir.path()))
+				.await
+				.unwrap();
+			let settings = omp_envd::tool_settings::ToolSettings::from_con(&ctx);
+			assert_eq!(settings.enabled("computer"), desired);
+			assert_eq!(omp_tools::settings::SV_COMPUTER_ENABLED.get(&ctx), desired);
+			assert!(!settings.enabled("read"), "the overlay's unrelated deny survives");
+			assert!(settings.enabled("browser"), "the overlay's unrelated allow survives");
+			let overrides = omp_envd::tool_settings::SV_TOOLS_ENABLED.get(&ctx);
+			assert_eq!(overrides.0.len(), 3, "only the existing computer entry is replaced");
+			assert_eq!(fs::read(&overlay).unwrap(), before, "launch overrides are not persisted");
+		}
+	}
+
+	#[tokio::test]
+	async fn computer_use_omission_preserves_configured_capability() {
+		for configured in [false, true] {
+			let dir = tempfile::tempdir().unwrap();
+			let mut args = ChatArgs::default_interactive();
+			args.model = Some(Str::new_static("openai/gpt-5"));
+			args.project = dir.path().to_path_buf();
+			let ctx = Arc::new(omp_con::Ctx::new());
+			ctx.exec(
+				&format!(
+					"sv_computer_enabled {}\nsv_tools_enabled {{ computer {configured} read false }}\n",
+					!configured
+				),
+				omp_con::Source::Config(Str::new_static("user.cfg")),
+			)
+			.unwrap();
+			let before = omp_envd::tool_settings::SV_TOOLS_ENABLED.get(&ctx);
+			Launch::prepare(args, Arc::clone(&ctx), test_env(dir.path()))
+				.await
+				.unwrap();
+			assert_eq!(omp_envd::tool_settings::SV_TOOLS_ENABLED.get(&ctx), before);
+			assert_eq!(
+				omp_envd::tool_settings::ToolSettings::from_con(&ctx).enabled("computer"),
+				configured
+			);
+			assert_eq!(omp_tools::settings::SV_COMPUTER_ENABLED.get(&ctx), !configured);
+		}
+	}
+
 	/// Every parsed `ChatArgs` field is consumed: the lowering destructures
 	/// the struct exhaustively (compile-time), and this launch sets every
 	/// launch-shaped flag and checks it reached its convar, `KernelOptions`
@@ -1285,6 +1369,7 @@ mod tests {
 		args.plan_yolo = true;
 		args.plan_yolo_into = Some(Str::new_static("openai/gpt-5:minimal"));
 		args.prewalk_into = Some(Str::new_static("openai/gpt-5"));
+		args.computer_use = Some(true);
 		args.config = vec![overlay];
 		args.add_dir = vec![extra.clone()];
 		args.skills = Some(SelectorList(vec![Str::new_static("rust*")]));
@@ -1331,6 +1416,8 @@ mod tests {
 		);
 
 		assert_eq!(omp_agent::AI_COMPACT_THRESHOLD.get(&ctx), 0.5, "--config overlay ran");
+		assert!(omp_tools::settings::SV_COMPUTER_ENABLED.get(&ctx));
+		assert!(omp_envd::tool_settings::ToolSettings::from_con(&ctx).enabled("computer"));
 		assert_eq!(omp_catalog::settings::AI_TIER_OPENAI.get(&ctx), TierSetting::Priority);
 		assert!(omp_ai::settings::AI_EXTERNAL_THINKING.get(&ctx));
 		assert!(omp_ai::settings::AI_ADVISOR_ENABLED.get(&ctx));
@@ -1589,6 +1676,7 @@ mod tests {
 			.set(&ctx, true)
 			.unwrap();
 		apply_launch_convars(&ctx, &LaunchConvars {
+			computer_use:      None,
 			hide_thinking:     false,
 			service_tier:      None,
 			external_thinking: false,

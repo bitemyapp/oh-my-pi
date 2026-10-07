@@ -327,3 +327,15 @@ test-omperor-rpc-tool-results:
 test-omperor-native-projection:
     cargo nextest run -p omp-envd --lib --locked -E 'test(server::tests::native_verdict_)'
     cargo test --doc -p omp-envd --locked
+
+# Launch-owned computer capability wins over user settings without resetting other tools.
+[group('test')]
+test-omperor-computer-use:
+    cargo nextest run -p omp-app --lib --locked -E 'test(computer_use) | test(chat_cmd::tests::every_parsed_chat_arg_reaches_its_seam)'
+    cargo test --doc -p omp-app --locked
+
+# Computer permission is transported per connection through the shared owner.
+[group('test')]
+test-omperor-computer-owner:
+    cargo nextest run -p omp-envd --lib --locked -E 'test(computer_use_) | test(devices_host::tests::)'
+    cargo test --doc -p omp-envd --locked

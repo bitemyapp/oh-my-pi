@@ -1029,8 +1029,14 @@ impl ProjectEnvironment {
 		}
 		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
 		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, abort_tasks, server };
-		if let Err(error) =
-			hello_attached_session(&client, approval_mode, has_edit_repair, edit_model.as_ref()).await
+		if let Err(error) = hello_attached_session(
+			&client,
+			approval_mode,
+			has_edit_repair,
+			edit_model.as_ref(),
+			tool_settings::ToolSettings::from_con(&con).enabled("computer"),
+		)
+		.await
 		{
 			drop(lifecycle);
 			return Err(error);
@@ -1547,10 +1553,15 @@ async fn hello_attached_session(
 	approval_mode: Option<ApprovalMode>,
 	edit_repair: bool,
 	edit_model: Option<&Str>,
+	computer_use: bool,
 ) -> Result<ServerHello, EnvdError> {
-	Ok(client
-		.hello(client_hello(approval_mode, edit_repair, edit_model))
-		.await?)
+	let mut hello = client_hello(approval_mode, edit_repair, edit_model);
+	hello
+		.props
+		.get_or_insert_with(ValueMap::default)
+		.fields
+		.insert("computer-use".to_owned(), Value { kind: Some(value::Kind::Bool(computer_use)) });
+	Ok(client.hello(hello).await?)
 }
 
 fn client_hello(

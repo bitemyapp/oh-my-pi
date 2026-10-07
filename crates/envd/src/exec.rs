@@ -467,6 +467,7 @@ struct SpawnBook {
 
 #[derive(Clone)]
 struct SessionCommand {
+	computer_access: crate::computer::ComputerAccess,
 	host: Weak<HostInner>,
 	exec: Bytes,
 	source: Str,
@@ -963,6 +964,7 @@ impl ExecHost {
 			events: Arc::downgrade(&events),
 		});
 		let command = SessionCommand {
+			computer_access: crate::computer::ComputerAccess::current(),
 			host: Arc::downgrade(&self.inner),
 			exec: exec.clone(),
 			source,
@@ -2281,6 +2283,20 @@ async fn session_loop(mut shell: Shell, commands: Receiver<SessionCommand>) {
 }
 
 async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool {
+	// Bind the immutable command scope into the cloneable builtin closure.
+	// Existing background subshells retain their own scope when the next
+	// command reuses this persistent shell from another connection.
+	if let Some(host) = command
+		.host
+		.upgrade()
+		.and_then(|host| host.devices.lock().clone())
+	{
+		let mut registration = omp_shell_builtins::dyn_builtin(
+			host.with_computer_access(command.computer_access.clone()),
+		);
+		registration.disabled = shell.builtins().get("dyn").is_some_and(|old| old.disabled);
+		shell.register_builtin("dyn", registration);
+	}
 	let started_at = Instant::now();
 	match command.cancel_rx.try_recv() {
 		Ok(_) | Err(flume::TryRecvError::Disconnected) => {
@@ -2377,10 +2393,13 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 			}
 		};
 		tokio::pin!(timeout);
-		let execution = crate::devices_host::scope_exec_diags(
-			Arc::clone(&command.diags),
-			shell.run_string(command.source.to_string(), &source_info, &params),
-		);
+		let execution = command
+			.computer_access
+			.clone()
+			.scope(crate::devices_host::scope_exec_diags(
+				Arc::clone(&command.diags),
+				shell.run_string(command.source.to_string(), &source_info, &params),
+			));
 		tokio::pin!(execution);
 		tokio::select! {
 			  result = &mut execution => match result {

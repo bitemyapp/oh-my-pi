@@ -1442,6 +1442,7 @@ fn launch_option(argument: &OsString) -> Option<bool> {
 			| "--provider-session-id"
 			| "--prompt-cache-key"
 			| "--config"
+			| "--computer-use"
 			| "--add-dir"
 			| "--smol"
 			| "--slow"
@@ -1770,6 +1771,10 @@ pub struct ChatArgs {
 	/// Model selector used when prewalk begins.
 	#[arg(long)]
 	pub prewalk_into:        Option<Str>,
+	/// Override computer capability for this launch without changing other tool
+	/// settings.
+	#[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
+	pub computer_use:        Option<bool>,
 	/// Read-only command-stream cfg overlays in precedence order.
 	#[arg(long = "config", value_name = "PATH")]
 	pub config:              Vec<PathBuf>,
@@ -1878,6 +1883,7 @@ impl ChatArgs {
 			prewalk:             false,
 			no_prewalk:          false,
 			prewalk_into:        None,
+			computer_use:        None,
 			config:              Vec::new(),
 			add_dir:             Vec::new(),
 			skills:              None,
@@ -3661,6 +3667,27 @@ mod tests {
 
 	fn parse(arguments: &[&str]) -> OmpCli {
 		OmpCli::try_parse_from(arguments).expect("valid command")
+	}
+
+	#[test]
+	fn parses_explicit_computer_use_launch_override() {
+		for (value, expected) in [("true", true), ("false", false)] {
+			for command in ["rpc", "rpc-ui"] {
+				let parsed = parse(&["omp", command, "--computer-use", value]);
+				let Some(Command::Rpc(args) | Command::RpcUi(args)) = parsed.command else {
+					panic!("RPC launch command");
+				};
+				assert_eq!(args.launch.computer_use, Some(expected));
+			}
+		}
+		let Some(Command::Rpc(args)) = parse(&["omp", "rpc"]).command else {
+			panic!("RPC launch command");
+		};
+		assert_eq!(args.launch.computer_use, None);
+		assert!(OmpCli::try_parse_from(["omp", "rpc", "--computer-use", "maybe"]).is_err());
+		assert!(OmpCli::try_parse_from(["omp", "rpc", "--computer-use"]).is_err());
+		assert_eq!(launch_option(&OsString::from("--computer-use")), Some(true));
+		assert_eq!(launch_option(&OsString::from("--computer-use=false")), Some(false));
 	}
 
 	#[test]

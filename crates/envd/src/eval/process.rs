@@ -333,7 +333,8 @@ impl ProcessEvalExec {
 		let host = Arc::clone(&self.inner.host);
 		let blobs = self.inner.blobs.clone();
 		let interrupt_grace = self.inner.interrupt_grace;
-		tokio::spawn(async move {
+		let computer_access = crate::computer::ComputerAccess::current();
+		tokio::spawn(computer_access.scope(async move {
 			let _gate = gate;
 			if task_cancelled.is_cancelled() {
 				if forced_reset {
@@ -445,7 +446,7 @@ impl ProcessEvalExec {
 					},
 				}
 			}
-		});
+		}));
 		Ok(ProcessEvalRun { events, cancelled, terminal: false, effective_reset })
 	}
 }
@@ -961,7 +962,8 @@ impl EvalChild {
 					let task_owner = Str::new(owner);
 					let task_session = session.clone();
 					let task_events = bridge_events_tx.clone();
-					bridge_tasks.spawn(async move {
+					let computer_access = crate::computer::ComputerAccess::current();
+					bridge_tasks.spawn(computer_access.scope(async move {
 						let progress = ProgressChannel { request_id, events: task_events.clone() };
 						let response = task_timeout
 							.host_wait(task_host.call_for(
@@ -977,7 +979,7 @@ impl EvalChild {
 							Err(error) => (None, Some(Str::from(error.to_string()))),
 						};
 						let _ = task_events.send(BridgeTaskEvent::Response { request_id, value, error });
-					});
+					}));
 				},
 				ChildFrame::Fatal { message } => {
 					needs_reset.store(true, Ordering::Release);

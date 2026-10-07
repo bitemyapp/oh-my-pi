@@ -1,8 +1,9 @@
 //! Admission-routed native desktop session host.
 
 use std::{
+	future::Future,
 	sync::{
-		Arc,
+		Arc, OnceLock,
 		atomic::{AtomicBool, Ordering},
 	},
 	time::Duration,
@@ -80,6 +81,107 @@ impl ComputerSettings {
 	}
 }
 
+tokio::task_local! {
+	static COMPUTER_ACCESS: ComputerAccess;
+}
+
+/// One connection's desktop permission and lazily initialized desktop state.
+#[derive(Clone)]
+pub(crate) struct ComputerAccess(Arc<ComputerAccessState>);
+
+struct ComputerAccessState {
+	enabled: AtomicBool,
+	host:    OnceLock<Arc<ComputerSessionHost>>,
+}
+
+impl Drop for ComputerAccessState {
+	fn drop(&mut self) {
+		if let Some(host) = self.host.get() {
+			host.release();
+		}
+	}
+}
+
+impl ComputerAccess {
+	pub(crate) fn new(enabled: bool) -> Self {
+		Self(Arc::new(ComputerAccessState {
+			enabled: AtomicBool::new(enabled),
+			host:    OnceLock::new(),
+		}))
+	}
+
+	pub(crate) fn current() -> Self {
+		COMPUTER_ACCESS
+			.try_with(Clone::clone)
+			.unwrap_or_else(|_| Self::new(false))
+	}
+
+	pub(crate) fn current_enabled() -> bool {
+		COMPUTER_ACCESS.try_with(Self::enabled).unwrap_or(false)
+	}
+
+	pub(crate) fn enabled(&self) -> bool {
+		self.0.enabled.load(Ordering::Acquire)
+	}
+
+	pub(crate) fn revoke(&self) {
+		self.0.enabled.store(false, Ordering::Release);
+		if let Some(host) = self.0.host.get() {
+			host.release();
+		}
+	}
+
+	pub(crate) async fn scope<T>(self, future: impl Future<Output = T>) -> T {
+		COMPUTER_ACCESS.scope(self, future).await
+	}
+}
+
+/// Shared daemon route; each connection retains its own permission and desktop
+/// handles. Constructing the route does not initialize a desktop backend.
+pub(crate) struct ComputerConnectionHost {
+	blobs:    BlobHost,
+	settings: ComputerSettings,
+}
+
+impl ComputerConnectionHost {
+	pub(crate) fn new(blobs: BlobHost, con: &Ctx) -> Arc<Self> {
+		Arc::new(Self { blobs, settings: ComputerSettings::from_con(con) })
+	}
+}
+
+#[async_trait]
+impl ComputerHost for ComputerConnectionHost {
+	async fn execute(
+		&self,
+		params: Params,
+		cancellation: CancellationToken,
+		updates: flume::Sender<Update>,
+	) -> Result<Payload, Fault> {
+		let access = ComputerAccess::current();
+		if !access.enabled() {
+			return Err(fault(
+				FaultCode::PermissionDenied,
+				"computer use is disabled for this session",
+				None,
+			));
+		}
+		let host = access
+			.0
+			.host
+			.get_or_init(|| ComputerSessionHost::new(self.blobs.clone(), &self.settings));
+		if !access.enabled() {
+			host.release();
+			return Err(fault(FaultCode::PermissionDenied, "computer session is disconnected", None));
+		}
+		host.execute(params, cancellation, updates).await
+	}
+
+	fn release(&self) {
+		// The connection owns and releases desktop state; the shared route owns
+		// none.
+	}
+}
+
 /// Persistent native desktop owner shared by every `computer` invocation in a
 /// session-scoped Environment registry.
 pub(crate) struct ComputerSessionHost {
@@ -93,8 +195,7 @@ pub(crate) struct ComputerSessionHost {
 }
 
 impl ComputerSessionHost {
-	pub(crate) fn new(blobs: BlobHost, con: &Ctx) -> Arc<Self> {
-		let settings = ComputerSettings::from_con(con);
+	fn new(blobs: BlobHost, settings: &ComputerSettings) -> Arc<Self> {
 		Arc::new(Self {
 			session: DesktopSession::new(Some(DesktopSessionOptions {
 				display: Some(settings.display.to_string()),
@@ -1743,14 +1844,45 @@ fn native_fault(operation: Operation, error: omp_desktop::DesktopError) -> Fault
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Arc;
+
 	use omp_con::Ctx;
 	use omp_core::Str;
 	use serde_json::{Map, json};
 
 	use super::{
-		ComputerSettings, Operation, SV_COMPUTER_DISPLAY, SV_COMPUTER_MAX_HEIGHT,
+		ComputerAccess, ComputerSettings, Operation, SV_COMPUTER_DISPLAY, SV_COMPUTER_MAX_HEIGHT,
 		SV_COMPUTER_MAX_WIDTH, Statement, bounded_cap, evaluate_assertion, parse_program,
 	};
+
+	#[tokio::test]
+	async fn computer_use_context_is_isolated_and_absent_context_denies() {
+		assert!(!ComputerAccess::current().enabled());
+		let yes = ComputerAccess::new(true);
+		let no = ComputerAccess::new(false);
+		let (enabled, disabled) = tokio::join!(
+			yes.clone().scope(async {
+				tokio::task::yield_now().await;
+				ComputerAccess::current().enabled()
+			}),
+			no.scope(async {
+				tokio::task::yield_now().await;
+				ComputerAccess::current().enabled()
+			}),
+		);
+		assert!(enabled);
+		assert!(!disabled);
+		assert!(!ComputerAccess::current().enabled());
+		let other = ComputerAccess::new(true);
+		assert!(
+			!Arc::ptr_eq(&yes.0, &other.0),
+			"separate enabled connections cannot share retained desktop handles"
+		);
+		assert!(yes.0.host.get().is_none(), "permission alone must not initialize the desktop");
+		yes.revoke();
+		assert!(!yes.enabled());
+		assert!(other.enabled(), "disconnect must not revoke another connection");
+	}
 
 	#[test]
 	fn computer_settings_project_from_typed_convars() {

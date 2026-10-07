@@ -88,6 +88,13 @@ impl DynHost {
 		self.admission.bind_route(route);
 	}
 
+	pub(crate) fn with_computer_access(
+		self: Arc<Self>,
+		access: crate::computer::ComputerAccess,
+	) -> Arc<dyn ShellDynHost> {
+		Arc::new(ConnectionDynHost { host: self, access })
+	}
+
 	fn invocation_id(&self) -> Str {
 		let sequence = self
 			.next_invocation_id
@@ -257,6 +264,42 @@ fn recovery_snapshot_diag(payload: &Value) -> Option<Diag> {
 	})
 }
 
+// The shell clones builtin closures into command substitutions, pipelines,
+// and background tasks, which do not inherit Tokio task-local state.
+struct ConnectionDynHost {
+	host:   Arc<DynHost>,
+	access: crate::computer::ComputerAccess,
+}
+
+impl ShellDynHost for ConnectionDynHost {
+	fn list(&self) -> DynFuture<'_, Vec<DynDevice>> {
+		Box::pin(self.access.clone().scope(self.host.list()))
+	}
+
+	fn schema(&self, name: &str) -> DynFuture<'_, DynSchema> {
+		Box::pin(self.access.clone().scope(self.host.schema(name)))
+	}
+
+	fn call(
+		&self,
+		name: &str,
+		args: Value,
+		cancellation: CancellationToken,
+	) -> DynFuture<'_, DynCallOutput> {
+		Box::pin(
+			self
+				.access
+				.clone()
+				.scope(self.host.call(name, args, cancellation)),
+		)
+	}
+}
+
+fn computer_device_allowed(name: &str) -> bool {
+	!DevicePath::parse(name).is_ok_and(|path| path.root() == "computer")
+		|| crate::computer::ComputerAccess::current_enabled()
+}
+
 impl ShellDynHost for DynHost {
 	fn list(&self) -> DynFuture<'_, Vec<DynDevice>> {
 		Box::pin(async move {
@@ -273,6 +316,7 @@ impl ShellDynHost for DynHost {
 					description: Some(device.summary.clone()),
 				})
 				.chain(mcp)
+				.filter(|device| computer_device_allowed(device.name.as_str()))
 				.filter(|device| {
 					visible
 						.as_ref()
@@ -300,6 +344,9 @@ impl ShellDynHost for DynHost {
 	fn schema(&self, name: &str) -> DynFuture<'_, DynSchema> {
 		let name = Str::new(name);
 		Box::pin(async move {
+			if !computer_device_allowed(name.as_str()) {
+				return Err(DynFault::new("computer use is disabled for this session"));
+			}
 			if let Some(schema) = Self::proposal_schema(name.as_str()) {
 				return Ok(schema);
 			}
@@ -329,6 +376,9 @@ impl ShellDynHost for DynHost {
 		let name = Str::new(name);
 		Box::pin(async move {
 			let result = async {
+				if !computer_device_allowed(name.as_str()) {
+					return Err(DynFault::new("computer use is disabled for this session"));
+				}
 				if matches!(name.as_str(), "resolve" | "reject") {
 					if cancellation.is_cancelled() {
 						return Err(DynFault::new("staged proposal finalization was cancelled"));

@@ -83,7 +83,7 @@ use super::{
 	EnvdError,
 	admission::DynamicAdmission,
 	blobs::BlobHost,
-	computer::ComputerSessionHost,
+	computer::ComputerConnectionHost,
 	devices_host::DynHost,
 	docs::{DocumentHost, ResourceMutationServices},
 	document_cache,
@@ -4282,6 +4282,7 @@ pub(crate) fn production_registry<
 	workers: &ExtHostSupervisor,
 	interrupt_grace: Duration,
 	py_eval: bool,
+	connection_computer: bool,
 	tool_settings: &ToolSettings,
 	browser_settings: &BrowserSettings,
 	shell_settings: &ShellSettings,
@@ -4356,8 +4357,8 @@ pub(crate) fn production_registry<
 			builtin_device_claims(),
 		)?;
 	}
-	if tool_settings.enabled("computer") {
-		let computer = ComputerSessionHost::new(blobs.clone(), con);
+	if connection_computer || tool_settings.enabled("computer") {
+		let computer = ComputerConnectionHost::new(blobs.clone(), con);
 		environment_registry(
 			&mut registry,
 			omp_tools::computer::tool(computer),
