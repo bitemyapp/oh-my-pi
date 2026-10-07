@@ -389,3 +389,10 @@ test-omperor-cache-timer:
     cargo nextest run -p omp-journal --lib --locked -E 'test(receipt_observation)'
     cargo nextest run -p omp-app --lib --locked -E 'test(receipt_rpc_preserves)'
     cargo test --doc -p omp-ai -p omp-agent -p omp-journal -p omp-app --locked
+
+# Isolated app owners share workspaces without sharing runtime state or unsafe disk commits.
+[group('test')]
+test-omperor-isolated-state:
+    cargo nextest run -p omp-env --lib --locked -E 'test(project_state::)'
+    cargo nextest run -p omp-envd --lib --locked -E 'test(docserver::types::tests::) | test(docserver::fs::tests::) | test(docserver::path_ops::tests::) | test(docserver::daemon::tests::) | test(docserver::actor::tests::) | test(docserver::transaction::tests::) | test(document_authority) | test(stale_daemon_does_not_rehost) | test(new_build_attach_waits)'
+    cargo test --doc -p omp-env -p omp-envd --locked

@@ -18,7 +18,7 @@ use crate::docserver::{
 	environment::WorkspaceMutationGuard,
 	fs::{
 		CopyOutcome, DestinationOverwritePolicy, DirectoryEntry, DiskState, ExistingDirectoryPolicy,
-		FileKind, FollowSymlinks, PathMetadata, PortablePermissions, SymlinkTarget,
+		FileKind, FollowSymlinks, LocalFs, PathMetadata, PortablePermissions, SymlinkTarget,
 		SymlinkTargetKind,
 	},
 	lsp_registry::LspRegistry,
@@ -135,9 +135,8 @@ impl PathService {
 		self.reject_active_at_or_below(&path, cancellation).await?;
 		ensure_not_cancelled(cancellation, &path, "create directory")?;
 		let metadata = self
-			.store
-			.local_fs()
-			.create_directory(path, recursive, existing)?;
+			.filesystem(move |filesystem| filesystem.create_directory(path, recursive, existing))
+			.await?;
 		Ok(PathMutationResult::Completed(metadata))
 	}
 
@@ -186,7 +185,9 @@ impl PathService {
 			self.reject_active_exact(&metadata.path, cancellation)?;
 		}
 		ensure_not_cancelled(cancellation, &metadata.path, "remove path")?;
-		self.store.local_fs().remove(path, recursive)?;
+		self
+			.filesystem(move |filesystem| filesystem.remove(path, recursive))
+			.await?;
 		Ok(PathMutationResult::Completed(()))
 	}
 
@@ -263,9 +264,8 @@ impl PathService {
 			.await?;
 		ensure_not_cancelled(cancellation, &source_metadata.path, "rename path")?;
 		let metadata = self
-			.store
-			.local_fs()
-			.rename(source, destination, overwrite)?;
+			.filesystem(move |filesystem| filesystem.rename(source, destination, overwrite))
+			.await?;
 		Ok(PathMutationResult::Completed(metadata))
 	}
 
@@ -370,9 +370,10 @@ impl PathService {
 			.await?;
 		ensure_not_cancelled(cancellation, &destination, "copy path")?;
 		let outcome = self
-			.store
-			.local_fs()
-			.copy(source, destination, follow_source, overwrite)?;
+			.filesystem(move |filesystem| {
+				filesystem.copy(source, destination, follow_source, overwrite)
+			})
+			.await?;
 		Ok(PathMutationResult::Completed(outcome))
 	}
 
@@ -405,10 +406,12 @@ impl PathService {
 		ensure_not_cancelled(cancellation, &link, "create symlink")?;
 		self.reject_active_at_or_below(&link, cancellation).await?;
 		ensure_not_cancelled(cancellation, &link, "create symlink")?;
+		let target = target.clone();
 		let metadata = self
-			.store
-			.local_fs()
-			.create_symlink(target, link, target_kind, overwrite)?;
+			.filesystem(move |filesystem| {
+				filesystem.create_symlink(&target, link, target_kind, overwrite)
+			})
+			.await?;
 		Ok(PathMutationResult::Completed(metadata))
 	}
 
@@ -450,11 +453,11 @@ impl PathService {
 		}
 		self.reject_active_at_or_below(&link, cancellation).await?;
 		ensure_not_cancelled(cancellation, &link, "create hard link")?;
-		let metadata =
-			self
-				.store
-				.local_fs()
-				.create_hard_link(source, link, follow_source, overwrite)?;
+		let metadata = self
+			.filesystem(move |filesystem| {
+				filesystem.create_hard_link(source, link, follow_source, overwrite)
+			})
+			.await?;
 		Ok(PathMutationResult::Completed(metadata))
 	}
 
@@ -495,10 +498,21 @@ impl PathService {
 		}
 		ensure_not_cancelled(cancellation, &path, "set path permissions")?;
 		let metadata = self
-			.store
-			.local_fs()
-			.set_permissions(path, permissions, follow)?;
+			.filesystem(move |filesystem| filesystem.set_permissions(path, permissions, follow))
+			.await?;
 		Ok(PathMutationResult::Completed(metadata))
+	}
+
+	// Filesystem commits can wait for another application's short mutation lock.
+	// Keep that wait and the following disk operation off the async runtime.
+	async fn filesystem<T: Send + 'static>(
+		&self,
+		operation: impl FnOnce(LocalFs) -> Result<T> + Send + 'static,
+	) -> Result<T> {
+		let filesystem = self.store.local_fs();
+		tokio::task::spawn_blocking(move || operation(filesystem))
+			.await
+			.map_err(|source| Error::Worker { source })?
 	}
 
 	async fn active_regular(
@@ -558,7 +572,11 @@ impl PathService {
 			return Ok(content.clone());
 		}
 		ensure_not_cancelled(cancellation, source, "copy path")?;
-		match self.store.local_fs().stable_read(source)? {
+		let source_path = source.to_path_buf();
+		match self
+			.filesystem(move |filesystem| filesystem.stable_read(source_path))
+			.await?
+		{
 			DiskState::Present { content, .. } => Ok(content),
 			DiskState::Missing => Err(path_io_error(
 				source,

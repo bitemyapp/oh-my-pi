@@ -32,6 +32,7 @@ mod error;
 pub mod format_options;
 /// Portable Environment filesystem value types.
 pub mod fs;
+mod locks;
 /// Ordered LSP lifecycle, synchronization, and passthrough primitives.
 pub mod lsp;
 /// Transactional lowering for server-initiated workspace edit requests.

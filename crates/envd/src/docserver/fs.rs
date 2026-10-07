@@ -16,9 +16,7 @@ use cap_std::{
 	fs,
 	fs::{Dir, Metadata, OpenOptions},
 };
-#[cfg(test)]
-use omp_core::Hash32;
-use omp_core::{Str, sf};
+use omp_core::{Hash32, Str, sf};
 #[cfg(test)]
 use parking_lot::Mutex;
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
@@ -329,6 +327,7 @@ type MutationHook = Box<dyn FnMut(MutationStage, &Path) + Send>;
 struct LocalFsInner {
 	root:               Dir,
 	root_path:          PathBuf,
+	project_key:        Hash32,
 	max_document_bytes: u64,
 	temp_sequence:      AtomicU64,
 	#[cfg(test)]
@@ -500,12 +499,31 @@ impl LocalFs {
 			inner: Arc::new(LocalFsInner {
 				root,
 				root_path,
+				project_key: *config.project_key(),
 				max_document_bytes: config.max_document_bytes().get(),
 				temp_sequence: AtomicU64::new(0),
 				#[cfg(test)]
 				mutation_hook: Mutex::new(None),
 			}),
 		})
+	}
+
+	// Callers already run these synchronous filesystem operations on workers.
+	// A fresh open gives each operation an independent OS lock description,
+	// including clones and separate document authorities in the same process.
+	fn lock_disk(&self, shared: bool) -> Result<std::fs::File> {
+		let file = super::locks::open("mutation", &self.inner.project_key).map_err(|source| {
+			Self::io_error("open project mutation lock", &self.inner.root_path, source)
+		})?;
+		let locked = if shared {
+			file.lock_shared()
+		} else {
+			file.lock()
+		};
+		locked.map_err(|source| {
+			Self::io_error("lock project mutation", &self.inner.root_path, source)
+		})?;
+		Ok(file)
 	}
 
 	/// Returns the canonical ambient identity of the capability root.
@@ -537,6 +555,7 @@ impl LocalFs {
 
 	/// Reads exact document bytes and verifies two matching observations.
 	pub fn stable_read(&self, path: impl AsRef<Path>) -> Result<DiskState> {
+		let _disk = self.lock_disk(true)?;
 		let path = path.as_ref();
 		let resolved = self.resolve_target(path)?;
 		let (parent, name) = self.open_parent(&resolved)?;
@@ -679,7 +698,16 @@ impl LocalFs {
 	///
 	/// The document actor is the intended sole caller of this synchronous final
 	/// commit operation.
-	pub fn commit_prepared(&self, mut prepared: PreparedWrite) -> Result<DiskState> {
+	pub fn commit_prepared(&self, prepared: PreparedWrite) -> Result<DiskState> {
+		let disk = self.lock_disk(false)?;
+		self.commit_prepared_locked(prepared, &disk)
+	}
+
+	fn commit_prepared_locked(
+		&self,
+		mut prepared: PreparedWrite,
+		_disk: &std::fs::File,
+	) -> Result<DiskState> {
 		if !Arc::ptr_eq(&self.inner, &prepared.owner) {
 			return Err(Error::InvalidTarget {
 				target: Str::new(prepared.destination_path.to_string_lossy()),
@@ -769,6 +797,7 @@ impl LocalFs {
 	/// Deletes a prepared file only while its parent and exact state remain
 	/// current.
 	pub fn commit_prepared_delete(&self, prepared: PreparedDelete) -> Result<DiskState> {
+		let _disk = self.lock_disk(false)?;
 		self.verify_prepared_owner(&prepared.owner, &prepared.target.path, "delete")?;
 		if !self.prepared_entry_parent_is_current(&prepared.target)? {
 			return Err(Self::stale_entry(&prepared.target));
@@ -894,6 +923,7 @@ impl LocalFs {
 	/// Moves a prepared file only while both parents and exact states remain
 	/// current.
 	pub fn commit_prepared_move(&self, mut prepared: PreparedMove) -> Result<DiskState> {
+		let disk = self.lock_disk(false)?;
 		self.verify_prepared_owner(&prepared.owner, &prepared.source.path, "move")?;
 		if !self.prepared_entry_parent_is_current(&prepared.source)?
 			|| !self.prepared_entry_parent_is_current(&prepared.destination)?
@@ -951,7 +981,7 @@ impl LocalFs {
 					),
 				)
 			})?;
-			let installed = match self.commit_prepared(content) {
+			let installed = match self.commit_prepared_locked(content, &disk) {
 				Ok(installed) => installed,
 				Err(error) => {
 					if Self::rename_noreplace(
@@ -1125,6 +1155,7 @@ impl LocalFs {
 		recursive: bool,
 		existing: ExistingDirectoryPolicy,
 	) -> Result<PathMetadata> {
+		let _disk = self.lock_disk(false)?;
 		let path = path.as_ref();
 		let requested_relative = self.lexical_relative(path)?;
 		let relative = if recursive {
@@ -1173,6 +1204,7 @@ impl LocalFs {
 		expected_present: bool,
 		recursive: bool,
 	) -> Result<DiskState> {
+		let _disk = self.lock_disk(false)?;
 		let resolved = self.resolve_entry(path.as_ref())?;
 		Self::reject_root_entry(&resolved, "remove")?;
 		let (parent_relative, _) = Self::split_relative(&resolved.relative)
@@ -1233,6 +1265,7 @@ impl LocalFs {
 
 	/// Removes a file, link, empty directory, or recursively a directory tree.
 	pub fn remove(&self, path: impl AsRef<Path>, recursive: bool) -> Result<()> {
+		let _disk = self.lock_disk(false)?;
 		let resolved = self.resolve_entry(path.as_ref())?;
 		Self::reject_root_entry(&resolved, "remove")?;
 		let metadata = self
@@ -1259,6 +1292,7 @@ impl LocalFs {
 		destination: impl AsRef<Path>,
 		overwrite: DestinationOverwritePolicy,
 	) -> Result<PathMetadata> {
+		let _disk = self.lock_disk(false)?;
 		let source = self.resolve_entry(source.as_ref())?;
 		let destination = self.resolve_entry(destination.as_ref())?;
 		Self::reject_root_entry(&source, "rename")?;
@@ -1287,6 +1321,7 @@ impl LocalFs {
 		follow_source: FollowSymlinks,
 		overwrite: DestinationOverwritePolicy,
 	) -> Result<CopyOutcome> {
+		let _disk = self.lock_disk(false)?;
 		if overwrite == DestinationOverwritePolicy::ReplaceEmptyDirectory {
 			return Err(Self::invalid_argument(
 				destination.as_ref(),
@@ -1418,6 +1453,7 @@ impl LocalFs {
 		target_kind: SymlinkTargetKind,
 		overwrite: DestinationOverwritePolicy,
 	) -> Result<PathMetadata> {
+		let _disk = self.lock_disk(false)?;
 		if overwrite == DestinationOverwritePolicy::ReplaceEmptyDirectory {
 			return Err(Self::invalid_argument(
 				link.as_ref(),
@@ -1458,6 +1494,7 @@ impl LocalFs {
 		follow_source: FollowSymlinks,
 		overwrite: DestinationOverwritePolicy,
 	) -> Result<PathMetadata> {
+		let _disk = self.lock_disk(false)?;
 		if overwrite == DestinationOverwritePolicy::ReplaceEmptyDirectory {
 			return Err(Self::invalid_argument(
 				link.as_ref(),
@@ -1504,6 +1541,7 @@ impl LocalFs {
 		changes: PortablePermissions,
 		follow: FollowSymlinks,
 	) -> Result<PathMetadata> {
+		let _disk = self.lock_disk(false)?;
 		let path = path.as_ref();
 		if changes.read_only.is_none() && changes.executable.is_none() {
 			return Err(Self::invalid_argument(path, "at least one permission property is required"));
@@ -1572,6 +1610,7 @@ impl LocalFs {
 		changes: PortablePermissions,
 		follow: FollowSymlinks,
 	) -> Result<PathMetadata> {
+		let _disk = self.lock_disk(false)?;
 		let path = path.as_ref();
 		if changes.read_only.is_none() && changes.executable.is_none() {
 			return Err(Self::invalid_argument(path, "at least one permission property is required"));
@@ -2917,6 +2956,195 @@ mod tests {
 			DiskState::Present { fingerprint, .. } => DiskExpectation::Present(fingerprint),
 			DiskState::Missing => panic!("fixture should be present"),
 		}
+	}
+
+	// The child is the actual unit-test executable, so these assertions exercise
+	// independently opened OS locks across processes rather than a shared mutex.
+	#[test]
+	fn isolated_authority_child_probe() {
+		let Some(root) = std::env::var_os("OMP_TEST_AUTHORITY_ROOT") else {
+			return;
+		};
+		let mode = std::env::var("OMP_TEST_AUTHORITY_MODE").expect("child operation");
+		let config = ServerConfig::new(root).expect("child config from OMP_DATA_DIR");
+		if mode == "same-owner" {
+			assert!(config.try_lock_authority().is_err());
+			return;
+		}
+		let _authority = config
+			.try_lock_authority()
+			.expect("independent child authority");
+		if mode == "mutation-contended" {
+			let lock = super::super::locks::open("mutation", config.project_key())
+				.expect("child mutation lock");
+			assert!(matches!(lock.try_lock(), Err(fs::TryLockError::WouldBlock)));
+			return;
+		}
+		assert_eq!(mode, "commit");
+		let filesystem = LocalFs::new(&config).expect("child filesystem");
+		let path = filesystem.root_path().join("document");
+		let prepared = filesystem
+			.prepare_write(
+				&path,
+				Bytes::from_static(b"child"),
+				present_expectation(&filesystem, &path),
+			)
+			.expect("child preparation");
+		filesystem.commit_prepared(prepared).expect("child commit");
+	}
+
+	fn authority_child(root: &Path, namespace: &Path, mode: &str) {
+		use std::{
+			process::{Child, Command, Stdio},
+			thread,
+			time::{Duration, Instant},
+		};
+		struct ChildGuard(Child);
+		impl Drop for ChildGuard {
+			fn drop(&mut self) {
+				let _ = self.0.kill();
+				let _ = self.0.wait();
+			}
+		}
+		let mut child = ChildGuard(
+			Command::new(std::env::current_exe().expect("test executable"))
+				.args([
+					"--exact",
+					"docserver::fs::tests::isolated_authority_child_probe",
+					"--nocapture",
+				])
+				.env("OMP_TEST_AUTHORITY_ROOT", root)
+				.env("OMP_DATA_DIR", namespace)
+				.env("OMP_PROFILE", "default")
+				.env("OMP_TEST_AUTHORITY_MODE", mode)
+				.stdout(Stdio::null())
+				.spawn()
+				.expect("spawn authority child"),
+		);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		loop {
+			if let Some(status) = child.0.try_wait().expect("poll child") {
+				assert!(status.success(), "authority child failed: {status}");
+				break;
+			}
+			assert!(Instant::now() < deadline, "authority child did not finish");
+			thread::sleep(Duration::from_millis(10));
+		}
+	}
+
+	#[test]
+	fn isolated_processes_share_commit_locks_and_reject_stale_writes() {
+		let root = tempfile::tempdir().expect("project");
+		let owners = tempfile::tempdir().expect("owner namespaces");
+		let production = owners.path().join("production");
+		let development = owners.path().join("development");
+		let config = ServerConfig::new(root.path())
+			.expect("config")
+			.with_authority_namespace(&production)
+			.expect("production namespace");
+		let _authority = config.try_lock_authority().expect("production authority");
+		let filesystem = LocalFs::new(&config).expect("filesystem");
+		let path = filesystem.root_path().join("document");
+		fs::write(&path, b"original").expect("fixture");
+		let prepared = filesystem
+			.prepare_write(
+				&path,
+				Bytes::from_static(b"stale"),
+				present_expectation(&filesystem, &path),
+			)
+			.expect("parent preparation");
+		authority_child(root.path(), &production, "same-owner");
+		let mutation = filesystem.lock_disk(false).expect("parent mutation lock");
+		authority_child(root.path(), &development, "mutation-contended");
+		drop(mutation);
+		authority_child(root.path(), &development, "commit");
+		assert!(matches!(filesystem.commit_prepared(prepared), Err(Error::StaleDiskState { .. })));
+		assert_eq!(fs::read(path).expect("final contents"), b"child");
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+	#[test]
+	fn isolated_commit_waits_for_stale_exchange_rollback() {
+		use std::{thread, time::Duration};
+		let (root, first) = create_filesystem();
+		let config = ServerConfig::new(root.path()).expect("second config");
+		let second = LocalFs::new(&config).expect("second filesystem");
+		let path = first.root_path().join("document");
+		fs::write(&path, b"original").expect("fixture");
+		let stale = first
+			.prepare_write(&path, Bytes::from_static(b"stale"), present_expectation(&first, &path))
+			.expect("stale preparation");
+		// Change only after preparation, forcing the atomic exchange to roll back.
+		fs::write(&path, b"external").expect("external update");
+		let current = second
+			.prepare_write(&path, Bytes::from_static(b"second"), present_expectation(&second, &path))
+			.expect("current preparation");
+		let (entered_tx, entered_rx) = flume::bounded(1);
+		let (release_tx, release_rx) = flume::bounded(1);
+		first.set_mutation_hook(move |stage, _| {
+			if stage == MutationStage::AfterWrite {
+				entered_tx.send(()).expect("exchange notification");
+				release_rx
+					.recv_timeout(Duration::from_secs(5))
+					.expect("release exchange");
+			}
+		});
+		let first_thread = thread::spawn(move || first.commit_prepared(stale));
+		entered_rx
+			.recv_timeout(Duration::from_secs(5))
+			.expect("first exchange");
+		let reader = LocalFs::new(&config).expect("reader filesystem");
+		let read_path = path.clone();
+		let (read_started_tx, read_started_rx) = flume::bounded(1);
+		let (read_tx, read_rx) = flume::bounded(1);
+		let read_thread = thread::spawn(move || {
+			read_started_tx.send(()).expect("reader start");
+			read_tx
+				.send(reader.stable_read(read_path))
+				.expect("reader result");
+		});
+		read_started_rx
+			.recv_timeout(Duration::from_secs(5))
+			.expect("reader starts");
+		assert!(matches!(
+			read_rx.recv_timeout(Duration::from_millis(50)),
+			Err(flume::RecvTimeoutError::Timeout)
+		));
+		let (started_tx, started_rx) = flume::bounded(1);
+		let (finished_tx, finished_rx) = flume::bounded(1);
+		let second_thread = thread::spawn(move || {
+			started_tx.send(()).expect("second start");
+			let result = second.commit_prepared(current);
+			finished_tx.send(result).expect("second result");
+		});
+		started_rx
+			.recv_timeout(Duration::from_secs(5))
+			.expect("second starts");
+		assert!(matches!(
+			finished_rx.recv_timeout(Duration::from_millis(50)),
+			Err(flume::RecvTimeoutError::Timeout)
+		));
+		release_tx.send(()).expect("release rollback");
+		assert!(matches!(
+			first_thread.join().expect("first worker"),
+			Err(Error::StaleDiskState { .. })
+		));
+		finished_rx
+			.recv_timeout(Duration::from_secs(5))
+			.expect("second finishes")
+			.expect("second commit");
+		second_thread.join().expect("second worker");
+		let read = read_rx
+			.recv_timeout(Duration::from_secs(5))
+			.expect("reader finishes")
+			.expect("consistent read");
+		read_thread.join().expect("reader worker");
+		let content = read.content().expect("present document");
+		assert!(
+			content.as_ref() == b"external" || content.as_ref() == b"second",
+			"reader must never observe the provisional stale exchange"
+		);
+		assert_eq!(fs::read(path).expect("final contents"), b"second");
 	}
 
 	#[test]

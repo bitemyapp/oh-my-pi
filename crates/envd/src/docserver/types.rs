@@ -560,12 +560,14 @@ half_open_range!(LineRange, RangeKind::Line, "line count", "A zero-based half-op
 /// operation.
 #[derive(Clone)]
 pub struct ServerConfig {
-	environment_root:   PathBuf,
-	server_build:       Str,
-	root:               Arc<Dir>,
-	authority_held:     Arc<AtomicBool>,
-	revision_capacity:  NonZeroUsize,
-	max_document_bytes: NonZeroU64,
+	environment_root:    PathBuf,
+	server_build:        Str,
+	root:                Arc<Dir>,
+	authority_held:      Arc<AtomicBool>,
+	project_key:         Hash32,
+	authority_namespace: Hash32,
+	revision_capacity:   NonZeroUsize,
+	max_document_bytes:  NonZeroU64,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -583,6 +585,7 @@ impl fmt::Debug for ServerConfig {
 impl PartialEq for ServerConfig {
 	fn eq(&self, other: &Self) -> bool {
 		self.environment_root == other.environment_root
+			&& self.authority_namespace == other.authority_namespace
 			&& self.server_build == other.server_build
 			&& self.revision_capacity == other.revision_capacity
 			&& self.max_document_bytes == other.max_document_bytes
@@ -591,12 +594,14 @@ impl PartialEq for ServerConfig {
 
 impl Eq for ServerConfig {}
 
-/// Exclusive daemon authority held on the stable project directory itself.
+/// Exclusive authority in one owner namespace, plus a shared project lock
+/// preventing an older, globally exclusive authority from running concurrently.
 #[derive(Debug)]
 #[must_use]
 pub struct AuthorityLock {
-	root: fs::File,
-	held: Arc<AtomicBool>,
+	root:       fs::File,
+	_namespace: fs::File,
+	held:       Arc<AtomicBool>,
 }
 
 impl Drop for AuthorityLock {
@@ -646,16 +651,51 @@ impl ServerConfig {
 				reason: sf!("Environment root changed while it was opened"),
 			});
 		}
+		let data_dir = omp_core::dirs::data_dir(None).map_err(|source| Error::Io {
+			operation: sf!("resolve Environment authority namespace"),
+			path:      canonical.clone(),
+			source:    io::Error::other(source),
+		})?;
+		let authority_namespace =
+			super::locks::namespace_key(&data_dir).map_err(|source| Error::Io {
+				operation: sf!("identify Environment authority namespace"),
+				path: data_dir,
+				source,
+			})?;
+		let project_key =
+			super::locks::project_key(&opened, &canonical).map_err(|source| Error::Io {
+				operation: sf!("identify Environment authority root"),
+				path: canonical.clone(),
+				source,
+			})?;
 		Ok(Self {
-			environment_root:   canonical,
-			server_build:       Str::default(),
-			root:               Arc::new(root),
-			authority_held:     Arc::new(AtomicBool::new(false)),
-			revision_capacity:  NonZeroUsize::new(DEFAULT_REVISION_CAPACITY)
+			project_key,
+			authority_namespace,
+			environment_root: canonical,
+			server_build: Str::default(),
+			root: Arc::new(root),
+			authority_held: Arc::new(AtomicBool::new(false)),
+			revision_capacity: NonZeroUsize::new(DEFAULT_REVISION_CAPACITY)
 				.expect("default revision capacity is nonzero"),
 			max_document_bytes: NonZeroU64::new(DEFAULT_MAX_DOCUMENT_BYTES)
 				.expect("default document limit is nonzero"),
 		})
+	}
+
+	/// Selects the data namespace whose document authority this server owns.
+	/// The default follows `OMP_DATA_DIR` and the selected OMP profile.
+	pub fn with_authority_namespace(mut self, namespace: &Path) -> Result<Self> {
+		self.authority_namespace =
+			super::locks::namespace_key(namespace).map_err(|source| Error::Io {
+				operation: sf!("identify Environment authority namespace"),
+				path: namespace.to_path_buf(),
+				source,
+			})?;
+		Ok(self)
+	}
+
+	pub(super) const fn project_key(&self) -> &Hash32 {
+		&self.project_key
 	}
 
 	/// Sets the executable-generation identity advertised to document clients.
@@ -675,7 +715,9 @@ impl ServerConfig {
 		&self.environment_root
 	}
 
-	/// Acquires process authority on the opened project directory.
+	/// Acquires one authority per physical project and owner data namespace.
+	/// Other namespaces may observe the same project; final disk mutations
+	/// still serialize on a separate physical-project lock.
 	pub fn try_lock_authority(&self) -> Result<AuthorityLock> {
 		use cap_std::fs;
 
@@ -696,22 +738,40 @@ impl ServerConfig {
 		let result = (|| {
 			let root = self
 				.root
-				.try_clone()
+				.open_dir(".")
 				.map(fs::Dir::into_std_file)
 				.map_err(|source| Error::Io {
-					operation: sf!("clone Environment authority handle"),
+					operation: sf!("open Environment authority handle"),
 					path: self.environment_root.clone(),
 					source,
 				})?;
-			root.try_lock().map_err(|source| Error::Io {
+			root.try_lock_shared().map_err(|source| Error::Io {
 				operation: sf!("lock Environment authority"),
 				path:      self.environment_root.clone(),
 				source:    source.into(),
 			})?;
-			Ok(root)
+			let mut digest = Hash32::hasher();
+			digest.update(self.project_key.as_bytes());
+			digest.update(self.authority_namespace.as_bytes());
+			let namespace =
+				super::locks::open("authority", &digest.finalize()).map_err(|source| Error::Io {
+					operation: sf!("open Environment authority lock"),
+					path: self.environment_root.clone(),
+					source,
+				})?;
+			namespace.try_lock().map_err(|source| Error::Io {
+				operation: sf!("lock Environment authority"),
+				path:      self.environment_root.clone(),
+				source:    source.into(),
+			})?;
+			Ok((root, namespace))
 		})();
 		match result {
-			Ok(root) => Ok(AuthorityLock { root, held: Arc::clone(&self.authority_held) }),
+			Ok((root, namespace)) => Ok(AuthorityLock {
+				root,
+				_namespace: namespace,
+				held: Arc::clone(&self.authority_held),
+			}),
 			Err(error) => {
 				self.authority_held.store(false, Ordering::Release);
 				Err(error)
@@ -939,6 +999,69 @@ mod tests {
 		assert!(config.try_lock_authority().is_err());
 		drop(lock);
 		let _reacquired_authority = config.try_lock_authority().expect("released authority");
+	}
+
+	#[test]
+	fn authority_is_exclusive_within_each_data_namespace() {
+		let root = TempDir::new().expect("project");
+		let owners = TempDir::new().expect("owner namespaces");
+		let config = |name: &str| {
+			ServerConfig::new(root.path())
+				.expect("config")
+				.with_authority_namespace(&owners.path().join(name))
+				.expect("namespace")
+		};
+		let production = config("production");
+		let development = config("development");
+		let production_lock = production
+			.try_lock_authority()
+			.expect("production authority");
+		let _development_lock = development
+			.try_lock_authority()
+			.expect("independent development authority");
+		assert!(config("production").try_lock_authority().is_err());
+		drop(production_lock);
+		let _replacement = config("production")
+			.try_lock_authority()
+			.expect("released production authority");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn namespace_aliases_do_not_create_a_second_authority() {
+		let root = TempDir::new().expect("project");
+		let owners = TempDir::new().expect("owner namespaces");
+		let owner = owners.path().join("owner");
+		let alias = owners.path().join("alias");
+		fs::create_dir(&owner).expect("owner directory");
+		std::os::unix::fs::symlink(&owner, &alias).expect("owner alias");
+		let first = ServerConfig::new(root.path())
+			.expect("config")
+			.with_authority_namespace(&owner)
+			.expect("namespace");
+		let second = ServerConfig::new(root.path())
+			.expect("config")
+			.with_authority_namespace(&alias)
+			.expect("namespace alias");
+		let _authority = first.try_lock_authority().expect("first authority");
+		assert!(second.try_lock_authority().is_err());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn legacy_physical_authority_and_scoped_authority_exclude_each_other() {
+		let root = TempDir::new().expect("project");
+		let legacy = fs::File::open(root.path()).expect("legacy root handle");
+		legacy.try_lock().expect("legacy exclusive authority");
+		let config = ServerConfig::new(root.path()).expect("config");
+		assert!(config.try_lock_authority().is_err());
+		legacy.unlock().expect("release legacy authority");
+		let scoped = config.try_lock_authority().expect("scoped authority");
+		assert!(matches!(legacy.try_lock(), Err(fs::TryLockError::WouldBlock)));
+		drop(scoped);
+		legacy
+			.try_lock()
+			.expect("legacy authority after scoped shutdown");
 	}
 
 	#[cfg(unix)]

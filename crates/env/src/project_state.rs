@@ -202,6 +202,23 @@ mod tests {
 	use super::{document_socket, environment_socket, extension_socket};
 
 	#[test]
+	fn isolated_data_roots_keep_every_runtime_socket_separate() {
+		let project = tempfile::tempdir().expect("project");
+		let owners = tempfile::tempdir().expect("owner data roots");
+		let production = super::directory(&owners.path().join("production"), project.path())
+			.expect("production state");
+		let development = super::directory(&owners.path().join("development"), project.path())
+			.expect("development state");
+		assert_ne!(production, development);
+		assert_ne!(environment_socket(&production), environment_socket(&development));
+		assert_ne!(document_socket(&production), document_socket(&development));
+		assert_ne!(
+			extension_socket(&production, "workspace", "trusted", "extension", "session", 1),
+			extension_socket(&development, "workspace", "trusted", "extension", "session", 1),
+		);
+	}
+
+	#[test]
 	fn socket_paths_fit_the_platform_address_limit() {
 		let state_dir = PathBuf::from("/").join("long-project-state-segment".repeat(32));
 		let env = environment_socket(&state_dir);
