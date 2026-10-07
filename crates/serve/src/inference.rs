@@ -1365,6 +1365,9 @@ impl pb::inference_server::Inference for InferenceRpc {
 		}
 		let provider_chain =
 			(!request.engine.is_empty()).then(|| configured_search_providers(request.engine.as_str()));
+		if let Some(providers) = &provider_chain {
+			validate_search_provider_chain(self.registry.catalog(), providers)?;
+		}
 		let provider = provider_chain
 			.as_ref()
 			.and_then(|providers| providers.first())
@@ -2464,6 +2467,31 @@ fn chat_request(
 		negotiation: NegotiationPolicy::default(),
 		forced_call: None,
 	})
+}
+
+// Validate explicit selection before constructing a client or selecting
+// credentials. Use the same provider/route operation declarations as
+// model-less routing; an installed provider may still lack standalone search.
+fn validate_search_provider_chain(
+	catalog: &omp_catalog::snapshot::Catalog,
+	providers: &[ProviderId],
+) -> Result<(), Status> {
+	if providers.iter().any(|provider| {
+		catalog.provider(provider).is_some_and(|definition| {
+			definition.routes.iter().any(|route| {
+				catalog.route(route).is_some_and(|route| {
+					route.capability_limits.operations.map_or_else(
+						|| definition.management.supports(OperationKind::Search),
+						|operations| operations.contains_kind(OperationKind::Search),
+					)
+				})
+			})
+		})
+	}) {
+		Ok(())
+	} else {
+		Err(Status::unimplemented("selected search provider is unsupported by this backend"))
+	}
 }
 
 fn configured_search_providers(name: &str) -> Vec<ProviderId> {
@@ -3922,6 +3950,21 @@ mod tests {
 	};
 
 	use super::*;
+
+	#[test]
+	fn search_provider_preflight_rejects_unimplemented_codex_without_account_selection() {
+		let catalog = snapshot::Catalog::embedded();
+		let providers = configured_search_providers("codex");
+		let error = validate_search_provider_chain(&catalog, &providers).unwrap_err();
+		assert_eq!(error.code(), tonic::Code::Unimplemented);
+		assert_eq!(error.message(), "selected search provider is unsupported by this backend");
+		assert!(
+			validate_search_provider_chain(&catalog, &[ProviderId::from("openai-codex")]).is_err()
+		);
+		assert!(
+			validate_search_provider_chain(&catalog, &configured_search_providers("public")).is_ok()
+		);
+	}
 
 	#[test]
 	fn items_project_to_exactly_one_message_each() {

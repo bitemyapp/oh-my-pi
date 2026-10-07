@@ -151,6 +151,13 @@ fn unbound_media() -> BackendError {
 /// The status message is deliberately discarded because it may contain
 /// provider response bodies, account identifiers, or credential diagnostics.
 pub fn redacted_status(status: &tonic::Status) -> BackendError {
+	if status.code() == tonic::Code::Unimplemented {
+		return BackendError {
+			kind:   BackendErrorKind::Unavailable,
+			code:   sf!("operation_unsupported_by_backend"),
+			status: None,
+		};
+	}
 	let kind = match status.code() {
 		tonic::Code::Cancelled => BackendErrorKind::Cancelled,
 		tonic::Code::DeadlineExceeded => BackendErrorKind::Timeout,
@@ -208,5 +215,18 @@ impl fmt::Debug for SearchBridgeHost {
 			.debug_struct("SearchBridgeHost")
 			.field("bound", &self.inference.get().is_some())
 			.finish()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn unsupported_search_status_is_clear_and_does_not_expose_provider_text() {
+		let error = redacted_status(&tonic::Status::unimplemented("private provider response"));
+		assert_eq!(error.kind, BackendErrorKind::Unavailable);
+		assert_eq!(error.code, "operation_unsupported_by_backend");
+		assert_eq!(error.status, None);
 	}
 }

@@ -1969,6 +1969,7 @@ pub async fn compose_kernel(
 			InferenceSessionOverrides {
 				provider: options.api_key.as_ref().and(options.provider.clone()),
 				api_key: options.api_key,
+				account_pins: options.account_pins.clone(),
 				con: Some(Arc::clone(&ctx)),
 				..InferenceSessionOverrides::default()
 			},

@@ -245,8 +245,10 @@ pub fn tool<B: SearchBackend>(backend: Arc<B>) -> WebSearch<B> {
 			name:            sf!("web_search"),
 			rev:             Rev { family: Default::default(), n: 2 },
 			description:     sf!(
-				"Searches the web through configured providers. Supports Google-style query \
-				 directives, ordered automatic fallback, or an explicit provider pin."
+				"Searches the web through the session inference backend. Call web_search directly; it \
+				 is not a bash dyn device. Supports Google-style query directives, ordered automatic \
+				 fallback, or an explicit provider pin. Automatic fallback may use a different \
+				 provider; select a provider explicitly when account scope matters."
 			),
 			schema:          omp_tool::schema::<Params>(),
 			constraint:      Constraint::Schema {

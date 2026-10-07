@@ -347,3 +347,14 @@ test-omperor-browser-guidance:
     cargo test --doc -p omp-tools --locked
     cargo nextest run -p omp-envd --lib --locked --run-ignored all -E 'test(browser_daemon::tests::selector_errors_) | test(browser_daemon::tests::browser_guidance_) | test(browser_daemon::tests::runtime_lifts_)'
     cargo test --doc -p omp-envd --locked
+
+# Session-bound search is advertised natively and reaches the owning inference bridge.
+[group('test')]
+test-omperor-native-search:
+    cargo nextest run -p omp-envd --lib --locked -E 'test(tools::tests::web_search_selection_) | test(search_backend::tests::)'
+    cargo test --doc -p omp-envd --locked
+    cargo nextest run -p omp-tools --lib --locked -E 'test(web_search::tests::)'
+    cargo test --doc -p omp-tools --locked
+    cargo check -p omp-driver --locked
+    cargo nextest run -p omp-serve --lib --locked -E 'test(inference::tests::search_provider_preflight_)'
+    cargo test --doc -p omp-serve --locked

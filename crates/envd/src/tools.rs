@@ -3734,8 +3734,10 @@ fn register_session_base(
 		register_instrumented(
 			registry,
 			omp_tools::web_search::tool(Arc::clone(&search_bridge)),
-			long_tail_presentation(policy),
-			long_tail_claims(policy),
+			// Search needs the session-bound inference/account bridge. Shell dyn
+			// runs in the shared daemon, whose search bridge is intentionally unbound.
+			Presentation::Slot,
+			core_claims(),
 		)?;
 	}
 	if tool_settings.enabled("todo") {
@@ -5888,6 +5890,129 @@ const fn worker_declaration_error(message: &'static str) -> EnvdError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[derive(Default)]
+	struct SessionSearchProbe(Mutex<Vec<v1::SearchRequest>>);
+
+	#[async_trait::async_trait]
+	impl SearchInference for SessionSearchProbe {
+		async fn search(
+			&self,
+			request: v1::SearchRequest,
+		) -> Result<v1::SearchResponse, omp_tools::web_search::BackendError> {
+			self.0.lock().push(request);
+			Ok(v1::SearchResponse {
+				engine: "session-bound-probe".to_owned(),
+				answer: "Search reached the owning session".to_owned(),
+				..Default::default()
+			})
+		}
+
+		async fn generate_image(
+			&self,
+			_: v1::GenerateImageRequest,
+		) -> Result<Vec<Blob>, omp_tools::web_search::BackendError> {
+			panic!("search must not invoke image inference")
+		}
+
+		async fn speak(
+			&self,
+			_: v1::SpeakRequest,
+		) -> Result<Vec<u8>, omp_tools::web_search::BackendError> {
+			panic!("search must not invoke speech inference")
+		}
+	}
+
+	#[tokio::test]
+	async fn web_search_selection_uses_native_bound_session_and_is_not_a_dyn_device() {
+		use omp_tool::{CallOutcome, DevicePath, ErasedEv, ErasedOutcome, LoweringCaps};
+		let scratch = tempfile::tempdir().expect("search state");
+		let root = scratch.path();
+		let ctx = Ctx::new();
+		let blobs = BlobHost::open(root.join("blobs")).expect("blob host");
+		let telemetry = Arc::new(
+			TelemetryIndex::open(&root.join("sessions"), &root.join("telemetry.sqlite3"))
+				.expect("telemetry"),
+		);
+		let github = Arc::new(
+			GithubCache::open(
+				root.join("github.sqlite3"),
+				crate::tool_settings::GithubCacheSettings::from_con(&ctx).policy(),
+			)
+			.expect("github cache"),
+		);
+		let search = Arc::new(SessionSearchProbe::default());
+		let mut registry = Registry::new();
+		register_session_base(
+			&mut registry,
+			Vec::new(),
+			Vec::new(),
+			Some(search.clone()),
+			None,
+			None,
+			None,
+			&blobs,
+			root,
+			root,
+			&telemetry,
+			github,
+			&ToolSettings::default(),
+			image_config(&ctx),
+			speech_config(&ctx),
+			ToolsPolicy::Auto,
+		)
+		.expect("session tools register");
+		assert_eq!(registry.locus("web_search").unwrap(), ToolLocus::Session);
+		assert_eq!(registry.presentation("web_search").unwrap(), Presentation::Slot);
+		assert!(!environment_tool_names(&registry).contains("web_search"));
+		assert!(!registry.devices().any(|device| device.name == "web_search"));
+		assert!(
+			registry
+				.resolve_device(&DevicePath::parse("web_search").unwrap())
+				.is_err()
+		);
+		// This is the explicit --tools selection seam used by Omperor.
+		let selected = registry.restrict(["web_search"]);
+		let caps = LoweringCaps {
+			strict_schema:  false,
+			grammar:        omp_catalog::GrammarBits::empty(),
+			maximum_tools:  None,
+			maximum_strict: None,
+		};
+		let advertised = selected
+			.advertise_selected(caps, &[sf!("web_search")])
+			.unwrap();
+		assert_eq!(advertised.len(), 1);
+		assert_eq!(advertised[0].definition.name, "web_search");
+		assert_eq!(selected.advertise(caps).unwrap().len(), 1);
+		let (feed, params) = IncomingParams::channel();
+		feed
+			.args_committed(Str::new_static(r#"{"query":"session routing","provider":"codex"}"#))
+			.expect("committed search args");
+		let mut stream = selected
+			.invoke("web_search", params)
+			.expect("native search");
+		let mut completed = false;
+		while let Some(event) = stream.next().await {
+			if let ErasedEv::Done(outcome) = event.expect("search event") {
+				let ErasedOutcome::Done { verdict, .. } = outcome else {
+					panic!("search must complete with a typed verdict")
+				};
+				let outcome: CallOutcome<omp_tools::web_search::Payload, omp_tools::web_search::Fault> =
+					serde_json::from_slice(&verdict).expect("search verdict");
+				let CallOutcome::Ok(payload) = outcome else {
+					panic!("the session-bound search backend must succeed")
+				};
+				assert_eq!(payload.response.engine, "session-bound-probe");
+				completed = true;
+			}
+		}
+		assert!(completed);
+		let requests = search.0.lock();
+		assert_eq!(requests.len(), 1);
+		assert_eq!(requests[0].engine, "codex");
+		assert_eq!(requests[0].query, "session routing");
+	}
 
 	static EVAL_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
