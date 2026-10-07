@@ -1218,7 +1218,7 @@ fn dispatch_helper(
 		},
 		"click" => {
 			document
-				.resolve(selector(values, 0)?)
+				.resolve(selector(values, 0, op)?)
 				.map_err(|error| browser_fault("tab.click", error))?
 				.click()
 				.map_err(|error| browser_fault("tab.click", error))?;
@@ -1226,7 +1226,7 @@ fn dispatch_helper(
 		},
 		"type" => {
 			document
-				.resolve(selector(values, 0)?)
+				.resolve(selector(values, 0, op)?)
 				.map_err(|error| browser_fault("tab.type", error))?
 				.type_text(arg_str(values, 1, "type requires text")?)
 				.map_err(|error| browser_fault("tab.type", error))?;
@@ -1234,7 +1234,7 @@ fn dispatch_helper(
 		},
 		"fill" => {
 			document
-				.resolve(selector(values, 0)?)
+				.resolve(selector(values, 0, op)?)
 				.map_err(|error| browser_fault("tab.fill", error))?
 				.fill(arg_str(values, 1, "fill requires a value")?)
 				.map_err(|error| browser_fault("tab.fill", error))?;
@@ -1274,7 +1274,7 @@ fn dispatch_helper(
 		},
 		"scrollIntoView" => {
 			document
-				.resolve(selector(values, 0)?)
+				.resolve(selector(values, 0, op)?)
 				.map_err(|error| browser_fault("tab.scrollIntoView", error))?
 				.scroll_into_view()
 				.map_err(|error| browser_fault("tab.scrollIntoView", error))?;
@@ -1285,10 +1285,10 @@ fn dispatch_helper(
 				&& values.get(1).is_some_and(Value::is_string)
 			{
 				let from = document
-					.resolve(selector(values, 0)?)
+					.resolve(selector(values, 0, op)?)
 					.map_err(|error| browser_fault("tab.drag", error))?;
 				let to = document
-					.resolve(selector(values, 1)?)
+					.resolve(selector(values, 1, op)?)
 					.map_err(|error| browser_fault("tab.drag", error))?;
 				from
 					.drag_to(&to)
@@ -1341,7 +1341,7 @@ fn dispatch_helper(
 		},
 		"select" => {
 			let handle = document
-				.resolve(selector(values, 0)?)
+				.resolve(selector(values, 0, op)?)
 				.map_err(|error| browser_fault("tab.select", error))?;
 			let selected = values
 				.iter()
@@ -1361,7 +1361,7 @@ fn dispatch_helper(
 				.filter_map(Value::as_str)
 				.map(PathBuf::from)
 				.collect::<Vec<_>>();
-			tab.upload_files(selector(values, 0)?, &paths, remaining)
+			tab.upload_files(selector(values, 0, op)?, &paths, remaining)
 				.map_err(|error| browser_fault("tab.uploadFile", error))?;
 			Value::Null
 		},
@@ -1380,7 +1380,7 @@ fn dispatch_helper(
 		},
 		"waitFor" | "waitForSelector" => {
 			let handle = document
-				.wait_for_selector(selector(values, 0)?, remaining)
+				.wait_for_selector(selector(values, 0, op)?, remaining)
 				.map_err(|error| browser_fault("tab.waitForSelector", error))?;
 			json!({ "selector": values.first(), "metadata": {
 				"id": handle.metadata().map_err(|error| browser_fault("tab.waitForSelector", error))?.id
@@ -1606,9 +1606,19 @@ fn mutates_page(op: &str) -> bool {
 	matches!(op, "goto" | "click" | "press" | "drag")
 }
 
-fn selector(values: &[Value], index: usize) -> Result<Selector, Fault> {
-	Selector::parse(arg_str(values, index, "selector is required")?)
-		.map_err(|error| browser_fault("selector", error))
+fn selector(values: &[Value], index: usize, operation: &str) -> Result<Selector, Fault> {
+	let value = values.get(index).and_then(Value::as_str).ok_or_else(|| {
+		let hint = if matches!(operation, "waitFor" | "waitForSelector") {
+			"Use await wait(milliseconds) for a delay."
+		} else {
+			"Pass a CSS selector or 'aria-ref=e3', not a selector/ref object."
+		};
+		invalid_owned(
+			sf!("tab.{operation} requires a selector string at argument {}. {hint}", index + 1),
+			Some(sf!("tab.{operation}")),
+		)
+	})?;
+	Selector::parse(value).map_err(|error| browser_fault("selector", error))
 }
 
 fn arg_str<'a>(values: &'a [Value], index: usize, message: &'static str) -> Result<&'a str, Fault> {
@@ -1990,6 +2000,89 @@ mod tests {
 			redact("failed at https://example.test/a?token=secret authorization=secret"),
 			"failed at <redacted-url> <redacted>"
 		);
+	}
+
+	#[test]
+	fn selector_errors_identify_the_helper_and_delay_api() {
+		let fault = selector(&[json!(300)], 0, "waitFor").expect_err("delay is not a selector");
+		assert_eq!(fault.operation.as_deref(), Some("tab.waitFor"));
+		assert!(
+			fault
+				.message
+				.contains("tab.waitFor requires a selector string")
+		);
+		assert!(fault.message.contains("wait(milliseconds)"));
+		let fault =
+			selector(&[json!({ "ref": "e3" })], 0, "click").expect_err("selectors are strings");
+		assert!(fault.message.contains("tab.click"));
+		assert!(fault.message.contains("aria-ref=e3"));
+		for value in ["input", "aria-ref=e3"] {
+			assert!(selector(&[json!(value)], 0, "fill").is_ok());
+		}
+	}
+
+	#[test]
+	#[ignore = "requires an installed headless browser engine"]
+	fn browser_guidance_examples_execute_against_a_real_page() {
+		let engine = Engine::find(SurfaceKind::Frames).expect("headless browser engine");
+		let view = WebViewBuilder::new(engine)
+			.html(
+				r#"<!doctype html><title>Browser contract</title>
+				<label>New task<input id="task"></label><button id="add">Add task</button><ul></ul>
+				<script>document.querySelector('#add').onclick=()=>{
+				const item=document.createElement('li');item.textContent=document.querySelector('input').value;
+				document.querySelector('ul').append(item);};</script>"#,
+			)
+			.incognito(true)
+			.build_frames(FrameConfig::default())
+			.expect("isolated page");
+		view
+			.automation()
+			.wait_for_navigation(Duration::from_secs(10))
+			.expect("loaded page");
+		let session = TabSession { view, backend: sf!("headless") };
+		let temp = tempfile::tempdir().expect("tempdir");
+		let blobs = BlobHost::open(temp.path()).expect("blobs");
+		let (updates, _receiver) = flume::unbounded();
+		let cancellation = CancellationToken::new();
+		let run = |code| {
+			run_code(
+				&session,
+				&blobs,
+				"contract",
+				code,
+				Duration::from_secs(15),
+				&cancellation,
+				&updates,
+			)
+		};
+		let (_, result, _) = run(
+			"await tab.fill('input', 'Draft'); await tab.click('button'); return await \
+			 tab.ariaSnapshot()",
+		)
+		.expect("documented fill/click/snapshot example");
+		assert!(
+			result
+				.expect("explicit return")
+				.as_str()
+				.unwrap()
+				.contains("Draft")
+		);
+		let (display, result, _) = run(
+			"await wait(1); await tab.waitForSelector('li'); display(await tab.observe()); return \
+			 await tab.evaluate(() => document.querySelectorAll('li').length)",
+		)
+		.expect("documented wait and display helpers");
+		assert_eq!(display.len(), 1);
+		assert_eq!(result, Some(json!(1)));
+		let fault = run("await tab.click('button'); await tab.waitFor(1)")
+			.expect_err("numeric tab.waitFor is rejected after the click");
+		assert!(fault.message.contains("tab.waitFor"));
+		assert!(fault.message.contains("wait(milliseconds)"));
+		let (_, result, _) =
+			run("return await tab.evaluate(() => document.querySelectorAll('li').length)")
+				.expect("inspect page after a failed run");
+		assert_eq!(result, Some(json!(2)), "earlier actions survive a later helper error");
 	}
 
 	#[test]

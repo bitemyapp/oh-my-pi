@@ -107,7 +107,11 @@ pub struct Params {
 	pub wait_until:              Option<WaitUntil>,
 	/// Automatic JavaScript dialog handling.
 	pub dialogs:                 Option<Dialogs>,
-	/// JavaScript body evaluated by `run` against the persistent named tab.
+	/// Async JavaScript body for `run`; use `return` or `display` to expose
+	/// results. Example: `await tab.fill("input", "Draft"); await
+	/// tab.click("button"); return await tab.ariaSnapshot()`. Selectors are
+	/// strings. `tab.waitFor(selector)` waits for an element;
+	/// `wait(milliseconds)` delays.
 	pub code:                    Option<Str>,
 	/// Bounded operation timeout in seconds.
 	pub timeout:                 Option<f64>,
@@ -290,16 +294,30 @@ pub fn spec() -> ToolSpec {
 	ToolSpec {
 		name:            sf!("browser"),
 		rev:             Rev { family: Str::default(), n: 3 },
-		description:     sf!(
-			"Drives persistent, session-owned browser tabs through a composable JavaScript surface. \
-			 Call open before run and close when finished. run exposes page, browser, tab, display, \
-			 assert, and wait. tab provides url/title/goto, observe/ariaSnapshot, \
-			 click/type/fill/press/scroll/scrollIntoView/drag/select/uploadFile, evaluate/extract, \
-			 screenshot/download, \
-			 waitFor/waitForSelector/waitForUrl/waitForResponse/waitForNavigation, and id/ref \
-			 element handles. app.path spawns an owned browser; app.cdp_url attaches without owning \
-			 the page; app.relay uses the logged-in relay browser. Request interception is scoped to \
-			 one run and is removed before settlement."
+		description:     Str::new_static(
+			"Drives persistent, session-owned browser tabs. Call open before run and close when \
+			 finished.\nrun executes an async JavaScript body with tab, page, browser, display, \
+			 assert, and wait.\nUse `return await tab.ariaSnapshot()` or `display(await \
+			 tab.observe())` to see results; a bare expression is not returned. Await every action. \
+			 Local variables do not persist between runs; the named tab and page state do.\nInspect \
+			 the page before acting. Pass a CSS selector string or a current snapshot ref such as \
+			 'aria-ref=e3', not a selector/ref object.\nActions: tab.click(selector), \
+			 tab.fill(selector, value), tab.type(selector, text), tab.press(key, {selector}), \
+			 tab.scroll(dx, dy), tab.scrollIntoView(selector), tab.select(selector, ...values), \
+			 tab.uploadFile(selector, ...paths).\nHandles: (await tab.ref('e3')).click() or \
+			 .fill(value); tab.id(3) uses numeric element ids.\nWaits: tab.waitFor(selector) and \
+			 tab.waitForSelector(selector) wait for an element. For a timed delay use `await \
+			 wait(300)`; for a condition use `await wait(async () => (await \
+			 tab.extract('text')).includes('Ready'))`. Do not pass milliseconds to \
+			 tab.waitFor.\nNavigation: tab.goto(url), tab.url(), await tab.title(), \
+			 tab.waitForUrl(pattern), tab.waitForResponse(pattern), tab.waitForNavigation().\nRead: \
+			 tab.observe(), tab.ariaSnapshot(), tab.extract('text'|'html'|'markdown'), \
+			 tab.evaluate(fn, ...args). Capture: await tab.screenshot({fullPage: true}) retains an \
+			 image; tab.download(url) retains a download.\nExample run: `await tab.fill('input', \
+			 'Draft'); await tab.click('button'); return await tab.ariaSnapshot()`. If a run fails, \
+			 inspect the page before retrying: earlier actions remain applied.\napp.path spawns an \
+			 owned browser; app.cdp_url attaches without owning the page; app.relay uses the \
+			 logged-in relay browser. Request interception is scoped to one run.",
 		),
 		schema:          omp_tool::schema::<Params>(),
 		constraint:      Constraint::Schema {

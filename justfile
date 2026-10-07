@@ -339,3 +339,11 @@ test-omperor-computer-use:
 test-omperor-computer-owner:
     cargo nextest run -p omp-envd --lib --locked -E 'test(computer_use_) | test(devices_host::tests::)'
     cargo test --doc -p omp-envd --locked
+
+# Browser API guidance and real isolated browser execution (requires a headless engine).
+[group('test')]
+test-omperor-browser-guidance:
+    cargo nextest run -p omp-tools --lib --locked -E 'test(browser::tests::)'
+    cargo test --doc -p omp-tools --locked
+    cargo nextest run -p omp-envd --lib --locked --run-ignored all -E 'test(browser_daemon::tests::selector_errors_) | test(browser_daemon::tests::browser_guidance_) | test(browser_daemon::tests::runtime_lifts_)'
+    cargo test --doc -p omp-envd --locked
