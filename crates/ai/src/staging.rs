@@ -1437,9 +1437,11 @@ mod tests {
 	}
 
 	#[test]
-	fn secure_gate_usage_round_trip_preserves_reported_cache_zero() {
+	fn secure_gate_usage_round_trip_preserves_reported_cache_zero_and_retention() {
 		let usage = crate::receipt::Usage {
 			input_tokens: 100,
+			prompt_cache_ttl_seconds: Some(1800),
+			prompt_cache_retention: Some(crate::receipt::PromptCacheRetention::Extended24h),
 			cache_read_tokens: 600,
 			cache_read_reported: true,
 			cache_write_reported: true,
@@ -1456,6 +1458,24 @@ mod tests {
 		};
 		assert_eq!(restored.usage, usage);
 		assert!(restored.final_update);
+		let mut receipt = crate::receipt::ExecutionReceipt::default();
+		receipt.timings.completed_at =
+			Some(std::time::UNIX_EPOCH + Duration::from_secs(1_750_000_000));
+		let event = ChatEvent::Completed(crate::event::Completion {
+			reason: crate::event::FinishReason::Stop,
+			blocks: 1,
+			usage,
+			receipt: receipt.clone().into(),
+		});
+		encoded.clear();
+		super::encode_chat_event(&event, &mut encoded).expect("stage completion");
+		let ChatEvent::Completed(restored) =
+			super::decode_chat_event(&encoded).expect("unstage completion")
+		else {
+			panic!("expected completion");
+		};
+		assert_eq!(restored.usage, usage);
+		assert_eq!(*restored.receipt, receipt);
 	}
 
 	#[test]
@@ -2069,6 +2089,12 @@ fn encode_usage(usage: Usage, out: &mut Vec<u8>) {
 	put_bool(out, usage.cache_read_reported);
 	put_bool(out, usage.cache_write_reported);
 	put_bool(out, usage.cache_write_1h_reported);
+	put_option_u64(out, usage.prompt_cache_ttl_seconds);
+	put_u8(out, match usage.prompt_cache_retention {
+		None => 0,
+		Some(crate::receipt::PromptCacheRetention::InMemory) => 1,
+		Some(crate::receipt::PromptCacheRetention::Extended24h) => 2,
+	});
 	put_u32(out, usage.images);
 	put_u32(out, usage.search_calls);
 	put_u8(out, match usage.source {
@@ -2221,6 +2247,13 @@ impl<'a> GateCursor<'a> {
 			cache_read_reported: self.bool()?,
 			cache_write_reported: self.bool()?,
 			cache_write_1h_reported: self.bool()?,
+			prompt_cache_ttl_seconds: self.option_u64()?,
+			prompt_cache_retention: match self.u8()? {
+				0 => None,
+				1 => Some(crate::receipt::PromptCacheRetention::InMemory),
+				2 => Some(crate::receipt::PromptCacheRetention::Extended24h),
+				_ => return Err(gate_corrupt("secure_gate_cache_retention_corrupt")),
+			},
 			images: self.u32()?,
 			search_calls: self.u32()?,
 			source: match self.u8()? {

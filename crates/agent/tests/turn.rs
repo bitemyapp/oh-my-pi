@@ -199,6 +199,62 @@ async fn user_turn_journals_assistant_text_in_the_explicit_turn() {
 }
 
 #[tokio::test]
+async fn cache_timer_journals_stream_end_time_and_only_the_current_response_metadata() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let journal_path = directory.path().join("cache.oms");
+	let stream_end = SystemTime::UNIX_EPOCH + Duration::from_millis(1_750_000_000_100);
+	let mut reported = text_script("cached");
+	let Some(ChatEvent::Completed(completion)) = reported.last_mut() else {
+		panic!("completion");
+	};
+	completion.usage.prompt_cache_ttl_seconds = Some(1800);
+	completion.usage.prompt_cache_retention =
+		Some(omp_ai::receipt::PromptCacheRetention::Extended24h);
+	completion.receipt.timings.completed_at = Some(stream_end);
+	let (inference, _) = ScriptedInference::new([reported, text_script("no metadata")]);
+	let mut kernel = Kernel::new(
+		inference,
+		registry(std::iter::empty()),
+		policy(&directory.path().join("blobs")),
+		StaticPrompt(Str::new_static("test system")),
+	);
+	let mut session = fresh_session(&journal_path);
+	let before = SystemTime::now()
+		.duration_since(SystemTime::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	for text in ["first", "second"] {
+		kernel
+			.run_turn(&mut session, input(text), RunControl::default())
+			.await
+			.expect("turn completes");
+	}
+	let after = SystemTime::now()
+		.duration_since(SystemTime::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	drop(session);
+	let receipts: Vec<omp_journal::data::TurnReceipt> = journal_entries(&journal_path)
+		.into_iter()
+		.filter(|entry| entry.kind.name.as_str() == kind::TURN_RECEIPT)
+		.map(|entry| serde_json::from_str(entry.data.as_str()).expect("receipt decodes"))
+		.collect();
+	assert_eq!(receipts.len(), 2);
+	assert_eq!(receipts[0].response_completed_at_ms, Some(1_750_000_000_100));
+	assert_eq!(receipts[0].prompt_cache_ttl_seconds, Some(1800));
+	assert_eq!(receipts[0].prompt_cache_retention.as_deref(), Some("24h"));
+	assert_eq!(receipts[1].prompt_cache_ttl_seconds, None);
+	assert_eq!(receipts[1].prompt_cache_retention, None);
+	assert!(
+		(before..=after).contains(
+			&receipts[1]
+				.response_completed_at_ms
+				.expect("local completion time")
+		)
+	);
+}
+
+#[tokio::test]
 async fn paused_completion_resamples_and_replays_durable_evidence() {
 	let directory = tempfile::tempdir().expect("temporary directory");
 	let journal_path = directory.path().join("paused.oms");

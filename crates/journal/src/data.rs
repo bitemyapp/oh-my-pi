@@ -731,6 +731,16 @@ pub struct TurnReceipt {
 	/// Whether the one-hour write counter was explicitly reported.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub cache_write_1h_reported:     Option<bool>,
+	/// Minimum cache lifetime explicitly returned in the API response.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub prompt_cache_ttl_seconds:    Option<u64>,
+	/// Legacy provider-reported policy; never an exact expiry or minimum TTL.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub prompt_cache_retention:      Option<Str>,
+	/// Client wall clock at inference stream completion, before
+	/// journaling/hooks.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub response_completed_at_ms:    Option<u64>,
 	/// Uncached input token count; excludes `cache_read` and `cache_write`.
 	pub tokens_in:                   u64,
 	/// Output token count.
@@ -789,6 +799,9 @@ impl TurnReceipt {
 			cache_read_reported: None,
 			cache_write_reported: None,
 			cache_write_1h_reported: None,
+			prompt_cache_ttl_seconds: None,
+			prompt_cache_retention: None,
+			response_completed_at_ms: None,
 			tokens_in,
 			tokens_out,
 			cost_nano_usd,
@@ -992,7 +1005,13 @@ mod tests {
 		assert_eq!(legacy.cache_write_reported, None);
 		assert_eq!(legacy.cache_write_1h, None);
 		assert_eq!(legacy.cost_source, None);
+		assert_eq!(legacy.prompt_cache_ttl_seconds, None);
+		assert_eq!(legacy.prompt_cache_retention, None);
+		assert_eq!(legacy.response_completed_at_ms, None);
 		let recorded = TurnReceipt {
+			prompt_cache_ttl_seconds: Some(1800),
+			prompt_cache_retention: Some(Str::new_static("24h")),
+			response_completed_at_ms: Some(1750000000100),
 			receipt_id: Some(Str::new_static("01RECEIPT")),
 			recorded_at_ms: Some(1750000000123),
 			usage_source: Some(super::ReceiptUsageSource::Provider),

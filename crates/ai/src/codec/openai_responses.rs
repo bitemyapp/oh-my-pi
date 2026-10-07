@@ -34,7 +34,7 @@ use crate::{
 	error::{Error, ErrorKind, RetryAction},
 	event::{BlockKind, ChatEvent, FinishReason, ToolCall, UsageUpdate},
 	id::{RequestId, ToolCallId},
-	receipt::{Adjustment, Cost, FeatureId, ReasonId, Usage, UsageSource},
+	receipt::{Adjustment, Cost, FeatureId, PromptCacheRetention, ReasonId, Usage, UsageSource},
 	session::StoredProviderStateEvent,
 	transport::{Frame, FramingProtocol},
 };
@@ -1023,36 +1023,70 @@ pub struct ResponsesStatusDetails {
 	pub error: Option<ResponsesErrorObject>,
 }
 
+/// Cache options reported in the response, independent of request preferences.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponsesReturnedPromptCacheOptions {
+	/// Minimum retention duration explicitly reported by the provider.
+	#[serde(default)]
+	pub ttl: Option<Str>,
+}
+
+// Cache diagnostics are optional: future metadata shapes must not make an
+// otherwise valid inference response fail to decode.
+fn deserialize_optional_cache_metadata<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+	D: serde::Deserializer<'de>,
+	T: Deserialize<'de>,
+{
+	#[derive(Deserialize)]
+	#[serde(untagged)]
+	enum Metadata<T> {
+		Known(T),
+		Unknown(serde::de::IgnoredAny),
+	}
+	Ok(match Metadata::deserialize(deserializer)? {
+		Metadata::Known(value) => Some(value),
+		Metadata::Unknown(_) => None,
+	})
+}
+
 /// Typed response envelope carried by lifecycle events.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponsesResponse {
 	/// Authoritative response identity.
 	#[serde(default)]
-	pub id:                 Option<Str>,
+	pub id:                     Option<Str>,
 	/// Wire model identity.
 	#[serde(default)]
-	pub model:              Option<Str>,
+	pub model:                  Option<Str>,
 	/// Response status.
 	#[serde(default)]
-	pub status:             Option<Str>,
+	pub status:                 Option<Str>,
 	/// Terminal error.
 	#[serde(default)]
-	pub error:              Option<ResponsesErrorObject>,
+	pub error:                  Option<ResponsesErrorObject>,
 	/// Nested status details.
 	#[serde(default)]
-	pub status_details:     Option<ResponsesStatusDetails>,
+	pub status_details:         Option<ResponsesStatusDetails>,
 	/// Incomplete details.
 	#[serde(default)]
-	pub incomplete_details: Option<ResponsesIncompleteDetails>,
+	pub incomplete_details:     Option<ResponsesIncompleteDetails>,
 	/// Terminal output items.
 	#[serde(default)]
-	pub output:             Vec<ResponsesOutputItem>,
+	pub output:                 Vec<ResponsesOutputItem>,
 	/// Terminal usage.
 	#[serde(default)]
-	pub usage:              Option<ResponsesUsage>,
+	pub usage:                  Option<ResponsesUsage>,
 	/// Applied service tier.
 	#[serde(default)]
-	pub service_tier:       Option<Str>,
+	pub service_tier:           Option<Str>,
+	/// Cache options actually applied by the provider. Unknown option shapes
+	/// must not break an otherwise valid inference response.
+	#[serde(default, deserialize_with = "deserialize_optional_cache_metadata")]
+	pub prompt_cache_options:   Option<ResponsesReturnedPromptCacheOptions>,
+	/// Legacy policy returned by the provider, not the request preference.
+	#[serde(default, deserialize_with = "deserialize_optional_cache_metadata")]
+	pub prompt_cache_retention: Option<PromptCacheRetention>,
 }
 
 /// Responses stream event discriminator.
@@ -2056,8 +2090,9 @@ impl OpenAiResponsesDecoder {
 				)));
 				return;
 			}
-			if let Some(usage) = &response.usage {
-				let mut usage = Usage::from(usage);
+			if response.usage.is_some() || response.prompt_cache_options.is_some()
+				|| response.prompt_cache_retention.is_some() {
+				let mut usage = response_usage(response);
 				usage.search_calls = u32::from(self.saw_completed_hosted_tool);
 				out.push(ResponsesProjection::Canonical(ChatEvent::Usage(UsageUpdate {
 					usage,
@@ -2100,8 +2135,7 @@ impl OpenAiResponsesDecoder {
 			FinishReason::Stop
 		};
 		let mut usage = response
-			.and_then(|value| value.usage.as_ref())
-			.map_or_else(Usage::default, Usage::from);
+			.map_or_else(Usage::default, response_usage);
 		usage.search_calls = u32::from(self.saw_completed_hosted_tool);
 		out.push(ResponsesProjection::Completion(Box::new(RawCompletion {
 			reason,
@@ -2109,6 +2143,39 @@ impl OpenAiResponsesDecoder {
 			usage,
 		})));
 	}
+}
+
+/// Keep response metadata separate from inferred cache-token accounting.
+fn response_usage(response: &ResponsesResponse) -> Usage {
+	let mut usage = response
+		.usage
+		.as_ref()
+		.map_or_else(Usage::default, Usage::from);
+	usage.prompt_cache_ttl_seconds = response
+		.prompt_cache_options
+		.as_ref()
+		.and_then(|options| options.ttl.as_deref())
+		.and_then(|ttl| {
+			let (amount, multiplier) = if let Some(n) = ttl.strip_suffix('m') {
+				(n, 60)
+			} else if let Some(n) = ttl.strip_suffix('h') {
+				(n, 3600)
+			} else if let Some(n) = ttl.strip_suffix('s') {
+				(n, 1)
+			} else {
+				return None;
+			};
+			if !amount.bytes().all(|byte| byte.is_ascii_digit()) {
+				return None;
+			}
+			amount
+				.parse::<u64>()
+				.ok()?
+				.checked_mul(multiplier)
+				.filter(|&n| n > 0)
+		});
+	usage.prompt_cache_retention = response.prompt_cache_retention;
+	usage
 }
 
 #[derive(Clone, Copy)]
@@ -5713,6 +5780,108 @@ mod tests {
 			}),
 			br#"[{"type":"function","name":"match_input","parameters":{"type":"object","properties":{},"required":[],"additionalProperties":false},"strict":true}]"#,
 		);
+	}
+
+	#[test]
+	fn terminal_response_passes_cache_ttl_without_requiring_token_usage() {
+		for terminal in ["response.completed", "response.done", "response.incomplete"] {
+			let mut decoder = OpenAiResponsesDecoder::default();
+			let wire = serde_json::json!({"type":terminal,"response":{
+				"id":"resp_cache", "status": if terminal == "response.incomplete" { "incomplete" } else { "completed" },
+				"prompt_cache_options":{"ttl":"30m","mode":"auto"},
+				"prompt_cache_retention":"24h"
+			}});
+			let events = decoder.push_json(&serde_json::to_vec(&wire).unwrap());
+			let completion = events
+				.iter()
+				.find_map(|event| match event {
+					ResponsesProjection::Completion(completion) => Some(completion),
+					_ => None,
+				})
+				.expect("terminal completion");
+			assert_eq!(completion.usage.prompt_cache_ttl_seconds, Some(1800));
+			assert_eq!(
+				completion.usage.prompt_cache_retention,
+				Some(crate::receipt::PromptCacheRetention::Extended24h)
+			);
+			assert_eq!(completion.usage.source, crate::receipt::UsageSource::Unknown);
+			assert!(events.iter().any(|event| matches!(event,
+				ResponsesProjection::Canonical(ChatEvent::Usage(update)) if update.usage == completion.usage)));
+		}
+	}
+
+	#[test]
+	fn terminal_response_retains_cache_metadata_and_token_accounting_independently() {
+		for (ttl, seconds) in [("30m", 1800), ("1h", 3600), ("45s", 45)] {
+			let mut decoder = OpenAiResponsesDecoder::default();
+			let wire = serde_json::json!({"type":"response.completed","response":{
+				"id":"resp_cache", "status":"completed",
+				"prompt_cache_options":{"ttl":ttl,"mode":"future_mode"},
+				"usage":{"input_tokens":100,"output_tokens":5,
+					"input_tokens_details":{"cached_tokens":20,"cache_write_tokens":10}}
+			}});
+			let events = decoder.push_json(&serde_json::to_vec(&wire).unwrap());
+			let completion = events
+				.iter()
+				.find_map(|event| match event {
+					ResponsesProjection::Completion(completion) => Some(completion),
+					_ => None,
+				})
+				.expect("terminal completion");
+			assert_eq!(completion.usage.prompt_cache_ttl_seconds, Some(seconds));
+			assert_eq!(completion.usage.input_tokens, 70);
+			assert_eq!(completion.usage.cache_read_tokens, 20);
+			assert_eq!(completion.usage.cache_write_tokens, 10);
+			assert_eq!(completion.usage.output_tokens, 5);
+			assert_eq!(completion.usage.source, crate::receipt::UsageSource::Provider);
+		}
+	}
+
+	#[test]
+	fn absent_or_unrecognized_cache_metadata_does_not_invent_a_ttl_or_fail_inference() {
+		for ttl in [
+			serde_json::Value::Null,
+			serde_json::json!("0m"),
+			serde_json::json!("+30m"),
+			serde_json::json!("future"),
+			serde_json::json!("18446744073709551615h"),
+			serde_json::json!(30),
+		] {
+			let wire = serde_json::json!({"prompt_cache_options":{"ttl":ttl}, "prompt_cache_retention":"future_policy"});
+			let response: super::ResponsesResponse = serde_json::from_value(wire).unwrap();
+			let usage = super::response_usage(&response);
+			assert_eq!(usage.prompt_cache_ttl_seconds, None);
+			assert_eq!(usage.prompt_cache_retention, None);
+		}
+		assert_eq!(
+			super::response_usage(&super::ResponsesResponse::default()).prompt_cache_ttl_seconds,
+			None
+		);
+		let response: super::ResponsesResponse = serde_json::from_value(serde_json::json!({
+			"prompt_cache_retention":"in_memory", "usage":{"input_tokens":100,"output_tokens":5}
+		}))
+		.unwrap();
+		let usage = super::response_usage(&response);
+		assert_eq!(
+			usage.prompt_cache_retention,
+			Some(crate::receipt::PromptCacheRetention::InMemory)
+		);
+		assert_eq!(usage.prompt_cache_ttl_seconds, None);
+		assert_eq!(usage.input_tokens, 100);
+		for options in
+			[serde_json::json!(30), serde_json::json!([]), serde_json::json!("future_options")]
+		{
+			let response: super::ResponsesResponse = serde_json::from_value(serde_json::json!({
+				"prompt_cache_options":options, "prompt_cache_retention":"24h"
+			}))
+			.unwrap();
+			let usage = super::response_usage(&response);
+			assert_eq!(
+				usage.prompt_cache_retention,
+				Some(crate::receipt::PromptCacheRetention::Extended24h)
+			);
+			assert_eq!(usage.prompt_cache_ttl_seconds, None, "a maximum policy is not a TTL");
+		}
 	}
 
 	#[test]

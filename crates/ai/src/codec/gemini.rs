@@ -1873,6 +1873,8 @@ impl GoogleUsageMetadata {
 			cache_read_reported: false,
 			cache_write_reported: false,
 			cache_write_1h_reported: false,
+			prompt_cache_ttl_seconds: None,
+			prompt_cache_retention: None,
 			images: 0,
 			audio_input_ms: 0,
 			audio_output_ms: 0,

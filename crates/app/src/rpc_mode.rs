@@ -3019,6 +3019,9 @@ fn kernel_event_value(event: KernelEvent) -> Option<Value> {
 			"cacheReadReported": receipt.cache_read_reported,
 			"cacheWriteReported": receipt.cache_write_reported,
 			"cacheWrite1hReported": receipt.cache_write_1h_reported,
+			"promptCacheTtlSeconds": receipt.prompt_cache_ttl_seconds,
+			"promptCacheRetention": receipt.prompt_cache_retention,
+			"responseCompletedAtMs": receipt.response_completed_at_ms,
 			"provider": receipt.identity.as_ref().map(|identity| identity.provider.as_str()),
 			"model": receipt.identity.as_ref().map(|identity| identity.model.as_str()),
 			"tokensIn": receipt.tokens_in,
@@ -3252,6 +3255,9 @@ mod tests {
 	fn receipt_rpc_preserves_journal_identity_and_accounting_provenance() {
 		use omp_journal::data::{ReceiptCostSource, ReceiptUsageSource, TurnReceipt};
 		let receipt = TurnReceipt {
+			prompt_cache_ttl_seconds: Some(1800),
+			prompt_cache_retention: Some(Str::new_static("24h")),
+			response_completed_at_ms: Some(1750000000100),
 			receipt_id: Some(Str::new_static("01RECEIPT")),
 			recorded_at_ms: Some(1750000000123),
 			usage_source: Some(ReceiptUsageSource::Provider),
@@ -3264,6 +3270,9 @@ mod tests {
 			super::kernel_event_value(omp_agent::KernelEvent::InferenceReceipt(Box::new(receipt)))
 				.expect("RPC receipt");
 		assert_eq!(value["receiptId"], "01RECEIPT");
+		assert_eq!(value["promptCacheTtlSeconds"], 1800);
+		assert_eq!(value["promptCacheRetention"], "24h");
+		assert_eq!(value["responseCompletedAtMs"], 1750000000100_u64);
 		assert_eq!(value["recordedAtMs"], 1750000000123_u64);
 		assert_eq!(value["usageSource"], "provider");
 		assert_eq!(value["costSource"], "catalog_estimate");

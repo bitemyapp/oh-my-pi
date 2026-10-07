@@ -380,3 +380,12 @@ test-omperor-catalog-startup:
 test-omperor-partition-disconnect:
     cargo nextest run -p omp-env --lib --locked -E 'test(partition::tests::)'
     cargo test --doc -p omp-env --locked
+
+# Response-reported cache retention survives decoding, staging, journal replay and RPC.
+[group('test')]
+test-omperor-cache-timer:
+    cargo nextest run -p omp-ai --lib --locked -E 'test(codec::openai_responses::tests::) | test(cache_metadata) | test(secure_gate_usage_round_trip)'
+    cargo nextest run -p omp-agent --lib --test turn --locked -E 'test(receipt_observation) | test(cache_timer)'
+    cargo nextest run -p omp-journal --lib --locked -E 'test(receipt_observation)'
+    cargo nextest run -p omp-app --lib --locked -E 'test(receipt_rpc_preserves)'
+    cargo test --doc -p omp-ai -p omp-agent -p omp-journal -p omp-app --locked

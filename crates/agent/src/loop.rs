@@ -2560,6 +2560,10 @@ impl<C: Inference> Kernel<C> {
 						});
 					},
 					ChatEvent::Completed(completion) => {
+						let response_completed_at_ms = completion.receipt.timings.completed_at
+							.unwrap_or_else(std::time::SystemTime::now)
+							.duration_since(std::time::UNIX_EPOCH).ok()
+							.and_then(|d| u64::try_from(d.as_millis()).ok());
 						close_streams(session, &mut content_streams)?;
 						self.apply_live_components(session)?;
 						stop_reason = finish_reason(&completion.reason);
@@ -2622,7 +2626,7 @@ impl<C: Inference> Kernel<C> {
 								}),
 							)?;
 						}
-						let receipt = receipt_facts(
+						let mut receipt = receipt_facts(
 							&usage,
 							cost_nano_usd(&completion),
 							request_started,
@@ -2631,6 +2635,7 @@ impl<C: Inference> Kernel<C> {
 							&completion.receipt.recoveries,
 							identity.clone(),
 						);
+						receipt.response_completed_at_ms = response_completed_at_ms;
 						session.receipt(receipt.clone())?;
 						self.apply_live_components(session)?;
 						self
@@ -4145,6 +4150,8 @@ pub(crate) fn usage_receipt(usage: &Usage) -> TurnReceipt {
 		cache_read_reported: Some(usage.cache_read_reported),
 		cache_write_reported: Some(usage.cache_write_reported),
 		cache_write_1h_reported: Some(usage.cache_write_1h_reported),
+		prompt_cache_ttl_seconds: usage.prompt_cache_ttl_seconds,
+		prompt_cache_retention: usage.prompt_cache_retention.map(|policy| Str::new_static(policy.into())),
 		..TurnReceipt::default()
 	}
 }
@@ -4207,6 +4214,8 @@ mod streaming_edit_tests {
 	#[test]
 	fn receipt_observation_has_stable_identity_time_and_provenance() {
 		let usage = omp_ai::Usage {
+			prompt_cache_ttl_seconds: Some(1800),
+			prompt_cache_retention: Some(omp_ai::receipt::PromptCacheRetention::Extended24h),
 			cache_write_tokens: 400,
 			cache_write_1h_tokens: 300,
 			cache_write_reported: true,
@@ -4223,6 +4232,8 @@ mod streaming_edit_tests {
 			.expect("ULID");
 		assert_eq!(receipt.recorded_at_ms, Some(id.timestamp_ms()));
 		assert_eq!(receipt.cache_write_1h, Some(300));
+		assert_eq!(receipt.prompt_cache_ttl_seconds, Some(1800));
+		assert_eq!(receipt.prompt_cache_retention.as_deref(), Some("24h"));
 		assert_eq!(receipt.cache_write_1h_reported, Some(true));
 		assert_eq!(receipt.usage_source, Some(omp_journal::data::ReceiptUsageSource::Provider));
 		let replay: omp_journal::data::TurnReceipt =

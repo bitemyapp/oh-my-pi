@@ -133,6 +133,19 @@ pub enum UsageSource {
 	Mixed,
 }
 
+/// Legacy OpenAI retention policy returned by the provider (not an expiry).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum PromptCacheRetention {
+	/// The provider selected in-memory retention.
+	InMemory,
+	/// The provider selected extended retention, at most 24 hours.
+	#[serde(rename = "24h")]
+	#[strum(serialize = "24h")]
+	Extended24h,
+}
+
 /// Dimensioned resource usage for any inference operation.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Usage {
@@ -164,6 +177,14 @@ pub struct Usage {
 	/// including zero.
 	#[serde(default)]
 	pub cache_write_1h_reported: bool,
+	/// Minimum lifetime explicitly returned in `prompt_cache_options.ttl`.
+	/// Absent means unknown; request settings and model defaults are not
+	/// evidence.
+	#[serde(default)]
+	pub prompt_cache_ttl_seconds: Option<u64>,
+	/// Legacy retention policy explicitly returned by the provider.
+	#[serde(default)]
+	pub prompt_cache_retention: Option<PromptCacheRetention>,
 	/// Images processed or generated.
 	pub images: u32,
 	/// Input audio duration in milliseconds.
@@ -210,6 +231,10 @@ impl Usage {
 			(initially_unknown || self.cache_write_reported) && other.cache_write_reported;
 		self.cache_write_1h_reported =
 			(initially_unknown || self.cache_write_1h_reported) && other.cache_write_1h_reported;
+		// These describe the latest attempt, not a sum of token dimensions. An
+		// attempt with no metadata must not inherit an earlier attempt's TTL.
+		self.prompt_cache_ttl_seconds = other.prompt_cache_ttl_seconds;
+		self.prompt_cache_retention = other.prompt_cache_retention;
 		self.images = self.images.saturating_add(other.images);
 		self.audio_input_ms = self.audio_input_ms.saturating_add(other.audio_input_ms);
 		self.audio_output_ms = self.audio_output_ms.saturating_add(other.audio_output_ms);
@@ -601,7 +626,8 @@ pub struct ExecutionReceipt {
 	/// Accumulated dimensioned usage.
 	pub usage:         Usage,
 	/// Anchored request-context accounting for the settled attempt.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
+	// Keep absent fields in positional postcard receipts as well as JSON.
+	#[serde(default)]
 	pub context:       Option<ContextUsageReceipt>,
 	/// Accumulated integer cost.
 	pub cost:          Cost,
@@ -657,6 +683,15 @@ mod tests {
 	}
 
 	#[test]
+	fn cache_metadata_belongs_to_the_latest_attempt_even_if_it_is_absent() {
+		let mut usage = Usage::default();
+		usage += Usage { prompt_cache_ttl_seconds: Some(1800), ..Usage::default() };
+		assert_eq!(usage.prompt_cache_ttl_seconds, Some(1800));
+		usage += Usage::default();
+		assert_eq!(usage.prompt_cache_ttl_seconds, None);
+	}
+
+	#[test]
 	fn accumulates_every_usage_dimension_and_integer_cost() {
 		let mut usage = Usage {
 			input_tokens: 1,
@@ -668,6 +703,8 @@ mod tests {
 			cache_read_reported: false,
 			cache_write_reported: false,
 			cache_write_1h_reported: false,
+			prompt_cache_ttl_seconds: None,
+			prompt_cache_retention: None,
 			images: 1,
 			audio_input_ms: 6,
 			audio_output_ms: 7,
@@ -686,6 +723,8 @@ mod tests {
 			cache_read_reported: false,
 			cache_write_reported: false,
 			cache_write_1h_reported: false,
+			prompt_cache_ttl_seconds: None,
+			prompt_cache_retention: None,
 			images: 2,
 			audio_input_ms: 60,
 			audio_output_ms: 70,
