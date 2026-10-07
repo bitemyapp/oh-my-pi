@@ -374,3 +374,9 @@ test-omperor-catalog-startup:
     cargo test --doc -p omp-ai --locked
     cargo nextest run -p omp-driver --lib --locked -E 'test(registry::tests::catalog_cache_)'
     cargo test --doc -p omp-driver --locked
+
+# Either required environment backend disconnect promptly terminates active requests.
+[group('test')]
+test-omperor-partition-disconnect:
+    cargo nextest run -p omp-env --lib --locked -E 'test(partition::tests::)'
+    cargo test --doc -p omp-env --locked

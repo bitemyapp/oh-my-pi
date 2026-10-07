@@ -93,6 +93,8 @@ impl PartitionedEnvTransport {
 	/// The returned join handle resolves to `Result<(), PartitionError>`. The
 	/// router performs both backend handshakes when the client sends its hello,
 	/// exposes only the remote backend's hello, and then merges backend frames.
+	/// Both backends are required: loss of either closes the merged client so
+	/// pending requests cannot wait forever on an unreachable execution owner.
 	#[must_use]
 	pub fn spawn(
 		local: FramePipe,
@@ -148,12 +150,10 @@ async fn route(
 		.await
 		.map_err(|_| PartitionError::BackendClosed { backend: Backend::Remote.name() })?;
 
-	let (local_hello, remote_hello) = tokio::join!(
+	let (_local_hello, remote_hello) = tokio::try_join!(
 		receive_hello(&local_rx, Backend::Local),
 		receive_hello(&remote_rx, Backend::Remote),
-	);
-	let _local_hello = local_hello?;
-	let remote_hello = remote_hello?;
+	)?;
 	client_tx
 		.send_async(remote_hello)
 		.await
@@ -162,8 +162,6 @@ async fn route(
 	let mut invocation_routes = FastHashMap::<Str, Backend>::default();
 	let mut request_routes = FastHashMap::<u64, Backend>::default();
 	let mut request_invocations = FastHashMap::<u64, Str>::default();
-	let mut local_open = true;
-	let mut remote_open = true;
 
 	loop {
 		tokio::select! {
@@ -182,17 +180,14 @@ async fn route(
 				let target = match backend { Backend::Local => &local_tx, Backend::Remote => &remote_tx };
 				target.send_async(frame).await.map_err(|_| PartitionError::BackendClosed { backend: backend.name() })?;
 			}
-			frame = local_rx.recv_async(), if local_open => match frame {
-				Ok(frame) => forward_server_frame(frame, &client_tx, &mut invocation_routes, &mut request_routes, &mut request_invocations).await?,
-				Err(_) => local_open = false,
+			frame = local_rx.recv_async() => {
+				let frame = frame.map_err(|_| PartitionError::BackendClosed { backend: Backend::Local.name() })?;
+				forward_server_frame(frame, &client_tx, &mut invocation_routes, &mut request_routes, &mut request_invocations).await?;
 			},
-			frame = remote_rx.recv_async(), if remote_open => match frame {
-				Ok(frame) => forward_server_frame(frame, &client_tx, &mut invocation_routes, &mut request_routes, &mut request_invocations).await?,
-				Err(_) => remote_open = false,
+			frame = remote_rx.recv_async() => {
+				let frame = frame.map_err(|_| PartitionError::BackendClosed { backend: Backend::Remote.name() })?;
+				forward_server_frame(frame, &client_tx, &mut invocation_routes, &mut request_routes, &mut request_invocations).await?;
 			},
-		}
-		if !local_open && !remote_open {
-			return Err(PartitionError::BackendClosed { backend: "local and remote" });
 		}
 	}
 }
@@ -410,6 +405,130 @@ mod tests {
 
 	fn frame(request_id: u64, body: client_frame::Body) -> ClientFrame {
 		ClientFrame { request_id, body: Some(body), ..ClientFrame::default() }
+	}
+
+	async fn disconnect_during_hello(failed: Backend) {
+		let (local_pipe, local) = in_process_frames(8);
+		let (remote_pipe, remote) = in_process_frames(8);
+		let (client, router) =
+			PartitionedEnvTransport::spawn(local_pipe, remote_pipe, Arc::default());
+		let hello = tokio::spawn(async move { client.hello(ClientHello::default()).await });
+		receive(&local).await;
+		receive(&remote).await;
+		// The other required backend stays connected but never answers its hello.
+		let _survivor = match failed {
+			Backend::Local => {
+				drop(local);
+				remote
+			},
+			Backend::Remote => {
+				drop(remote);
+				local
+			},
+		};
+		let result = tokio::time::timeout(Duration::from_secs(1), router)
+			.await
+			.expect("one failed handshake must terminate the partition")
+			.expect("router task");
+		assert!(
+			matches!(result, Err(PartitionError::BackendClosed { backend }) if backend == failed.name())
+		);
+		let result = tokio::time::timeout(Duration::from_secs(1), hello)
+			.await
+			.expect("client hello must observe backend loss")
+			.expect("hello task");
+		assert!(matches!(result, Err(ClientError::TransportClosed)));
+	}
+
+	async fn disconnect_releases_pending_invocations(failed: Backend) {
+		let (local_pipe, local) = in_process_frames(8);
+		let (remote_pipe, remote) = in_process_frames(8);
+		let tools = FastHashSet::from_iter([Str::from("read")]);
+		let (client, router) =
+			PartitionedEnvTransport::spawn(local_pipe, remote_pipe, Arc::new(tools));
+		let hello = tokio::spawn({
+			let client = client.clone();
+			async move { client.hello(ClientHello::default()).await }
+		});
+		for backend in [&local, &remote] {
+			receive(backend).await;
+			backend
+				.send(ServerFrame {
+					body: Some(server_frame::Body::Hello(ServerHello::default())),
+					..Default::default()
+				})
+				.await
+				.expect("hello response");
+		}
+		hello.await.expect("hello task").expect("handshake");
+		let mut local_call = client
+			.invoke(InvokeTool {
+				invocation_id: "local-active".into(),
+				name: "ask".into(),
+				..Default::default()
+			})
+			.await
+			.expect("local invocation");
+		let mut remote_call = client
+			.invoke(InvokeTool {
+				invocation_id: "remote-active".into(),
+				name: "read".into(),
+				..Default::default()
+			})
+			.await
+			.expect("remote invocation");
+		receive(&local).await;
+		receive(&remote).await;
+		let _survivor = match failed {
+			Backend::Local => {
+				drop(local);
+				remote
+			},
+			Backend::Remote => {
+				drop(remote);
+				local
+			},
+		};
+		for invocation in [&mut local_call, &mut remote_call] {
+			let result = tokio::time::timeout(Duration::from_secs(1), invocation.next_event())
+				.await
+				.expect("a dead required backend must release every pending invocation");
+			assert!(matches!(result, Err(ClientError::TransportClosed)));
+		}
+		let result = tokio::time::timeout(Duration::from_secs(1), router)
+			.await
+			.expect("partition exits")
+			.expect("router task");
+		assert!(
+			matches!(result, Err(PartitionError::BackendClosed { backend }) if backend == failed.name())
+		);
+		assert!(matches!(
+			client
+				.invoke(InvokeTool {
+					invocation_id: "after-death".into(),
+					name: "read".into(),
+					..Default::default()
+				})
+				.await,
+			Err(ClientError::TransportClosed)
+		));
+	}
+
+	#[tokio::test]
+	async fn local_disconnect_terminates_an_incomplete_handshake() {
+		disconnect_during_hello(Backend::Local).await;
+	}
+	#[tokio::test]
+	async fn remote_disconnect_terminates_an_incomplete_handshake() {
+		disconnect_during_hello(Backend::Remote).await;
+	}
+	#[tokio::test]
+	async fn local_disconnect_releases_active_calls() {
+		disconnect_releases_pending_invocations(Backend::Local).await;
+	}
+	#[tokio::test]
+	async fn remote_disconnect_releases_active_calls() {
+		disconnect_releases_pending_invocations(Backend::Remote).await;
 	}
 
 	#[test]
@@ -647,6 +766,7 @@ mod tests {
 				})
 				.await
 				.expect("send local response");
+			local_transport
 		});
 
 		let remote = tokio::spawn(async move {
@@ -697,6 +817,7 @@ mod tests {
 				})
 				.await
 				.expect("send remote response");
+			remote_transport
 		});
 
 		send(&final_pipe, frame(0, client_frame::Body::Hello(ClientHello::default()))).await;
@@ -799,8 +920,8 @@ mod tests {
 		assert!(ids.contains(&"local-response".to_owned()));
 		assert!(ids.contains(&"remote-response".to_owned()));
 
-		local.await.expect("local backend task");
-		remote.await.expect("remote backend task");
+		let _local = local.await.expect("local backend task");
+		let _remote = remote.await.expect("remote backend task");
 		drop(final_pipe);
 		let result = tokio::time::timeout(Duration::from_secs(2), router)
 			.await
