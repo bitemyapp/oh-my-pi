@@ -739,7 +739,16 @@ fn tool_result_from_thread(
 ) -> Result<ToolResultContent, ThreadProjectionError> {
 	match part.kind.as_ref() {
 		Some(part::Kind::Text(text)) => Ok(ToolResultContent::Text(text.as_str().into())),
-		Some(part::Kind::Blob(blob)) => Ok(ToolResultContent::Document(media_from_thread(blob)?)),
+		Some(part::Kind::Blob(blob)) => {
+			let media = media_from_thread(blob)?;
+			// Use the same MIME classification as stored assistant artifacts.
+			// Tool screenshots must retain image semantics for vision-capable codecs.
+			if blob.mime.starts_with("image/") {
+				Ok(ToolResultContent::Image(media))
+			} else {
+				Ok(ToolResultContent::Document(media))
+			}
+		},
 		_ => Err(ThreadProjectionError::UnsupportedToolResultPart),
 	}
 }
@@ -1761,6 +1770,41 @@ mod tests {
 	use omp_core::SecretString;
 
 	use super::{AuthInput, RawJson};
+
+	#[test]
+	fn thread_tool_blobs_preserve_image_and_document_media_kinds() {
+		use omp_proto::thread::v1::{Blob, Part, part};
+
+		use super::{MediaInput, ToolResultContent};
+		for mime in ["image/png", "image/jpeg", "image/webp", "application/pdf", "text/plain"] {
+			for inline in [Bytes::new(), Bytes::from_static(b"media fixture")] {
+				let part = Part {
+					kind: Some(part::Kind::Blob(Blob {
+						hash: Bytes::from_static(&[1; 32]),
+						mime: mime.to_owned(),
+						size: 13,
+						inline: inline.clone(),
+						..Default::default()
+					})),
+				};
+				let projected = ToolResultContent::from_thread_part(&part).expect("valid tool media");
+				let media = match projected {
+					ToolResultContent::Image(media) if mime.starts_with("image/") => media,
+					ToolResultContent::Document(media) if !mime.starts_with("image/") => media,
+					other => panic!("wrong media kind for {mime}: {other:?}"),
+				};
+				if inline.is_empty() {
+					assert!(matches!(media, MediaInput::Stored(_)));
+				} else {
+					let MediaInput::Bytes { media_type, data } = media else {
+						panic!("inline bytes remain inline")
+					};
+					assert_eq!(media_type, mime);
+					assert_eq!(data, inline);
+				}
+			}
+		}
+	}
 
 	#[test]
 	fn auth_input_debug_never_exposes_secrets() {

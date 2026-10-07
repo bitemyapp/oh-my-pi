@@ -358,3 +358,11 @@ test-omperor-native-search:
     cargo check -p omp-driver --locked
     cargo nextest run -p omp-serve --lib --locked -E 'test(inference::tests::search_provider_preflight_)'
     cargo test --doc -p omp-serve --locked
+
+# Journaled tool screenshots retain image semantics through canonical provider encoding.
+[group('test')]
+test-omperor-screenshot-projection:
+    cargo nextest run -p omp-ai --lib --locked -E 'test(call::tests::thread_tool_blobs_)'
+    cargo test --doc -p omp-ai --locked
+    cargo nextest run -p omp-driver --lib --locked -E 'test(headless::kernel::tests::journaled_screenshot_)'
+    cargo test --doc -p omp-driver --locked

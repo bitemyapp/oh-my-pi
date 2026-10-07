@@ -2964,6 +2964,154 @@ mod tests {
 
 	const GPT5: &str = "openai/gpt-5";
 
+	#[test]
+	fn journaled_screenshot_tool_result_encodes_as_image_for_responses_and_codex() {
+		use omp_ai::{
+			Message, OperationCall,
+			body::BodySource,
+			codec::{Codec as _, openai_codex::OpenAiCodexCodec},
+		};
+		use omp_session::{ComponentRegistry, Session};
+		use omp_tool::{BlobRef, Part};
+		// Valid 1x1 PNG, rather than a fake byte string accepted only by the encoder.
+		const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/\
+		                   x8AAwMCAO+ip1sAAAAASUVORK5CYII=";
+		let png = omp_core::encoding::base64::decode(PNG)
+			.into_vec()
+			.expect("PNG fixture");
+		let scratch = tempfile::tempdir().expect("session state");
+		let path = scratch.path().join("browser.oms");
+		let mut session = Session::create(&path, ComponentRegistry::standard()).expect("session");
+		session.begin_turn().expect("turn");
+		session
+			.user("Inspect the browser screenshot", Vec::new())
+			.expect("user");
+		let screenshot = session
+			.store_attachment("image/png", &png)
+			.expect("stored PNG");
+		let call = session
+			.call(
+				"bash",
+				1,
+				"call_browser",
+				None,
+				Some(
+					serde_json::value::to_raw_value(
+						&serde_json::json!({"command":"dyn browser run --code 'await tab.screenshot()'"}),
+					)
+					.unwrap(),
+				),
+				None,
+			)
+			.expect("call");
+		let parts = vec![Part::Text { text: sf!("Browser screenshot") }, Part::Blob {
+			blob: BlobRef {
+				hash:       screenshot.blob.hash.to_string().into(),
+				media_type: sf!("image/png"),
+				byte_len:   screenshot.blob.size,
+			},
+			alt:  None,
+		}];
+		session
+			.settle_projected(
+				call,
+				serde_json::value::to_raw_value(&()).unwrap(),
+				serde_json::value::to_raw_value(&parts).unwrap(),
+			)
+			.expect("result");
+		drop(session);
+		let session = Session::open(&path, ComponentRegistry::standard()).expect("replayed session");
+		let items = omp_agent::project_thread_with_attachments(session.dom(), session.blobs())
+			.expect("journal media resolves");
+		let messages = Message::from_thread_items(&items).expect("canonical tool result");
+		let request = ChatRequest {
+			messages:          messages.into(),
+			tools:             Arc::from([]),
+			hosted_tools:      Arc::from([]),
+			tool_choice:       Setting::Unset,
+			output:            Setting::Unset,
+			reasoning:         Setting::Unset,
+			verbosity:         Setting::Unset,
+			cache_retention:   Setting::Unset,
+			service_tier:      Setting::Unset,
+			sampling:          Sampling::default(),
+			max_output_tokens: None,
+			top_logprobs:      None,
+			safety:            Arc::from([]),
+			negotiation:       NegotiationPolicy::default(),
+			forced_call:       None,
+		};
+		let catalog = Catalog::embedded();
+		for codec in ["openai-codex", "openai-responses"] {
+			let spec = catalog
+				.models()
+				.iter()
+				.find(|model| {
+					model.routes.iter().any(|route| {
+						catalog
+							.route(route)
+							.is_some_and(|route| route.codec.as_str() == codec)
+					})
+				})
+				.expect("catalog model");
+			let route = spec
+				.routes
+				.iter()
+				.filter_map(|route| catalog.route(route))
+				.find(|route| route.codec.as_str() == codec)
+				.expect("route");
+			let wire_model = spec
+				.wire_ids
+				.iter()
+				.find(|(candidate, _)| candidate == &route.id)
+				.unwrap()
+				.1
+				.clone();
+			let target = WireTarget {
+				route: route.id.clone(),
+				codec: route.codec.clone(),
+				endpoint: route.endpoint.clone(),
+				wire_model,
+			};
+			let request_id = RequestId::new("browser-screenshot-regression");
+			let context = EncodeContext {
+				request_id: &request_id,
+				route,
+				target: Some(&target),
+				policy: catalog.wire_policy(&spec.wire_policy).expect("policy"),
+				..EncodeContext::default()
+			};
+			let operation = OperationCall::Chat(Arc::new(request.clone()));
+			let encoded = if codec == "openai-codex" {
+				OpenAiCodexCodec::default().encode(&context, &operation)
+			} else {
+				OpenAiResponsesCodec::default().encode(&context, &operation)
+			}
+			.unwrap_or_else(|error| {
+				panic!(
+					"{codec} rejected projected screenshot: kind={:?} phase={:?} code={:?}",
+					error.kind, error.phase, error.code
+				)
+			});
+			let BodySource::Bytes(body) = encoded.body else {
+				panic!("buffered request body")
+			};
+			let value: serde_json::Value = serde_json::from_slice(&body).expect("request JSON");
+			let output = value["input"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.find(|item| item["type"] == "function_call_output")
+				.expect("tool output");
+			assert_eq!(output["call_id"], "call_browser");
+			let content = output["output"].as_array().expect("multimodal tool output");
+			assert_eq!(content[0]["type"], "input_text");
+			assert_eq!(content[0]["text"], "Browser screenshot");
+			assert_eq!(content[1]["type"], "input_image");
+			assert_eq!(content[1]["image_url"], format!("data:image/png;base64,{PNG}"));
+		}
+	}
+
 	#[tokio::test]
 	async fn remote_outcome_replication_resumes_with_stable_session_provenance() {
 		let (client, transport) = omp_env::EnvClient::in_process(0);
