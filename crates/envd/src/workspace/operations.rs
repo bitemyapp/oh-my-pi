@@ -244,7 +244,9 @@ struct IsolationOwner<'a> {
 	id:  &'a str,
 }
 
-const ISOLATION_OWNER_FILE: &str = ".omp-isolation-owner";
+/// Written into each isolated root; the walker treats it as a repository
+/// boundary, so ignore files above the copy never filter its snapshot.
+const ISOLATION_OWNER_FILE: &str = omp_walker::ISOLATION_ROOT_MARKER;
 
 #[must_use]
 struct WorktreeBuild {
