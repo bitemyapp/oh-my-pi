@@ -1,16 +1,12 @@
 //! Versioned SQLite cache for secret-free model discovery and provider
 //! lifecycle.
 
-use std::{
-	path::Path,
-	thread,
-	time::{Duration, Instant},
-};
+use std::{path::Path, time::Duration};
 
 use omp_catalog::{DiscoveredModel, ProviderId};
 use omp_core::{Hash32, Str};
 use parking_lot::Mutex;
-use rusqlite::{Connection, ErrorCode, OptionalExtension as _, TransactionBehavior, params, types};
+use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params, types};
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
@@ -121,7 +117,7 @@ impl DiscoveryStore {
 	pub fn open(path: &Path) -> Result<Self, DiscoveryStoreError> {
 		let mut connection = Connection::open(path)?;
 		connection.busy_timeout(OPEN_BUSY_TIMEOUT)?;
-		configure_journal(&connection)?;
+		crate::sqlite::configure_journal(&connection, OPEN_BUSY_TIMEOUT)?;
 		if schema_version(&connection)? == Some(SCHEMA_VERSION) {
 			return Ok(Self { connection: Mutex::new(connection) });
 		}
@@ -377,35 +373,6 @@ impl DiscoveryStore {
 			)
 			.optional()
 			.map_err(DiscoveryStoreError::from)
-	}
-}
-
-fn configure_journal(connection: &Connection) -> rusqlite::Result<()> {
-	let started = Instant::now();
-	loop {
-		let result: rusqlite::Result<()> = (|| {
-			let mode: String =
-				connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
-			if !mode.eq_ignore_ascii_case("wal") {
-				connection.pragma_update(None, "journal_mode", "WAL")?;
-			}
-			Ok(())
-		})();
-		match result {
-			// Concurrent first-open journal transitions can return BUSY without
-			// invoking SQLite's busy handler. Bound this transition retry too.
-			Err(error)
-				if matches!(
-					error.sqlite_error_code(),
-					Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
-				) && started.elapsed() < OPEN_BUSY_TIMEOUT =>
-			{
-				thread::sleep(
-					Duration::from_millis(10).min(OPEN_BUSY_TIMEOUT.saturating_sub(started.elapsed())),
-				);
-			},
-			result => return result,
-		}
 	}
 }
 

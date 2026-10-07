@@ -396,3 +396,10 @@ test-omperor-isolated-state:
     cargo nextest run -p omp-env --lib --locked -E 'test(project_state::)'
     cargo nextest run -p omp-envd --lib --locked -E 'test(docserver::types::tests::) | test(docserver::fs::tests::) | test(docserver::path_ops::tests::) | test(docserver::daemon::tests::) | test(docserver::actor::tests::) | test(docserver::transaction::tests::) | test(document_authority) | test(stale_daemon_does_not_rehost) | test(new_build_attach_waits)'
     cargo test --doc -p omp-env -p omp-envd --locked
+
+# Concurrent cold credential stores and local key creation must converge safely.
+[group('test')]
+test-omperor-credential-startup:
+    cargo nextest run -p omp-ai --lib --locked -E 'test(auth::store::tests::) | test(auth::key::tests::) | test(discovery::store::tests::) | test(session::tests::) | test(sqlite::tests::)'
+    cargo nextest run -p omp-ai --test account --locked
+    cargo test --doc -p omp-ai --locked

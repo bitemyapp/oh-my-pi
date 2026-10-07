@@ -738,7 +738,7 @@ impl AccountStateStore {
 		let connection = Connection::open(&self.path)?;
 		connection.busy_timeout(Duration::from_secs(5))?;
 		connection.pragma_update(None, "foreign_keys", true)?;
-		connection.pragma_update(None, "journal_mode", "WAL")?;
+		crate::sqlite::configure_journal(&connection, Duration::from_secs(5))?;
 		Ok(connection)
 	}
 }

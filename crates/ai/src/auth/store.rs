@@ -395,7 +395,7 @@ impl CredentialStore {
 	pub fn open(path: impl Into<PathBuf>, keys: Arc<dyn KeySource>) -> Result<Self, StoreError> {
 		let store = Self { path: path.into(), keys };
 		let mut connection = store.connection()?;
-		connection.pragma_update(None, "journal_mode", "WAL")?;
+		crate::sqlite::configure_journal(&connection, BUSY_TIMEOUT)?;
 		migrate(&mut connection)?;
 		Ok(store)
 	}
@@ -1435,11 +1435,13 @@ impl fmt::Debug for CredentialStore {
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
-	let found = connection.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))?;
+	// SAFETY: Read the schema only after acquiring the writer lease. A peer may
+	// finish a migration while this connection waits for BEGIN IMMEDIATE.
+	let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+	let found = transaction.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))?;
 	if found > SCHEMA_VERSION {
 		return Err(StoreError::NewerSchema { found, supported: SCHEMA_VERSION });
 	}
-	let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 	if found == 0 {
 		transaction.execute_batch(
 			"CREATE TABLE credentials (
@@ -1646,6 +1648,83 @@ mod tests {
 				expected_generation: None,
 			})
 			.expect("persist credential")
+	}
+
+	#[test]
+	fn migration_rechecks_schema_after_waiting_for_writer() {
+		use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+		let directory = tempdir().expect("temporary directory");
+		let path = directory.path().join("credentials.sqlite");
+		let mut owner = Connection::open(&path).expect("owner connection");
+		owner
+			.pragma_update(None, "journal_mode", "WAL")
+			.expect("WAL fixture");
+		let mut peer = Connection::open(&path).expect("peer connection");
+		peer.busy_timeout(BUSY_TIMEOUT).expect("busy timeout");
+		let (waiting_tx, waiting_rx) = flume::bounded(1);
+		let (release_tx, release_rx) = flume::bounded(1);
+		peer
+			.authorizer(Some(move |context: AuthContext<'_>| {
+				if matches!(context.action, AuthAction::Transaction {
+					operation: TransactionOperation::Begin,
+				}) {
+					waiting_tx.send(()).expect("peer preparing BEGIN");
+					release_rx
+						.recv_timeout(Duration::from_secs(5))
+						.expect("owner migration completed");
+				}
+				Authorization::Allow
+			}))
+			.expect("install scheduling hook");
+		let peer = thread::spawn(move || migrate(&mut peer));
+		waiting_rx
+			.recv_timeout(Duration::from_secs(5))
+			.expect("peer reaches writer acquisition");
+		migrate(&mut owner).expect("owner migrates first");
+		release_tx.send(()).expect("release peer");
+		peer
+			.join()
+			.expect("peer worker")
+			.expect("peer must observe the committed schema");
+		assert_eq!(
+			owner
+				.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+				.expect("schema version"),
+			SCHEMA_VERSION
+		);
+	}
+
+	#[test]
+	fn cold_openers_preserve_every_credential() {
+		for round in 0..10 {
+			let directory = tempdir().expect("temporary directory");
+			let path = directory.path().join("credentials.sqlite");
+			let barrier = Arc::new(Barrier::new(20));
+			let workers: Vec<_> = (0..20)
+				.map(|worker| {
+					let path = path.clone();
+					let barrier = Arc::clone(&barrier);
+					thread::spawn(move || {
+						barrier.wait();
+						let store = CredentialStore::open(&path, source("key", KEY_ONE))?;
+						put(&store, AccountId::from_ref(&format!("account-{worker}")), b"fixture", 100);
+						Ok::<_, StoreError>(())
+					})
+				})
+				.collect();
+			let outcomes: Vec<_> = workers
+				.into_iter()
+				.map(|worker| worker.join().expect("cold opener"))
+				.collect();
+			assert!(outcomes.iter().all(Result::is_ok), "cold open round {round}: {outcomes:?}");
+			let connection = Connection::open(&path).expect("inspect cold database");
+			assert_eq!(
+				connection
+					.query_row("SELECT count(*) FROM credentials", [], |row| row.get::<_, u64>(0))
+					.expect("credential count"),
+				20
+			);
+		}
 	}
 
 	#[test]

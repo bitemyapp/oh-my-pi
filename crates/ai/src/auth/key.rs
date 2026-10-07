@@ -2,7 +2,7 @@
 
 use std::{
 	fmt::{self, Display},
-	fs::{self, File, OpenOptions},
+	fs::{self, File},
 	io::{self, Read as _, Write as _},
 	path::{Path, PathBuf},
 	str,
@@ -273,23 +273,30 @@ impl FileCredentialKeySource {
 		SystemRandom::new()
 			.fill(material.as_mut())
 			.map_err(|_| FileKeyError::Random)?;
-		let mut options = OpenOptions::new();
-		options.write(true).create_new(true);
+		let parent = path
+			.parent()
+			.filter(|parent| !parent.as_os_str().is_empty())
+			.unwrap_or_else(|| Path::new("."));
+		let mut builder = tempfile::Builder::new();
+		builder.prefix(".omp-credential-key-");
 		#[cfg(unix)]
 		{
-			use std::os::unix::fs::OpenOptionsExt as _;
-			options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+			use std::os::unix::fs::PermissionsExt as _;
+			builder.permissions(fs::Permissions::from_mode(0o600));
 		}
-		match options.open(path) {
-			Ok(mut file) => {
-				file
-					.write_all(material.as_ref())
-					.and_then(|()| file.sync_all())
-					.map_err(|source| FileKeyError::Io { path: path.to_path_buf(), source })?;
-				Self::from_material(path, material.as_ref())
-			},
-			Err(source) if source.kind() == io::ErrorKind::AlreadyExists => Self::read(path),
-			Err(source) => Err(FileKeyError::Io { path: path.to_path_buf(), source }),
+		let mut temporary = builder
+			.tempfile_in(parent)
+			.map_err(|source| FileKeyError::Io { path: path.to_path_buf(), source })?;
+		temporary
+			.write_all(material.as_ref())
+			.and_then(|()| temporary.as_file().sync_all())
+			.map_err(|source| FileKeyError::Io { path: path.to_path_buf(), source })?;
+		// SAFETY: Publish complete, durable bytes without replacing another
+		// creator's key. The losing temporary is removed by its drop guard.
+		match temporary.persist_noclobber(path) {
+			Ok(_) => Self::from_material(path, material.as_ref()),
+			Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Self::read(path),
+			Err(error) => Err(FileKeyError::Io { path: path.to_path_buf(), source: error.error }),
 		}
 	}
 
@@ -514,6 +521,53 @@ mod tests {
 	use super::{
 		FallbackKeySource, FileCredentialKeySource, FileKeyError, HeadlessKeySource, KeyId, KeySource,
 	};
+
+	#[test]
+	fn concurrent_file_key_creators_publish_one_complete_key() {
+		use std::{
+			sync::{Arc, Barrier},
+			thread,
+		};
+		for round in 0..10 {
+			let directory = tempfile::tempdir().expect("temporary directory");
+			let path = directory.path().join("credentials.key");
+			let barrier = Arc::new(Barrier::new(20));
+			let workers: Vec<_> = (0..20)
+				.map(|_| {
+					let path = path.clone();
+					let barrier = Arc::clone(&barrier);
+					thread::spawn(move || {
+						barrier.wait();
+						FileCredentialKeySource::open(&path)
+					})
+				})
+				.collect();
+			let outcomes: Vec<_> = workers
+				.into_iter()
+				.map(|worker| worker.join().expect("key creator"))
+				.collect();
+			assert!(outcomes.iter().all(Result::is_ok), "key creation round {round}: {outcomes:?}");
+			assert_eq!(
+				fs::read_dir(directory.path())
+					.expect("key directory")
+					.count(),
+				1,
+				"losing temporary keys must be removed"
+			);
+			let expected = FileCredentialKeySource::open(&path)
+				.expect("published key")
+				.active_key()
+				.expect("key");
+			for source in outcomes {
+				let observed = source
+					.expect("concurrent creator")
+					.active_key()
+					.expect("key");
+				assert_eq!(observed.id(), expected.id());
+				assert_eq!(observed.bytes(), expected.bytes());
+			}
+		}
+	}
 
 	#[test]
 	fn file_key_is_stable_and_owner_only() {

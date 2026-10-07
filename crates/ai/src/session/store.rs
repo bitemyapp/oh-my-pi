@@ -7,6 +7,7 @@ use std::{
 	marker,
 	path::Path,
 	sync::Arc,
+	time::Duration,
 };
 
 use bytes::Bytes;
@@ -326,8 +327,13 @@ impl<I> SqliteConversationStore<I> {
 
 	fn from_connection(connection: Connection) -> Result<Self, ConversationError> {
 		connection
+			.busy_timeout(Duration::from_secs(5))
+			.map_err(|_| ConversationError::Persistence)?;
+		crate::sqlite::configure_journal(&connection, Duration::from_secs(5))
+			.map_err(|_| ConversationError::Persistence)?;
+		connection
 			.execute_batch(
-				"PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;
+				"PRAGMA foreign_keys=ON;
 			CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, head TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS revisions (id TEXT PRIMARY KEY, conversation TEXT NOT NULL, parent \
 				 TEXT, turn TEXT, items BLOB NOT NULL);
