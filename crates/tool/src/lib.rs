@@ -159,6 +159,19 @@ pub fn decode_params<T: DeserializeOwned>(json: &str) -> Result<T, serde_json::E
 	serde_json::from_value(value)
 }
 
+/// The rejection for arguments that do not decode into a tool's parameters:
+/// the call settles as an argument error the model can read and repair,
+/// never as a failure of the whole turn.
+pub fn malformed_arguments(error: &serde_json::Error) -> ArgIssue {
+	ArgIssue {
+		path:     Vec::new(),
+		expected: sf!("arguments matching the tool's parameter schema"),
+		kind:     ArgIssueKind::Malformed,
+		example:  None,
+		found:    Some(Str::new(error.to_string())),
+	}
+}
+
 /// Namespaced thread-item property carrying a committed tool revision.
 pub const TOOL_REV_PROP: &str = "omp/tool-rev";
 

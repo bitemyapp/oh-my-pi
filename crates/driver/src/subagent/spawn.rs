@@ -275,7 +275,10 @@ impl SessionTool for TaskSessionTool {
 		args: Box<serde_json::value::RawValue>,
 	) -> SessionToolFuture<'a> {
 		Box::pin(async move {
-			let request = decode_call_params(args.get())?;
+			let request = match decode_call_params(args.get()) {
+				Ok(request) => request,
+				Err(error) => return Ok(CallOutcome::ArgsRejected(omp_tool::malformed_arguments(&error))),
+			};
 			let request = request.into_batch();
 			if request.tasks.is_empty() {
 				let fault = serde_json::value::to_raw_value(&TaskFault {

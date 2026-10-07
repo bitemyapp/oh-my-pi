@@ -70,6 +70,63 @@ async fn session_tools_route_before_registry_invocation() {
 	assert_eq!(result_text(&active, "session-tool"), ["\"session-owned\""]);
 }
 
+/// Strict parameters, like `task`'s: an unknown field is the model's mistake.
+struct StrictSession(ToolSpec);
+
+impl SessionTool for StrictSession {
+	fn spec(&self) -> &ToolSpec {
+		&self.0
+	}
+
+	fn call<'a>(
+		&'a self,
+		_cx: SessionToolCx<'a>,
+		args: Box<serde_json::value::RawValue>,
+	) -> SessionToolFuture<'a> {
+		#[derive(serde::Deserialize)]
+		#[serde(deny_unknown_fields)]
+		#[allow(dead_code)]
+		struct Params {
+			task: String,
+		}
+		Box::pin(async move {
+			match omp_tool::decode_params::<Params>(r#"{"task":"scan","stray":1}"#) {
+				Ok(_) => Ok(CallOutcome::Ok(args)),
+				Err(error) => Ok(CallOutcome::ArgsRejected(omp_tool::malformed_arguments(&error))),
+			}
+		})
+	}
+}
+
+#[tokio::test]
+async fn malformed_session_tool_arguments_are_a_repairable_tool_error_not_a_turn_failure() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let tools = registry([spec("strict_session", 1, "unused")]);
+	let identity = tools.resolved_identity("strict_session").expect("identity");
+	let dispatcher = Dispatcher::new(
+		Arc::clone(&tools),
+		DispatchPolicy::new(BlobStore::open(directory.path()).expect("blob store")),
+	)
+	.with_session_tool(Arc::new(StrictSession(tool_spec("strict_session", 1))));
+	let mut active = session(&directory.path().join("strict-session.oms"));
+	let (entry, args) = call(&mut active, &identity, "strict-call");
+	dispatcher
+		.dispatch(
+			&mut active,
+			request(
+				entry,
+				identity,
+				args,
+				ToolCancellation::ReadOnly(CancelTree::new().begin_turn().read_only_tool()),
+				false,
+			),
+		)
+		.await
+		.expect("an argument error settles the call instead of failing dispatch");
+	let text = result_text(&active, "strict-call").join("\n");
+	assert!(text.contains("unknown field `stray`"), "{text}");
+}
+
 #[tokio::test]
 async fn central_truncation_spills_and_notrunc_explicitly_opts_out() {
 	let directory = tempfile::tempdir().expect("temporary directory");

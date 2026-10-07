@@ -829,7 +829,11 @@ pub trait SessionTool: Send + Sync {
 			CallOutcome::Ok(payload) | CallOutcome::Faulted(payload) => {
 				vec![Part::Json { json: bytes::Bytes::copy_from_slice(payload.get().as_bytes()) }]
 			},
-			CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. } => Vec::new(),
+			// The model must see what was wrong with its arguments to repair them.
+			CallOutcome::ArgsRejected(issue) => {
+				vec![Part::Json { json: bytes::Bytes::from(serde_json::to_vec(issue)?) }]
+			},
+			CallOutcome::Aborted { .. } => Vec::new(),
 		})
 	}
 }

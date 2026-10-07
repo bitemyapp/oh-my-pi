@@ -127,7 +127,10 @@ impl SessionTool for HubSessionTool {
 		args: Box<serde_json::value::RawValue>,
 	) -> SessionToolFuture<'a> {
 		Box::pin(async move {
-			let params = decode_call_params(args.get())?;
+			let params = match decode_call_params(args.get()) {
+				Ok(params) => params,
+				Err(error) => return Ok(CallOutcome::ArgsRejected(omp_tool::malformed_arguments(&error))),
+			};
 			let params = match omp_tools::hub::validate(params, self.caller_id.as_str()) {
 				Ok(request) => request.params,
 				Err(fault) => {
