@@ -355,6 +355,25 @@ async fn rpc_abort_and_prompt_interrupts_then_starts_the_new_turn() {
 	assert_eq!(ends[1]["cancelled"], false);
 }
 
+/// An abort with no turn running has nothing to interrupt. It must not stay
+/// queued in the kernel's mailbox and cancel the next prompt.
+#[tokio::test]
+async fn rpc_abort_while_idle_does_not_cancel_the_next_prompt() {
+	let temp = tempfile::tempdir().expect("tempdir");
+	let frames = converse(
+		&temp,
+		VecDeque::from([completed_script("pong")]),
+		"{\"id\":\"stop\",\"type\":\"abort\"}\n{\"id\":\"prompt\",\"type\":\"prompt\",\"message\":\"ping\"}\n",
+		&["{\"id\":\"quit\",\"type\":\"quit\"}\n"],
+	)
+	.await;
+	assert_eq!(response(&frames, "stop")["success"], true);
+	let ends = agent_ends(&frames);
+	assert_eq!(ends.len(), 1, "{frames:#?}");
+	assert_eq!(ends[0]["cancelled"], false, "{frames:#?}");
+	assert_eq!(ends[0]["text"], "pong");
+}
+
 /// `get_state` works while streaming; the actor's replica serves the
 /// tree even though the running turn owns the session.
 #[tokio::test]

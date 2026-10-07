@@ -2411,7 +2411,12 @@ where
 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
 							},
 							"interrupt" | "abort" => {
-								let _ = mailbox.send(Up::Interrupt);
+								// With no turn running there is nothing to stop; an
+								// interrupt left in the mailbox would instead cancel the
+								// next prompt at its first request.
+								if turn_running {
+									let _ = mailbox.send(Up::Interrupt);
+								}
 								let response = RpcResponse::success_empty(id, command.as_str());
 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
 							},
