@@ -719,8 +719,6 @@ impl ServerConfig {
 	/// Other namespaces may observe the same project; final disk mutations
 	/// still serialize on a separate physical-project lock.
 	pub fn try_lock_authority(&self) -> Result<AuthorityLock> {
-		use cap_std::fs;
-
 		if self
 			.authority_held
 			.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -736,15 +734,11 @@ impl ServerConfig {
 			});
 		}
 		let result = (|| {
-			let root = self
-				.root
-				.open_dir(".")
-				.map(fs::Dir::into_std_file)
-				.map_err(|source| Error::Io {
-					operation: sf!("open Environment authority handle"),
-					path: self.environment_root.clone(),
-					source,
-				})?;
+			let root = super::fs::directory_file(&self.root).map_err(|source| Error::Io {
+				operation: sf!("open Environment authority handle"),
+				path: self.environment_root.clone(),
+				source,
+			})?;
 			root.try_lock_shared().map_err(|source| Error::Io {
 				operation: sf!("lock Environment authority"),
 				path:      self.environment_root.clone(),

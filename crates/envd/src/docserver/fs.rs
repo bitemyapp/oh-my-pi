@@ -2784,10 +2784,9 @@ impl LocalFs {
 	}
 
 	fn flush_directory(directory: &Dir, path: &Path) -> Result<()> {
-		let clone = directory
-			.try_clone()
-			.map_err(|source| Self::io_error("clone parent directory handle", path, source))?;
-		match clone.into_std_file().sync_all() {
+		let file = directory_file(directory)
+			.map_err(|source| Self::io_error("open parent directory handle", path, source))?;
+		match file.sync_all() {
 			Ok(()) => Ok(()),
 			Err(source)
 				if matches!(
@@ -2935,6 +2934,25 @@ impl LocalFs {
 	fn invalid_argument(path: &Path, reason: &str) -> Error {
 		Error::InvalidTarget { target: Str::new(path.to_string_lossy()), reason: Str::new(reason) }
 	}
+}
+
+/// An ordinary file handle on a directory, which `flock` and `fsync` accept.
+/// On Linux cap-std opens a directory it only resolves names in with
+/// `O_PATH`, and both refuse such a handle (`EBADF`), so the directory is
+/// opened again through it, for reading.
+#[cfg(unix)]
+pub(crate) fn directory_file(directory: &Dir) -> io::Result<std::fs::File> {
+	use rustix::fs::{Mode, OFlags, openat};
+
+	let fd =
+		openat(directory, ".", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())?;
+	Ok(std::fs::File::from(fd))
+}
+
+/// A new file handle on a directory, which locking and flushing accept.
+#[cfg(windows)]
+pub(crate) fn directory_file(directory: &Dir) -> io::Result<std::fs::File> {
+	directory.open_dir(".").map(Dir::into_std_file)
 }
 
 #[cfg(test)]
