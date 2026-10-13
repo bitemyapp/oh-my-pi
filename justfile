@@ -114,10 +114,10 @@ check-pkg pkg:
 build:
     cargo build -p omp-app --bin omp --locked
 
-# Build the `omp` CLI/daemon binary (release profile; macOS needs vendored release Python + Homebrew LLD, see AGENTS.md "Embedded Python").
+# Build the `omp` CLI/daemon binary (release profile; macOS needs vendored release Python + Homebrew LLD, see AGENTS.md "Embedded Python"; Linux has one embedded Python tree, vendor/python, for both profiles).
 [group('build & check')]
 build-release:
-    PYO3_CONFIG_FILE="{{ justfile_directory() }}/vendor/python-release/pyo3-config.txt" \
+    PYO3_CONFIG_FILE="{{ justfile_directory() }}/vendor/{{ if os() == "macos" { "python-release" } else { "python" } }}/pyo3-config.txt" \
         cargo build -p omp-app --bin omp --release --locked
 
 # ---------------------------------------------------------------------------

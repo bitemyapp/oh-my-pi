@@ -91,6 +91,12 @@ prepare_tree() {
 	LIB_NAME=$(basename "${CONFIG_LIBS[0]}" .a | sed 's/^lib//')
 	local EXECUTABLE="$VENDOR/install/bin/python3.14td"
 	[ -x "$EXECUTABLE" ] || EXECUTABLE="$VENDOR/install/bin/python3.14t"
+	# The archive's interpreter asks for the dynamic loader at its standard
+	# path, which NixOS doesn't have (it has a stub there that refuses to
+	# run it). Under a Nix toolchain it gets that toolchain's loader.
+	if ! "$EXECUTABLE" -c '' 2>/dev/null && [ -f "${NIX_CC:-}/nix-support/dynamic-linker" ]; then
+		patchelf --set-interpreter "$(cat "$NIX_CC/nix-support/dynamic-linker")" "$(readlink -f "$EXECUTABLE")"
+	fi
 
 	echo "generating ${VENDOR_NAME}/stdlib.bin..." >&2
 	"$EXECUTABLE" "$SCRIPT_DIR/pack-pymodules.py" "$STDLIB_DIR" "$VENDOR/stdlib.bin" \
